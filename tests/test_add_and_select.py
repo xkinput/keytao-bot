@@ -1503,6 +1503,135 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
 
     created = B18RealToolTests_created
 
+    def install_f2_review_http(self, facts, unconfirmed_words):
+        from tests.helpers import REAL_REVIEW_READS, review, urlsplit
+
+        class QueryHTTP(b19_partial_reply_binding_DraftHTTP):
+            def _response(self, method, url, kwargs):
+                path = urlsplit(url).path
+                if path.endswith("/evidence/fetch"):
+                    return OfflineResponse({}, 404)
+                if path == "/api/phrases/encode":
+                    word = kwargs["params"]["word"]
+                    code, reading = facts[word]
+                    self.requests.append((method, path, {"word": word}))
+                    unconfirmed = word in unconfirmed_words
+                    return OfflineResponse({
+                        "input": word, "type": "多字词", "codes": [code, code + "o"],
+                        "altCodes": [], "flyKeyVariants": [], "phrasePinyins": reading.split(),
+                        "pronunciationSource": "zdic-unavailable" if unconfirmed else "zdic-phrase",
+                        "standardPronunciationStatus": "unavailable" if unconfirmed else "found",
+                        "semanticPronunciationNeeded": unconfirmed,
+                        "chars": [{"char": char, "pinyin": syllable, "pinyins": [syllable],
+                                   "pronunciationLookupStatus": "found"}
+                                  for char, syllable in zip(word, reading.split())],
+                        **self.encode_overrides.get(word, {}),
+                    })
+                return super()._response(method, url, kwargs)
+
+        self.http = QueryHTTP()
+        self.http.encode_overrides = {}
+        self.http.entries.clear()
+        self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
+        self.enterContext(patch.multiple(review, **REAL_REVIEW_READS))
+        self.enterContext(patch.object(review.http_client, "guarded_fetch", AsyncMock(return_value=OfflineResponse({}, 404))))
+        self.enterContext(patch.object(review, "AsyncOpenAI", None))
+        self.enterContext(patch.object(review, "_review_cache", OrderedDict()))
+        self.enterContext(patch.object(review, "_semantic_review_cache", OrderedDict()))
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS,
+                     **harness._review_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
+        self.enterContext(patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get))
+        return review
+
+    async def test_f2_m1_08_unconfirmed_whole_word_uses_default_candidate_in_ten_word_list(self):
+        facts = {
+            "术曲": ("ejql", "shù qǔ"), "普信": ("pjxb", "pǔ xìn"),
+            "关系户": ("gxho", "guān xì hù"), "萝卜岗": ("lbgi", "luó bo gǎng"),
+            "代拍": ("dhph", "dài pāi"), "代抢": ("dhqx", "dài qiǎng"),
+            "轻断食": ("qdev", "qīng duàn shí"), "乙游": ("ykyd", "yǐ yóu"),
+            "卡砖": ("ksft", "kǎ zhuān"), "打本": ("dsbn", "dǎ běn"),
+        }
+        review = self.install_f2_review_http(facts, {"萝卜岗"})
+        await self.turn(" ".join(facts), raw_operation(
+            op="query", operands=list(facts), codes=[], refers_to_pending=False,
+        ))
+        reply = self.replay.last_response
+        state = self.replay.store.get(self.replay.author)
+        self.assertEqual([scope["word"] for scope in state.args["_candidate_scopes"]], list(facts), reply)
+        self.assertIn("luó bo gǎng", reply)
+        self.assertNotIn("请提供读音", reply)
+        scope = next(scope for scope in state.args["_candidate_scopes"] if scope["word"] == "萝卜岗")
+        self.assertTrue(scope["reviewedState"]["needsManualReview"])
+        self.assertEqual(scope["reviewedState"]["pronunciationCodes"]["lbgi"], "luó bo gǎng")
+        self.assertEqual(review.current_review_words.get(), ())
+        self.assertEqual(self.http.writes, [])
+        await self.turn("萝卜岗 1 加入")
+        self.assertEqual(self.created(), [("萝卜岗", "lbgi")], self.replay.last_response)
+        self.assertTrue(self.http.rows[0]["needsManualReview"])
+
+    async def test_f2_unconfirmed_single_polyphone_with_model_down_stays_unresolved(self):
+        review = self.install_f2_review_http({"枞壑": ("cyhe", "cóng hè")}, {"枞壑"})
+        payment_error = RuntimeError("HTTP 402")
+        payment_error.status_code = 402
+        for error in (None, asyncio.TimeoutError(), payment_error):
+            with self.subTest(error=type(error).__name__):
+                review._semantic_review_cache.clear()
+                create = AsyncMock(side_effect=error)
+                client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+                factory = None if error is None else lambda **kwargs: client
+                with patch.object(review, "AsyncOpenAI", factory), patch.object(
+                    review, "_review_llm_config", return_value={
+                        "api_key": "offline", "base_url": "https://offline.invalid",
+                        "model": "offline", "timeout": 1,
+                    },
+                ):
+                    await self.turn("枞壑", raw_operation(
+                        op="query", operands=["枞壑"], codes=[], refers_to_pending=False,
+                    ))
+                reply = self.replay.last_response
+                self.assertIn("暂不推荐编码", reply)
+                self.assertNotIn("cyhe", reply)
+                self.assertIsNone(self.replay.store.get(self.replay.author), reply)
+                self.assertEqual(review.current_review_words.get(), ())
+                self.assertEqual(self.http.writes, [])
+                if error is not None:
+                    create.assert_awaited()
+
+    async def test_f2_multiword_default_reading_refuses_context_and_unmatched_semantic_readings(self):
+        facts = {"枞壑": ("cyhe", "cóng hè"), "普信": ("pjxb", "pǔ xìn")}
+        review = self.install_f2_review_http(facts, {"枞壑"})
+        for semantic in (False, True):
+            with self.subTest(semantic=semantic):
+                self.replay.store.delete(self.replay.author)
+                review._semantic_review_cache.clear()
+                self.http.encode_overrides = {} if semantic else {
+                    "枞壑": {"contextPhrasePinyins": ["zōng", "hè"]},
+                }
+                response = harness._FakeAIResponse("stop", json.dumps({
+                    "accepted": True, "confidence": 0.99,
+                    "characters": [{"char": "枞", "pinyin": "zōng"}, {"char": "壑", "pinyin": "hè"}],
+                    "meaning": "生有常绿乔木的山谷", "usageType": "place",
+                }))
+                create = AsyncMock(return_value=response)
+                client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+                with patch.object(review, "AsyncOpenAI", (lambda **kwargs: client) if semantic else None), patch.object(
+                    review, "_review_llm_config", return_value={
+                        "api_key": "offline", "base_url": "https://offline.invalid",
+                        "model": "offline", "timeout": 1,
+                    },
+                ):
+                    await self.turn(" ".join(facts), raw_operation(
+                        op="query", operands=list(facts), codes=[], refers_to_pending=False,
+                    ))
+                state = self.replay.store.get(self.replay.author)
+                self.assertEqual([scope["word"] for scope in state.args["_candidate_scopes"]], ["普信"])
+                self.assertIn("「枞壑」", self.replay.last_response)
+                self.assertNotIn("cyhe", self.replay.last_response)
+                self.assertEqual(review.current_review_words.get(), ())
+                self.assertEqual(self.http.writes, [])
+                if semantic:
+                    create.assert_awaited()
+
     async def test_f1_m3_01_multiselect_with_bare_submit_suffix(self):
         self.http = b19_partial_reply_binding_DraftHTTP()
         self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
@@ -1937,6 +2066,31 @@ class HotfixMultiwordTests(unittest.IsolatedAsyncioTestCase):
     query = HotfixMultiwordTests_query
 
     assert_candidates = HotfixMultiwordTests_assert_candidates
+
+    async def test_f2_m3_06_mixed_candidates_name_failed_word_without_generic_failure(self):
+        self.codes.update({"坐坐": ("zlzl", "zlzli"), "切歌": ("qdge", "qdgev")})
+        original = self.lookup
+        for failure in (
+            "后续处理未能生成安全回复；本次未执行新的写入。", "这次服务没有完成处理，本次未写入。",
+            "「那很」后续处理未能生成安全回复；本次未执行新的写入。",
+            "「那很」这次服务没有完成处理，本次未写入。",
+        ):
+            with self.subTest(failure=failure):
+                async def lookup(name, args, *actor, **kwargs):
+                    if name == "keytao_prepare_reviewed_add" and args["word"] == "那很":
+                        return json.dumps({"success": False, "message": failure})
+                    return await original(name, args, *actor, **kwargs)
+
+                with patch.object(self.commands, "call_tool_function", side_effect=lookup):
+                    reply = await self.commands._prepare_multi_word_query(
+                        ("那很", "坐坐", "切歌"), "qq", self.author.actor_id, self.author,
+                        self.author.space_key, "Offline owner",
+                    )
+                self.assertIn("「那很」", reply)
+                self.assertIn("「坐坐」", reply)
+                self.assertIn("「切歌」", reply)
+                self.assertNotIn(failure, reply)
+                self.assertEqual([row["word"] for row in self.store.get(self.author).args["items"]], ["坐坐", "切歌"])
 
     async def test_four_resolved_and_one_unresolved(self):
         await self.assert_candidates(("没头没尾", "国潮", "泥炭", "棉麻", "车损"))

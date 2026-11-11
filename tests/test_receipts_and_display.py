@@ -1389,6 +1389,38 @@ class MessageIdBindingTests(unittest.IsolatedAsyncioTestCase):
 
 # Source: test_b9_msgid.py
 class DiscoveryMessageIdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_f2_discovery_skips_words_already_in_pending_batches(self):
+        from tests.test_chat_word_discovery import WordDiscoveryTests, discovery
+
+        for source in ("draft", "submitted", "others_submitted"):
+            with self.subTest(source=source):
+                fixture = WordDiscoveryTests()
+                fixture.addCleanup = self.addCleanup
+                try:
+                    await fixture.asyncSetUp()
+                    original_tool = fixture.tool
+
+                    async def tool(name, arguments, *actor, **kwargs):
+                        if name == "keytao_pending_items_by_words":
+                            return json.dumps({"success": True, "complete": True, "bound": True,
+                                               "othersComplete": True, "items": [{
+                                "source": source, "word": "午时", "code": "wj",
+                                "batchStatus": "Draft" if source == "draft" else "Submitted",
+                                "itemStatus": "Pending", "action": "Create",
+                            }]})
+                        return await original_tool(name, arguments, *actor, **kwargs)
+
+                    fixture.tools.side_effect = tool
+                    fixture.event.text = "午时好像是大家的叫法"
+                    await fixture.discovery.discover(fixture.bot, fixture.event, fixture.chat)
+                    fixture.bot.send.assert_not_awaited()
+                    fixture.verify.assert_not_awaited()
+                    self.assertIsNone(fixture.pending.get_record(fixture.actor))
+                    self.assertTrue(any(call.args[0] == "keytao_pending_items_by_words"
+                                        for call in fixture.tools.await_args_list))
+                finally:
+                    await fixture.asyncTearDown()
+
     async def test_semantic_selection_skips_latest_digest_only_for_known_origin_id(self):
         from tests.test_semantic_pending import SemanticPendingTests
 
@@ -1520,6 +1552,27 @@ class S54RendererTests(unittest.TestCase):
 
 # Source: test_s58_advertisement.py
 class S58AdvertisementTests(unittest.TestCase):
+    def test_f2_model_marker_removal_preserves_list_items_and_newlines(self):
+        raw = "1. 词库查询未修改本地词库，本次未写入。\n2. 本地词库可能尚未更新。\n3. 可以刷新词库。"
+        expected = raw.replace("本次未写入", "")
+        self.assertEqual(AgentOrchestrator._finalize_reply(
+            "为什么查询后才看到这个词", raw, {},
+            termination_state={"model_authored_reply": True},
+        ), expected)
+        fallback = AgentOrchestrator._finalize_reply(
+            "现在怎么样", "本次未写入", {},
+            termination_state={"model_authored_reply": True},
+        )
+        self.assertTrue(fallback)
+        self.assertNotIn("普通问答", fallback)
+        self.assertNotIn("安全拦截", fallback)
+        meta = "这轮是普通问答，没有触发写入或安全拦截。"
+        for raw, expected in ((meta, "暂时没有更多信息。"),
+                              (f"正常答复。\n{meta}\n补充。", "正常答复。\n\n补充。")):
+            self.assertEqual(AgentOrchestrator._finalize_reply(
+                "现在怎么样", raw, {}, termination_state={"model_authored_reply": True},
+            ), expected)
+
     def test_s45_character_facts_survive_unbound_linguistic_examples(self):
         raw = (
             "「亻」加「巨」是「佢」字，读作 qú（二声）。\n\n"

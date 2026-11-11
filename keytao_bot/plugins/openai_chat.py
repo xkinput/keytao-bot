@@ -99,6 +99,7 @@ from ..utils.observability import (
     turn_failure_reply,
 )
 from ..utils.pending_confirmation import (
+    UnansweredChatReply,
     PENDING_ASSENT_TEXTS,
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
@@ -1756,7 +1757,7 @@ async def get_ai_response_core(
                 user_id,
             )
             result = _append_unbound_binding_notice(result, actor_is_bound)
-        if isinstance(result, ServerBackedQueryReply):
+        if isinstance(result, (ServerBackedQueryReply, UnansweredChatReply)):
             return result
         conversational_turn = _current_conversational_turn.get()
         if conversational_turn is not None:
@@ -5059,6 +5060,31 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     """Await enabled routing before command stages; retain the legacy shadow slot."""
     if ctx.operation_understood_early:
         return False
+    rejection = _chat_routing.explicit_add_sentence_rejection(ctx.normalized_message_text)
+    if rejection:
+        ctx.response = rejection
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, rejection)
+        await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, rejection, ctx.QQMessageSegment)
+        return True
+    record = conversation_state_store.get_record(ctx.conv_key) if ctx.conv_key is not None else None
+    if (
+        record is not None and not record.execution_id
+        and record.owner_key == normalize_conversation_key(ctx.conv_key, ctx.space_key)
+        and record.owner_key.platform == ctx.platform
+        and record.owner_key.actor_id == str(ctx.user_id)
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_submit_batch"
+        and record.state.args.get("_recent_own_write") is True
+        and (not ctx.reply_reference.is_reply or _verified_pending_reply(ctx, record))
+        and _chat_routing._is_explicit_draft_submit_request(ctx.normalized_message_text, record.state)
+    ):
+        ctx.normalized_message_text = "提交"
+        _current_turn_message.set(ctx.normalized_message_text)
+        ctx.command_intent_cache, ctx.command_intent_for = command_intent_memoizer(
+            ctx.message_text, ctx.normalized_message_text,
+        )
+        ctx.operation_understood_early = True
+        return False
     from ..harness.authorization_grammar import parse_compound_entry_command
 
     if parse_compound_entry_command(_strip_command_message_prefixes(ctx.normalized_message_text)) is not None:
@@ -5290,6 +5316,24 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             ctx.scoped_pending_state = ctx.scoped_pending_intent = ctx.scoped_pending_response = None
             ctx.response = None
             _current_conversational_turn.set(None)
+            if validated.op == "chat" and "query" in route_ops:
+                await _stage_generate_ai_response(ctx)
+                if isinstance(ctx.response, UnansweredChatReply) or re.fullmatch(
+                    r"(?:目前没有对应的操作请求|当前没有可验证的可执行操作|"
+                    r"这轮是普通问答(?:，没有触发写入或安全拦截)?)[。.!！]?",
+                    str(ctx.response or "").strip(),
+                ):
+                    source = _strip_command_message_prefixes(message).strip()
+                    words = await _get_simple_word_query_words(message)
+                    if words == (source,) and _chat_routing._is_chat_word_query_target(source):
+                        validated = replace(validated, op="query", operands=words)
+                        ctx.operation_request = validated
+                        ctx.semantic_nonwrite_route = "query"
+                        ctx.response = None
+                    elif words == (source,):
+                        ctx.response = enforce_conversational_reply(message, "", ctx.history or [])
+                    else:
+                        ctx.response = UnansweredChatReply("暂时没有更多信息。")
             if validated.op == "query":
                 ctx.simple_word_query_words = validated.operands
                 replies = []
@@ -7457,7 +7501,7 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
             **({"conversation_only": True} if ctx.semantic_nonwrite_route else {}),
         )
         conversational_turn = _current_conversational_turn.get()
-        if conversational_turn is not None:
+        if conversational_turn is not None and not isinstance(ctx.response, UnansweredChatReply):
             ctx.response = enforce_conversational_reply(
                 ctx.normalized_message_text, ctx.response, conversational_turn[1],
             )

@@ -366,7 +366,8 @@ _MULTI_ADD_VERB_RE = re.compile(ADD_OPERATION_VERB_PATTERN)
 _MULTI_ADD_ADDRESS_CLAUSES = frozenset({"喵喵"})
 
 _INTERROGATIVE_MESSAGE_RE = re.compile(
-    r"(?:[?？]|是什么(?:字|词|意思)?|怎么写|如何写|什么意思|什么含义|"
+    r"(?:[?？]|是什么(?:字|词|意思)?|怎么写|如何写|什么意思|啥意思|什么含义|"
+    r"^(?:什么时候|何时|多久)(?:才|会|能|在|被|开始|收录|加入|入库|进入).+|"
     r"读什么|读啥|念什么|念啥|是不是.{0,24}(?:吗|嘛|么)|"
     r"(?:吗|嘛|么|呢)[。.!！~～]?$)"
 )

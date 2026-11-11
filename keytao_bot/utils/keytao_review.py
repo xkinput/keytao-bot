@@ -124,6 +124,9 @@ _current_commonness_evidence: ContextVar[Tuple[str, ...]] = ContextVar(
     "current_commonness_evidence",
     default=(),
 )
+current_review_words: ContextVar[Tuple[str, ...]] = ContextVar(
+    "current_review_words", default=(),
+)
 
 
 def begin_commonness_evidence_turn() -> Token[Tuple[str, ...]]:
@@ -4007,6 +4010,32 @@ async def prepare_reviewed_word(
                 )
                 if semantic_group:
                     groups = [semantic_group]
+
+            review_words = current_review_words.get()
+            if (
+                not groups
+                and len(set(review_words)) > 1
+                and word in review_words
+                and standard_status == "unavailable"
+                and pronunciation_source == "zdic-unavailable"
+                and proposal.get("accepted") is not True
+                and all(
+                    tuple(candidate.get("normalized") or ()) == default_sequence
+                    for candidate in [
+                        *raw_groups,
+                        *(pronunciation_resolution.get("web", {}).get("candidates") or []),
+                    ]
+                )
+                and _context_pinyin_sequence(encode_data) in ((), default_sequence)
+                and not _pronunciation_sequence_rejection_reason(word, default_sequence, encode_data)
+            ):
+                groups = [
+                    _review_group_from_returned(
+                        returned, evidence_kind="own_character", requires_manual_review=True,
+                    )
+                    for returned in returned_groups
+                    if tuple(returned.get("normalized") or ()) == default_sequence
+                ]
 
             if not groups:
                 return apply_review_disposition(apply_manual_review_flag({

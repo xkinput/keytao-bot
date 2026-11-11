@@ -42,6 +42,7 @@ from keytao_bot.utils.pending_confirmation import (
     FAILED_WRITE_TEMPLATE_MARKER,
     FAILED_WRITE_TEMPLATE_PREFIX,
     SYSTEM_REPLY_TEMPLATE_MARKERS,
+    UnansweredChatReply,
     append_unbound_binding_notice,
     already_existing_word_copy,
     already_existing_words_copy,
@@ -4378,17 +4379,18 @@ class AgentOrchestrator:
             )
             return binding_answer
 
-        clean_segments = [
-            segment
-            for segment in re.split(r"(?<=[。！？!?])|\n+", str(reply or ""))
-            if segment.strip()
-            and not any(marker in segment for marker in SYSTEM_REPLY_TEMPLATE_MARKERS)
-        ]
-        cleaned = "".join(clean_segments).strip()
+        cleaned = str(reply or "")
+        has_noop_marker = any(marker in cleaned for marker in (
+            "目前没有对应的操作请求", "当前没有可验证的可执行操作", "这轮是普通问答",
+        ))
+        for marker in SYSTEM_REPLY_TEMPLATE_MARKERS:
+            cleaned = cleaned.replace(marker, "")
         logger.warning(
             "[system_template_impersonation] stripped model-authored marker"
         )
-        return cleaned or "这轮是普通问答，没有触发写入或安全拦截。"
+        if not cleaned.strip(" \t\r\n，,；;。！!?？：:"):
+            return UnansweredChatReply("暂时没有更多信息。")
+        return UnansweredChatReply(cleaned) if has_noop_marker else cleaned
 
     @staticmethod
     def _capture_authoritative_result_links(

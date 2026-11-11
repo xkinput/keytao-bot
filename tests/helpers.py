@@ -3020,7 +3020,7 @@ async def HotfixMultiwordTests_assert_candidates(self, words):
     self.assertEqual([row["word"] for row in selected.args["items"]], resolved)
     for word in words:
         if word in self.unresolved:
-            line = f"「{word}」未能确认读音或候选编码，请提供读音或具体编码。"
+            line = f"「{word}」暂时没有可核验的候选，请单独查询此词。"
             self.assertEqual(delivered.splitlines().count(line), 1)
             self.assertNotIn(f"「{word}」候选编码", delivered)
         else:

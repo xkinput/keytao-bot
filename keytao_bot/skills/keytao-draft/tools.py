@@ -3505,6 +3505,7 @@ async def keytao_pending_items_by_words(
             return {
                 "success": True,
                 "complete": True,
+                "othersComplete": False,
                 "bound": False,
                 "notBound": True,
                 "words": requested_words,
@@ -3516,6 +3517,7 @@ async def keytao_pending_items_by_words(
             raise KeytaoApiError("current draft snapshot was incomplete")
 
         pending_items: List[Dict] = []
+        others_complete = True
         requested_set = set(requested_words)
         draft_batch_id = str(draft_result.get("batchId") or "").strip()
         if draft_batch_id:
@@ -3592,6 +3594,8 @@ async def keytao_pending_items_by_words(
                             and batch.get("status") == "Submitted"
                         ):
                             candidate_batches[candidate_id] = batch
+                        else:
+                            others_complete = False
                     if page >= total_pages:
                         break
                     page += 1
@@ -3602,6 +3606,7 @@ async def keytao_pending_items_by_words(
                 own_batch = creator_id == actor_id
                 if not own_batch:
                     if other_details >= 10:
+                        others_complete = False
                         continue
                     other_details += 1
                 try:
@@ -3633,6 +3638,7 @@ async def keytao_pending_items_by_words(
                 except Exception as error:
                     if own_batch:
                         raise
+                    others_complete = False
                     logger.warning(
                         "[pending_items_by_words] Other submitted detail skipped: "
                         f"{type(error).__name__}"
@@ -3641,9 +3647,12 @@ async def keytao_pending_items_by_words(
                 batch_url = make_batch_url(batch_id)
                 for item in batch["pullRequests"]:
                     if not isinstance(item, dict):
+                        others_complete = False
                         continue
                     item_word = str(item.get("word") or "").strip()
                     old_word = str(item.get("oldWord") or "").strip()
+                    if not item_word or not isinstance(item.get("status"), str):
+                        others_complete = False
                     if (
                         item.get("status") != "Pending"
                         or item_word not in requested_set
@@ -3664,6 +3673,7 @@ async def keytao_pending_items_by_words(
                     })
 
         trusted = trusted_pending_word_items(pending_items)
+        others_complete = others_complete and len(trusted) == len(pending_items)
         trusted.sort(key=lambda item: (
             0 if item["source"] == "submitted" else 1,
             item["word"],
@@ -3673,6 +3683,7 @@ async def keytao_pending_items_by_words(
         return {
             "success": True,
             "complete": True,
+            "othersComplete": others_complete,
             "bound": True,
             "words": requested_words,
             "items": trusted,

@@ -1404,7 +1404,7 @@ class B9LookupTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_failure_keeps_each_word_fail_closed(self):
         self.pending_failure = True
         response = await self.prepare(("喜上眉梢", "未收录"))
-        self.assertEqual(response, "Offline pending unavailable\n\nOffline pending unavailable")
+        self.assertEqual(response, "「喜上眉梢」暂时没有可核验的候选。\n\n「未收录」暂时没有可核验的候选。")
         self.assertEqual([name for name, _args in self.calls], [
             "keytao_lookup_by_words_batch", "keytao_pending_items_by_words",
         ])
@@ -1950,6 +1950,164 @@ class QueryPrecedenceTests(unittest.IsolatedAsyncioTestCase):
 
     delivered = QueryPrecedenceTests_delivered
 
+    async def test_interrogative_characters_inside_words_preserve_lexical_routes(self):
+        from keytao_bot.utils.explicit_code import parse_explicit_entry_code_request
+
+        grammar = s70_smalltalk_chat._authorization_grammar
+        for message in ("鹿死谁手 lsss 加入", "加入 舍我其谁 wwqs", "加入 怎么着 zmzv"):
+            with self.subTest(message=message):
+                self.assertIsNotNone(parse_explicit_entry_code_request(message))
+        self.assertEqual(
+            b17_rest_recommended_routing._extract_explicit_reviewed_add_word("加词 鹿死谁手"),
+            "鹿死谁手",
+        )
+        for word in ("不怎么样", "哪里哪里", "何时", "谁料", "非谁莫属"):
+            with self.subTest(word=word):
+                self.assertEqual(await b17_rest_recommended_routing._get_simple_word_query_words(word), (word,))
+        self.assertTrue(grammar.is_interrogative_message("什么时候在词库的"))
+
+    async def test_f2_m1_01_bare_words_override_semantic_chat(self):
+        from tests.test_add_and_select import B18RealToolTests
+
+        fixture = B18RealToolTests()
+        fixture.addCleanup = self.addCleanup
+        fixture.setUp()
+        facts = {"哈基米": ("hjm", "hā jī mǐ"), "魔了": ("mole", "mó le"),
+                 "南北绿豆": ("nbld", "nán běi lǜ dòu")}
+        fixture.install_f2_review_http(facts, set())
+        fixture.http.entries[:] = [{"word": "哈基米", "code": "hjm", "type": "Phrase", "weight": 100}]
+        try:
+            for word, meta in (
+                ("哈基米", "目前没有对应的操作请求。"), ("魔了", "这轮是普通问答。"),
+                ("哈基米", "“哈基米”是常见网络用语，目前没有对应的操作请求。"),
+                ("南北绿豆", "当前没有可验证的可执行操作。"),
+                ("魔了", "这轮是普通问答，没有触发写入或安全拦截。"),
+            ):
+                with self.subTest(word=word):
+                    fixture.replay.store.delete(fixture.replay.author)
+                    fixture.replay.history.clear()
+
+                    async def model(text, *_args, **_kwargs):
+                        return await GeneralReplyTests_reply(self, text, meta)
+
+                    with patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "query,chat"}), patch.object(
+                        fixture.replay.chat, "get_ai_response_core", side_effect=model,
+                    ):
+                        await fixture.turn(word, raw_operation(op="chat", operands=[], codes=[], frame="none"))
+                    reply = fixture.replay.last_response
+                    self.assertIn(word, reply)
+                    self.assertNotIn(meta, reply)
+                    if word == "哈基米":
+                        self.assertIn("已在词库", reply)
+                        self.assertIn("hjm", reply)
+                        self.assertIsNone(fixture.replay.store.get(fixture.replay.author))
+                    else:
+                        self.assertIn("推荐编码", reply)
+                        self.assertIsNotNone(fixture.replay.store.get(fixture.replay.author))
+                    self.assertEqual(fixture.replay.chat._finish_ai_chat_response.await_args.args[4], reply)
+            self.assertEqual(fixture.http.writes, [])
+        finally:
+            fixture.tearDown()
+
+    async def test_semantic_chat_keeps_short_smalltalk_without_add_tickets(self):
+        from tests.test_add_and_select import B18RealToolTests
+
+        fixture = B18RealToolTests()
+        fixture.addCleanup = self.addCleanup
+        fixture.setUp()
+        fixture.install_f2_review_http({}, set())
+        try:
+            for message in ("你好可爱", "今天好热", "这个不错", "刚才那个词", "好的谢谢", "原来如此"):
+                for answer in ("喵，听着呢。", "目前没有对应的操作请求。", "这轮是普通问答，没有触发写入或安全拦截。"):
+                    async def model(text, *_args, **_kwargs):
+                        return await GeneralReplyTests_reply(self, text, answer)
+
+                    with self.subTest(message=message, answer=answer), patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "query,chat"}), patch.object(
+                        fixture.replay.chat, "get_ai_response_core", side_effect=model,
+                    ):
+                        fixture.replay.history.clear()
+                        fixture.http.requests.clear()
+                        await fixture.turn(message, raw_operation(op="chat", operands=[], codes=[], frame="none"))
+                        if answer == "喵，听着呢。":
+                            self.assertEqual(fixture.replay.last_response, answer)
+                        for marker in ("普通问答", "对应的操作请求", "可验证的可执行操作", "安全拦截"):
+                            self.assertNotIn(marker, fixture.replay.last_response)
+                        self.assertNotIn("推荐编码", fixture.replay.last_response)
+                        self.assertIsNone(fixture.replay.store.get(fixture.replay.author))
+                        self.assertEqual(fixture.http.requests, [])
+                        self.assertEqual(fixture.http.writes, [])
+        finally:
+            fixture.tearDown()
+
+    async def test_f2_m1_03_followup_question_is_answered_once_without_review(self):
+        message = "什么时候在词库的"
+        answer = "暂时查不到「冲锋衣」的收录时间。"
+        history = []
+
+        def remember(_key, _memory, text, response):
+            history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": response}])
+
+        tokens = [(variable, variable.set(value)) for variable, value in (
+            (s70_smalltalk_chat._current_turn_message, ""),
+            (s70_smalltalk_chat._current_conversational_turn, None),
+            (s70_smalltalk_chat.current_operation_capture, None),
+            (s70_smalltalk_chat.current_draft_delivery_claims, []),
+        )]
+        try:
+            with self.runtime(), patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": ""}), patch.object(
+                s70_smalltalk_chat, "extract_memory_context", AsyncMock(return_value=self.memory),
+            ), patch.object(s70_smalltalk_chat, "get_history", side_effect=lambda *_args: history), patch.object(
+                s70_smalltalk_chat, "remember_conversation", side_effect=remember,
+            ), patch.object(s70_smalltalk_chat, "build_reply_context", AsyncMock(return_value="")), patch.object(
+                s70_smalltalk_chat, "get_ai_response_core", AsyncMock(return_value=answer),
+            ) as model, patch.object(
+                s70_smalltalk_chat, "_classify_message_command_intent",
+                AsyncMock(return_value=harness.MessageCommandIntent(has_operation_intent=False)),
+            ), patch.object(
+                s70_smalltalk_chat, "_classify_simple_word_query_intent",
+                AsyncMock(return_value=harness.SimpleWordQueryIntent(False)),
+            ):
+                for text in ("冲锋衣", message):
+                    previous_calls = list(self.calls)
+                    event = SimpleNamespace(message=[], get_plaintext=lambda: text)
+                    await s70_smalltalk_chat._handle_ai_chat_serialized(object(), event, "qq", self.key.actor_id)
+                    if text == message:
+                        self.assertEqual(self.calls, previous_calls)
+                delivered = s70_smalltalk_chat._finish_ai_chat_response.await_args_list
+                self.assertEqual(len(delivered), 2)
+                self.assertIn("「冲锋衣」已在词库", str(delivered[0].args[4]))
+                self.assertEqual(delivered[1].args[4], answer)
+                model.assert_awaited_once()
+                self.assertEqual(model.await_args.args[0], message)
+                self.assertIn("冲锋衣", str(model.await_args.args[3]))
+                s70_smalltalk_chat._finish_ai_chat_matcher.assert_not_awaited()
+            self.assertIsNone(self.store.get(self.key))
+            self.assertIn(("keytao_lookup_by_word", {"word": "冲锋衣"}), self.calls)
+            self.assertEqual(await b17_rest_recommended_routing._get_simple_word_query_words(message), ())
+        finally:
+            for variable, token in reversed(tokens):
+                variable.reset(token)
+
+    async def test_f2_m2_6_long_sentence_add_gets_short_rejection(self):
+        message = "加词：“床前看月光，疑是地上霜，举头望山月，低头思故乡”"
+        client = FakeClient(json.dumps(raw_operation(op="chat", operands=[], codes=[], frame="none")))
+        ctx = s70_smalltalk_chat.TurnContext(
+            bot=object(), event=object(), platform="qq", user_id=self.key.actor_id,
+            message_text=message, normalized_message_text=message, conv_key=self.key,
+            space_key=self.key.space_key, memory_context=self.memory, history=[],
+        )
+        with self.runtime(), patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "query,chat"}), patch.object(
+            s70_smalltalk_chat, "AsyncOpenAI", return_value=client,
+        ), patch.object(s70_smalltalk_chat, "get_ai_response_core", AsyncMock(return_value="这次服务没有完成处理，本次未写入。")):
+            self.assertTrue(await s70_smalltalk_chat._stage_understand_operation_early(ctx))
+        self.assertEqual(ctx.response, "这是句子，请添加其中的单个词语。")
+        self.assertEqual(self.calls, [])
+        self.assertFalse(client.create.await_count)
+
+        self.assertEqual(b17_rest_recommended_routing.explicit_add_sentence_rejection(
+            "加词：显眼包、嘴替、松弛感、电子榨菜、情绪价值、班味、泼天富贵、精神状态、职场搭子",
+        ), "")
+
     async def test_bare_words_with_move_verb_prefixes_query_without_classifier(self):
         for word in ("移民", "调查", "挪威", "调整", "移动", "调值"):
             with self.subTest(word=word), patch.object(
@@ -2244,9 +2402,47 @@ class StaleTicketReleaseTests(unittest.IsolatedAsyncioTestCase):
                 result["model"].assert_not_awaited()
 
 
+class F2DraftSubmitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_f2_m3_05_publish_after_real_draft_receipt_submits_own_draft(self):
+        from tests.helpers import (
+            B18RealToolTests_setUp, B18RealToolTests_seed, B18RealToolTests_turn,
+            TOOLS, b19_partial_reply_binding_DraftHTTP,
+        )
+
+        B18RealToolTests_setUp(self)
+        finish = self.replay.chat._finish_ai_chat_response.side_effect
+
+        def acknowledge(*args):
+            token = self.replay.commands.current_memory_context.set(self.replay.memory)
+            try:
+                self.replay.commands._acknowledge_delivered_draft_mutations(str(args[4]))
+                finish(*args)
+            finally:
+                self.replay.commands.current_memory_context.reset(token)
+
+        self.replay.chat._finish_ai_chat_response.side_effect = acknowledge
+        for command in ("发布", "提交"):
+            with self.subTest(command=command):
+                self.replay.store.delete(self.replay.author)
+                self.http = b19_partial_reply_binding_DraftHTTP()
+                self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
+                B18RealToolTests_seed(self, ("招笑",), reorder=False)
+                await B18RealToolTests_turn(self, "招笑 2，加入")
+                self.assertTrue(self.http.writes, self.replay.last_response)
+                self.assertEqual(self.http.submissions, 0)
+                receipt = self.replay.store.get(self.replay.author)
+                self.assertIsInstance(receipt, PendingToolConfirm)
+                self.assertTrue(receipt.args.get("_recent_own_write"), receipt)
+                await B18RealToolTests_turn(self, command, raw_operation(op="query", operands=["发布"], codes=[]))
+                self.assertEqual(self.http.submissions, 1, self.replay.last_response)
+                self.assertNotIn("「发布」已在词库", self.replay.last_response)
+                self.assertEqual(self.http.errors, [])
+
+
 def load_tests(loader, standard_tests, pattern):
     return _stage_t_unittest.TestSuite(
         loader.loadTestsFromTestCase(case) for case in (
+            F2DraftSubmitTests,
             B6ReminderTests,
             B6SubmitTests,
             B6ReminderIntegrationTests,

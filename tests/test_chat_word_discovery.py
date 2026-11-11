@@ -13,9 +13,12 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
 
 from tests import test_state_machine as harness
 from tests.helpers import (
+    OfflineResponse,
+    PendingWordHTTP,
     REAL_CALL_TOOL,
     TOOLS,
     b18_rest_real_tools_FACTS,
@@ -542,7 +545,8 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         if name == "keytao_lookup_by_word":
             return json.dumps({"success": True, "word": arguments["word"], "phrases": []})
         if name == "keytao_pending_items_by_words":
-            return json.dumps({"success": True, "complete": True, "items": []})
+            return json.dumps({"success": True, "complete": True, "bound": True,
+                               "othersComplete": True, "items": []})
         if name == "keytao_prepare_reviewed_add":
             return json.dumps(reviewed(arguments["word"]), ensure_ascii=False)
         raise AssertionError(f"Unexpected offline tool: {name}")
@@ -550,6 +554,149 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def offer(self, event=None):
         await self.discovery.discover(self.bot, event or self.event, self.chat)
         return self.pending.get_record(self.actor)
+
+    async def test_m3_09_casual_pending_word_skips_offer_through_qq_pipeline_with_real_tools(self):
+        with closing(sqlite3.connect(self.reference)) as conn, conn:
+            conn.execute("INSERT INTO word_commonness VALUES (?, ?, ?, ?)",
+                         ("麻糍", discovery.DISCOVERY_MIN_COMMONNESS + 10, "n", 2))
+        tool_functions = {**TOOLS.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS,
+                          **harness._lookup_tools.TOOL_FUNCTIONS}
+        for source in ("draft", "submitted", "others_submitted"):
+            with self.subTest(source=source):
+                http = PendingWordHTTP(source)
+                http.entries = []
+                http.pending_row.update(word="麻糍", code="msck")
+                if source == "draft":
+                    http.rows[:] = [copy.deepcopy(http.pending_row)]
+                event = FakeEvent("吃了麻糍再走")
+                with (
+                    qq_runtime(self.chat, self.bot) as bot,
+                    patch.object(discovery, "_discovery", self.discovery),
+                    patch.object(self.chat, "call_tool_function", REAL_CALL_TOOL),
+                    patch.object(self.commands.tool_executor, "_get_tool_function", tool_functions.get),
+                    patch.object(TOOLS.httpx, "AsyncClient", side_effect=lambda **_: http, create=True),
+                    patch.object(TOOLS.http_client, "_keytao_client", http),
+                    patch.object(TOOLS, "get_bot_token", return_value="offline-token"),
+                    patch.object(TOOLS, "get_keytao_url", return_value="https://offline.invalid"),
+                    patch.object(TOOLS, "get_bot_headers", return_value={}),
+                ):
+                    await self.chat.trace_sensitive_message(bot, event)
+                    self.assertIsNotNone(self.discovery.task)
+                    await asyncio.wait_for(self.discovery.task, timeout=5)
+                    self.assertFalse(await self.chat.should_handle(bot, event))
+                self.assertIsNone(self.pending.get_record(self.actor))
+                self.bot.send.assert_not_awaited()
+                self.verify.assert_not_awaited()
+                self.assertIn(("GET", "/api/batches", {
+                    "status": "Submitted", "search": "麻糍", "page": 1, "pageSize": 100,
+                }), http.requests)
+                if source != "draft":
+                    self.assertIn(("GET", f"/api/batches/{http.pending_batch_id}", {}), http.requests)
+                self.assertFalse(any(path == "/api/phrases/encode" for _, path, _ in http.requests))
+                self.assertEqual(http.writes, [])
+                self.assertEqual(http.errors, [])
+
+    async def test_unbound_speaker_with_new_word_keeps_proactive_offer(self):
+        async def unbound_tool(name, arguments, *args, **kwargs):
+            if name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "bound": False,
+                                   "othersComplete": False, "items": []})
+            return await self.tool(name, arguments, *args, **kwargs)
+
+        self.tools.side_effect = unbound_tool
+        with patch.object(self.commands.user_resolver, "resolve_actor_binding", AsyncMock(return_value=False)):
+            record = await self.offer()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.word, "午时")
+        self.verify.assert_awaited_once_with(self.chat, "午时", "午时")
+        self.bot.send.assert_awaited_once()
+        self.assertEqual([call.args[0] for call in self.tools.await_args_list], [
+            "keytao_lookup_by_words_batch", "keytao_pending_items_by_words", "keytao_prepare_reviewed_add",
+        ])
+
+    async def test_pending_discovery_keeps_offer_when_other_batches_cannot_be_checked(self):
+        class IncompletePendingHTTP(PendingWordHTTP):
+            def _response(http, method, url, kwargs):
+                path = urlsplit(url).path
+                if http.failure == "unbound" and path.endswith("/user/find"):
+                    http.requests.append((method, path, {}))
+                    return OfflineResponse({"found": False}, 404)
+                if http.failure == "detail" and path == f"/api/batches/{http.pending_batch_id}":
+                    http.requests.append((method, path, {}))
+                    raise TOOLS.httpx.TransportError("Offline pending detail unavailable")
+                if http.failure == "metadata" and path == "/api/batches":
+                    http.requests.append((method, path, copy.deepcopy(kwargs.get("params") or {})))
+                    return OfflineResponse({"batches": [{}], "pagination": {"page": 1, "totalPages": 1}})
+                if http.failure == "items" and path == f"/api/batches/{http.pending_batch_id}":
+                    http.requests.append((method, path, {}))
+                    return OfflineResponse({"batch": {
+                        "id": http.pending_batch_id, "status": "Submitted", "creatorId": 43,
+                        "pullRequests": [None, {}],
+                    }})
+                if http.failure == "budget" and path == "/api/batches":
+                    http.requests.append((method, path, copy.deepcopy(kwargs.get("params") or {})))
+                    return OfflineResponse({"batches": [
+                        {"id": f"other-{index}", "status": "Submitted", "creator": {"id": 43}}
+                        for index in range(11)
+                    ], "pagination": {"page": 1, "totalPages": 1}})
+                if http.failure == "budget" and path.startswith("/api/batches/other-"):
+                    http.requests.append((method, path, {}))
+                    return OfflineResponse({"batch": {
+                        "id": path.rsplit("/", 1)[1], "status": "Submitted", "creatorId": 43,
+                        "pullRequests": [],
+                    }})
+                return super()._response(method, url, kwargs)
+
+        tool_functions = {**TOOLS.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS,
+                          **harness._lookup_tools.TOOL_FUNCTIONS}
+        for failure in ("unbound", "detail", "budget", "metadata", "items"):
+            with self.subTest(failure=failure):
+                self.pending.delete(self.actor)
+                self.store = discovery.DiscoveryStore(self.root / f"incomplete-{failure}.db")
+                self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
+                self.bot.send.reset_mock()
+                self.verify.reset_mock()
+                http = IncompletePendingHTTP("others_submitted")
+                http.failure = failure
+                http.entries = []
+                event = FakeEvent("午时再走")
+                pending_results = []
+
+                async def real_tool(name, *args, **kwargs):
+                    if name == "keytao_prepare_reviewed_add":
+                        return json.dumps(reviewed("午时"), ensure_ascii=False)
+                    result = await REAL_CALL_TOOL(name, *args, **kwargs)
+                    if name == "keytao_pending_items_by_words":
+                        pending_results.append(json.loads(result))
+                    return result
+
+                with (
+                    qq_runtime(self.chat, self.bot) as bot,
+                    patch.object(discovery, "_discovery", self.discovery),
+                    patch.object(self.chat, "call_tool_function", real_tool),
+                    patch.object(self.commands.tool_executor, "_get_tool_function", tool_functions.get),
+                    patch.object(TOOLS.httpx, "AsyncClient", side_effect=lambda **_: http, create=True),
+                    patch.object(TOOLS.http_client, "_keytao_client", http),
+                    patch.object(TOOLS, "get_bot_token", return_value="offline-token"),
+                    patch.object(TOOLS, "get_keytao_url", return_value="https://offline.invalid"),
+                    patch.object(TOOLS, "get_bot_headers", return_value={}),
+                ):
+                    await self.chat.trace_sensitive_message(bot, event)
+                    self.assertIsNotNone(self.discovery.task)
+                    await asyncio.wait_for(self.discovery.task, timeout=5)
+                    self.assertFalse(await self.chat.should_handle(bot, event))
+                self.assertEqual(len(pending_results), 1)
+                self.assertIs(pending_results[0].get("success"), True)
+                self.assertIs(pending_results[0].get("complete"), True)
+                self.assertIs(pending_results[0].get("othersComplete"), False)
+                self.assertIs(pending_results[0].get("bound"), failure != "unbound")
+                self.assertIsNotNone(self.pending.get_record(self.actor))
+                self.assertEqual(self.pending.get_record(self.actor).state.word, "午时")
+                self.bot.send.assert_awaited_once()
+                self.verify.assert_awaited_once_with(self.chat, "午时", "午时再走")
+                self.assertFalse(any(path == "/api/phrases/encode" for _, path, _ in http.requests))
+                self.assertEqual(http.writes, [])
+                self.assertEqual(http.errors, [])
 
     async def test_discovery_add_and_submit_accepts_both_word_orders_with_real_tools(self):
         for index, message in enumerate(("提交并加入", "加入并提交")):
@@ -615,8 +762,9 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 verify.assert_awaited_once()
                 self.assertIs(self.store.get_verdict(word), False)
         self.bot.send.assert_not_awaited()
-        self.assertTrue(all(call.args[0] == "keytao_lookup_by_words_batch"
-                            for call in self.tools.await_args_list))
+        self.assertEqual([call.args[0] for call in self.tools.await_args_list], [
+            "keytao_lookup_by_words_batch", "keytao_pending_items_by_words",
+        ] * 4)
 
     async def test_commonness_word_requires_model_acceptance_before_offer(self):
         record = await self.offer()
@@ -640,8 +788,9 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.verify.assert_awaited_once_with(self.chat, word, word)
                 self.assertIs(self.store.get_verdict(word), False)
         self.bot.send.assert_not_awaited()
-        self.assertTrue(all(call.args[0] == "keytao_lookup_by_words_batch"
-                            for call in self.tools.await_args_list))
+        self.assertEqual([call.args[0] for call in self.tools.await_args_list], [
+            "keytao_lookup_by_words_batch", "keytao_pending_items_by_words",
+        ] * 4)
 
     async def test_commonness_rejection_or_failure_uses_only_one_call_per_message(self):
         for verdict in (False, None):
@@ -796,7 +945,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.state.server_candidates, [("wj", False), ("wja", False)])
         self.assertTrue(record.origin_prompt_digest)
         self.assertEqual([call.args[0] for call in self.tools.await_args_list], [
-            "keytao_lookup_by_words_batch", "keytao_prepare_reviewed_add",
+            "keytao_lookup_by_words_batch", "keytao_pending_items_by_words", "keytao_prepare_reviewed_add",
         ])
         self.bot.send.assert_awaited_once()
         message = self.bot.send.await_args.kwargs["message"]
@@ -846,7 +995,9 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_only_one_offer_and_one_batch_lookup_per_message(self):
         await self.offer(FakeEvent("午时，阳光，清风"))
-        self.assertEqual(self.tools.await_count, 2)
+        self.assertEqual([call.args[0] for call in self.tools.await_args_list], [
+            "keytao_lookup_by_words_batch", "keytao_pending_items_by_words", "keytao_prepare_reviewed_add",
+        ])
         self.assertEqual(self.tools.await_args_list[0].args[1], {"words": ["午时", "阳光", "清风"]})
         self.bot.send.assert_awaited_once()
         self.assertEqual(self.pending.live_entry_count(), 1)
@@ -884,7 +1035,9 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.offer(reply)
         self.assertFalse(self.store.eligible(ConversationAddress.group("qq", "elsewhere", "100")))
         self.assertIsNone(self.pending.get_record(self.actor))
-        self.assertEqual(self.tools.await_count, 2)
+        self.assertEqual([call.args[0] for call in self.tools.await_args_list], [
+            "keytao_lookup_by_words_batch", "keytao_pending_items_by_words", "keytao_prepare_reviewed_add",
+        ])
 
     async def test_opt_out_rule_repeats_without_writing_preferences_or_consuming_ticket(self):
         record = await self.offer()

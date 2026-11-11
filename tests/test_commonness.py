@@ -1677,6 +1677,30 @@ class S67RankingTests(unittest.TestCase):
 
     cells = S67RankingTests_cells
 
+    def test_m1_04_commonness_question_without_comparative_is_read_only(self):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executemany(
+                "INSERT INTO bcc_frequency VALUES ('multi_domain_total_word_freq.txt', ?, ?, ?, ?)",
+                [("爆火", 400, 1.0, 1), ("包伙", 100, 0.25, 2)],
+            )
+        text = asyncio.run(self.reply("爆火和包伙，哪个常用", entries=[]))
+        self.assertIn("「爆火」较「包伙」更常用", text)
+        self.assertIn("所用频次比 4.00×", text)
+        self.assertNotIn("候选编码", text)
+        self.assertNotIn("这次服务没有完成处理", text)
+
+    def test_m2_5_frequency_question_compares_both_words_without_add_card(self):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executemany(
+                "INSERT INTO bcc_frequency VALUES ('multi_domain_total_word_freq.txt', ?, ?, ?, ?)",
+                [("枪炮", 400, 1.0, 1), ("抢跑", 100, 0.25, 2)],
+            )
+        text = asyncio.run(self.reply("枪炮 抢跑，哪个词频更高", entries=[]))
+        self.assertIn("「枪炮」较「抢跑」更常用", text)
+        self.assertIn("所用频次比 4.00×", text)
+        self.assertNotIn("候选编码", text)
+        self.assertNotIn("这次服务没有完成处理", text)
+
     def test_modern_absent_row_names_jieba_and_absence(self):
         text = asyncio.run(self.reply())
         frequency = self.cells(text, "鎗")[2]

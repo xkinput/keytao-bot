@@ -662,6 +662,21 @@ class WordDiscovery:
                     self._present_words.popitem(last=False)
             elif phrases == [] and matches[0].get("success") is True:
                 missing.append(candidate)
+        if not missing:
+            return
+        try:
+            pending = json.loads(await chat.call_tool_function(
+                "keytao_pending_items_by_words", {"words": [candidate.word for candidate in missing]}, *address.actor_key,
+            ))
+        except (TypeError, ValueError):
+            pending = None
+        # An offer is advisory; unavailable pending facts must not block it.
+        if (isinstance(pending, dict) and pending.get("success") is True
+                and pending.get("complete") is True and pending.get("othersComplete") is True
+                and isinstance(pending.get("items"), list)):
+            pending_words = {str(item.get(field) or "").strip() for item in pending["items"]
+                             if isinstance(item, dict) for field in ("word", "oldWord")}
+            missing = [candidate for candidate in missing if candidate.word not in pending_words]
         word, source, verdict_status = "", "-", "-"
         model_called = False
         for candidate in missing:

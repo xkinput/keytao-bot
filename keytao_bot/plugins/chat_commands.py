@@ -167,6 +167,7 @@ from .chat_routing import (
     _describe_pending_state,
     _describe_pending_ticket_choice,
     _extract_explicit_reviewed_add_word,
+    explicit_add_sentence_rejection,
     _extract_referenced_word_targets,
     _format_live_ticket_precedence_message,
     _get_simple_word_query_words,
@@ -3640,15 +3641,19 @@ async def _prepare_multi_word_query(
             existing_words = {} if present_word_codes is not None else None
             binding_notices: List[bool] = []
             request = next((row for row in reading_requests if row.word == word), None)
-            response = await _try_handle_simple_single_word_query(
-                word, platform, user_id, conv_key, space_key, owner_label,
-                _prepared_scopes=word_scopes,
-                _prepared_existing_words=existing_words,
-                _prepared_binding_notices=binding_notices,
-                _prepared_data=prepared_data[word],
-                requested_reading=request.reading if request else "",
-                requested_code=request.code if request else "",
-            )
+            token = keytao_review.current_review_words.set(words)
+            try:
+                response = await _try_handle_simple_single_word_query(
+                    word, platform, user_id, conv_key, space_key, owner_label,
+                    _prepared_scopes=word_scopes,
+                    _prepared_existing_words=existing_words,
+                    _prepared_binding_notices=binding_notices,
+                    _prepared_data=prepared_data[word],
+                    requested_reading=request.reading if request else "",
+                    requested_code=request.code if request else "",
+                )
+            finally:
+                keytao_review.current_review_words.reset(token)
             return word_scopes, existing_words, response, keytao_review.current_commonness_evidence(), binding_notices
 
     results = await asyncio.gather(*(prepare_word(word) for word in words), return_exceptions=True)
@@ -3670,7 +3675,14 @@ async def _prepare_multi_word_query(
             response = append_unbound_binding_notice(response, actor_is_bound)
         if not word_scopes and not (present_word_codes is not None and word in present_word_codes):
             other_block_words[len(other_blocks)] = word
-            other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
+            response = str(response or "")
+            generic_failure = any(marker in response for marker in (
+                "后续处理未能生成安全回复", "这次服务没有完成处理",
+            ))
+            other_blocks.append(
+                response if word in response and not generic_failure
+                else f"「{word}」暂时没有可核验的候选。"
+            )
 
     if present_word_codes:
         other_blocks.append(already_existing_words_copy(present_word_codes))
@@ -3761,7 +3773,7 @@ async def _prepare_multi_word_query(
     # Diagnostic instructions cannot borrow the resolved words' batch ticket.
     for index, word in other_block_words.items():
         if advertised_reply_contract(other_blocks[index]).requires_live_state:
-            other_blocks[index] = f"「{word}」未能确认读音或候选编码，请提供读音或具体编码。"
+            other_blocks[index] = f"「{word}」暂时没有可核验的候选，请单独查询此词。"
     other_blocks[:0] = pending_word_reminder_lines(shown_others, words=combined_words)
     items: List[Dict[str, Any]] = []
     for scope in scopes:
@@ -3828,6 +3840,10 @@ async def _try_handle_simple_single_word_query(
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     from ..utils.reading_request import parse_parenthesised_readings
+
+    rejection = explicit_add_sentence_rejection(message_text)
+    if rejection:
+        return rejection
 
     explicit_words = (
         _explicit_add_candidate_words(message_text)

@@ -582,8 +582,17 @@ def _is_plain_draft_submit_request(message_text: str) -> bool:
     )
 
 
-def _is_explicit_draft_submit_request(message_text: str) -> bool:
+def _is_explicit_draft_submit_request(
+    message_text: str, pending_state: Optional[PendingState] = None,
+) -> bool:
     """Recognize a current-draft submit command without stealing questions."""
+    if (
+        isinstance(pending_state, PendingToolConfirm)
+        and pending_state.function_name == "keytao_submit_batch"
+        and pending_state.args.get("_recent_own_write") is True
+        and re.fullmatch(r"发布(?:草稿)?(?:吧)?[。.!！]?", message_text.strip())
+    ):
+        return True
     return _is_plain_draft_submit_request(message_text)
 
 
@@ -3216,7 +3225,28 @@ def _is_bare_word_query_target(word: str) -> bool:
             word,
         )
         and not re.match(r"^(?:我|你|他|她|它|我们|你们|他们)(?:说|觉得|认为|感觉|想|要)", word)
+        and not re.match(r"^(?:把|将).+(?:换成|改成|替换为)", word)
         and not re.search(r"(?:哪个|哪种|哪一个|用得多|(?:先|暂时|也)?(?:不要|不加|别加|保留|取消)$)", word)
+    )
+
+
+def _is_chat_word_query_target(word: str) -> bool:
+    """Require a lexical target before recovering a model-declined chat turn."""
+    return bool(
+        _is_bare_word_query_target(word)
+        and not is_conversational_text(word)
+        and not re.match(
+            r"^(?:(?:我|你|他|她|它|我们|你们|他们)(?:也|都)?"
+            r"(?:真|好|很|太|挺|蛮|可真|有点|有些|这么|那么)|"
+            r"(?:(?:今|昨|明)(?:天|晚|早)|现在|天气|外面)(?:也|又)?"
+            r"(?:真|好|很|太|挺|蛮|有点|有些|热|冷|晴|阴|下雨|下雪)|"
+            r"(?:这|那)(?:个|些|样|种|么)|"
+            r"(?:刚才|刚刚|方才|之前|前面|上面|后面|下面)(?:的|这|那)|"
+            r"(?:好|行|对|是)(?:的|了|哒|呀|啊|吧|呢)|"
+            r"(?:谢谢|多谢|辛苦)|"
+            r"(?:原来|果然|确实)(?:如此|这样|是这样|是的))",
+            word,
+        )
     )
 
 
@@ -3336,6 +3366,33 @@ _EXPLICIT_REVIEWED_ADD_WORD_RE = re.compile(
     r"(?:加词|添加词|新增词|加一个词|添加一个词)"
     r"\s*[:：,，]?\s*(?P<word>[\u3400-\u9fff]{1,20})$"
 )
+
+
+def explicit_add_sentence_rejection(message_text: str) -> str:
+    """Reject an oversized sentence operand before review or model routing."""
+    source = _strip_command_message_prefixes(message_text).strip()
+    match = re.fullmatch(
+        r"(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
+        r"(?:加词|添加词|新增词|加一个词|添加一个词)\s*[:：,，]?\s*"
+        r"(?P<operand>.+)",
+        source,
+    )
+    if match is None:
+        return ""
+    operand = match.group("operand").strip()
+    for opening, closing in (("「", "」"), ("“", "”"), ('"', '"')):
+        if operand.startswith(opening) and operand.endswith(closing):
+            operand = operand[1:-1]
+            break
+    else:
+        if re.search(r"[，,、；;\s]", operand):
+            return ""
+    if (
+        re.fullmatch(r"[\u3400-\u9fff，,。；;、！？!?\s]+", operand)
+        and len(re.sub(r"\s+", "", operand)) > 20
+    ):
+        return "这是句子，请添加其中的单个词语。"
+    return ""
 
 
 def _extract_explicit_reviewed_add_word(message_text: str) -> Optional[str]:

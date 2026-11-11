@@ -16,6 +16,10 @@ class ServerBackedQueryReply(str):
     """Internal provenance for an exact server-rendered query reply."""
 
 
+class UnansweredChatReply(str):
+    """A model reply reduced to empty internal narration by finalization."""
+
+
 class ReviewedSelectionReply(ServerBackedQueryReply):
     """A deterministic selection result with its original candidate snapshot."""
 
@@ -273,6 +277,10 @@ FAILED_WRITE_TEMPLATE_PREFIX = "这条指令按当前表述无法执行"
 FAILED_WRITE_TEMPLATE_MARKER = "本次未写入"
 POLICY_BLOCK_TEMPLATE_PREFIX = "安全拦截："
 SYSTEM_REPLY_TEMPLATE_MARKERS = (
+    "这轮是普通问答，没有触发写入或安全拦截。",
+    "这轮是普通问答。",
+    "目前没有对应的操作请求",
+    "当前没有可验证的可执行操作",
     FAILED_WRITE_TEMPLATE_PREFIX,
     FAILED_WRITE_TEMPLATE_MARKER,
     REMEDIATION_FALLBACK_GUIDANCE,

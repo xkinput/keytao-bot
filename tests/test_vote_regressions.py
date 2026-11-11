@@ -127,8 +127,7 @@ class B22VoteTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_vote("同意", receipt_id)
         self.assertEqual(self.votes.resolve("qq", self.replay.author.space_id, receipt_id), "b22-owner")
         record = self.replay.store.get_record(self.replay.author)
-        self.assertEqual(record.state.function_name, "keytao_submit_batch")
-        self.assertNotIn(receipt_id, record.origin_message_ids)
+        self.assertIsNone(record)
 
     assert_alias = B22VoteTests_assert_alias
 
