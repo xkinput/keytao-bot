@@ -543,43 +543,49 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
         internal_args = executor.canonicalize_arguments("keytao_shift_phrase_code", args, ToolContext())
         self.assertEqual(internal_args["_source_code"], "xlbl")
 
+def set_up_change_header_swap_http(test):
+    from urllib.parse import urlsplit
+    from tests.helpers import (
+        B18RealToolTests_setUp, OfflineResponse, REAL_REVIEW_READS, TOOLS,
+        b19_partial_reply_binding_DraftHTTP,
+    )
+
+    B18RealToolTests_setUp(test)
+
+    class SwapHTTP(b19_partial_reply_binding_DraftHTTP):
+        def _response(self, method, url, kwargs):
+            if urlsplit(url).path == "/api/phrases/encode":
+                word = kwargs["params"]["word"]
+                self.requests.append((method, "/api/phrases/encode", {"word": word}))
+                return OfflineResponse({
+                    "input": word, "type": "二字词", "codes": ["dsqt", "dsqtv", "dsqtvv"],
+                    "altCodes": [], "flyKeyVariants": [], "phrasePinyins": ["da", "quan"],
+                    "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                    "chars": [{"char": char, "pinyin": pinyin, "pinyins": [pinyin],
+                               "phoneticCode": code, "shapeCode": "v"}
+                              for char, pinyin, code in zip(word, ("da", "quan"), ("ds", "qt"))],
+                })
+            return super()._response(method, url, kwargs)
+
+    test.http = SwapHTTP()
+    test.http.entries = [
+        {"word": "大权", "code": "dsqt", "type": "Phrase", "weight": 100},
+        {"word": "大全", "code": "dsqtv", "type": "Phrase", "weight": 100},
+    ]
+    test.enterContext(patch.object(TOOLS.http_client, "_keytao_client", test.http))
+    test.enterContext(patch.multiple(review, **REAL_REVIEW_READS))
+    test.enterContext(patch.object(review.http_client, "guarded_fetch", AsyncMock(return_value=OfflineResponse({}, 404))))
+
+
 # Source: test_b11_shift.py
 class B11BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
     policy_message = B7BlockedToolLoopTests_policy_message
     orchestrator = B7BlockedToolLoopTests_orchestrator
 
-    async def test_change_header_swap_writes_both_items_with_real_tools(self):
-        from urllib.parse import urlsplit
-        from tests.helpers import (
-            B18RealToolTests_setUp, OfflineResponse, REAL_REVIEW_READS, TOOLS,
-            b19_partial_reply_binding_DraftHTTP, completed_draft_undo, review,
-        )
+    async def assert_change_header_swap_writes_real_tools(self, message):
+        from tests.helpers import TOOLS
 
-        B18RealToolTests_setUp(self)
-
-        class SwapHTTP(b19_partial_reply_binding_DraftHTTP):
-            def _response(self, method, url, kwargs):
-                if urlsplit(url).path == "/api/phrases/encode":
-                    word = kwargs["params"]["word"]
-                    self.requests.append((method, "/api/phrases/encode", {"word": word}))
-                    return OfflineResponse({
-                        "input": word, "type": "二字词", "codes": ["dsqt", "dsqtv", "dsqtvv"],
-                        "altCodes": [], "flyKeyVariants": [], "phrasePinyins": ["da", "quan"],
-                        "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
-                        "chars": [{"char": char, "pinyin": pinyin, "pinyins": [pinyin],
-                                   "phoneticCode": code, "shapeCode": "v"}
-                                  for char, pinyin, code in zip(word, ("da", "quan"), ("ds", "qt"))],
-                    })
-                return super()._response(method, url, kwargs)
-
-        self.http = SwapHTTP()
-        self.http.entries = [
-            {"word": "大权", "code": "dsqt", "type": "Phrase", "weight": 100},
-            {"word": "大全", "code": "dsqtv", "type": "Phrase", "weight": 100},
-        ]
-        self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
-        self.enterContext(patch.multiple(review, **REAL_REVIEW_READS))
-        self.enterContext(patch.object(review.http_client, "guarded_fetch", AsyncMock(return_value=OfflineResponse({}, 404))))
+        set_up_change_header_swap_http(self)
         token = completed_draft_undo.current_operation_capture.set(None)
         self.addCleanup(completed_draft_undo.current_operation_capture.reset, token)
         completed_draft_undo.start_operation_turn(self.replay.author)
@@ -619,7 +625,7 @@ class B11BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
             skills_manager=Skills(), tool_executor=executor,
             state_store=self.replay.store, bind_help_text="Offline binding help", system_prompt_core="Offline prompt",
         )
-        reply = await agent.run("喵喵 修改\ndsqt 大全\ndsqtv 大权", AgentRequestContext(
+        reply = await agent.run(message, AgentRequestContext(
             platform="qq", user_id=self.replay.author.actor_id, space_type="group", space_id="prod-replay",
             mutations_allowed=True, actor_is_bound=True,
         ))
@@ -632,6 +638,12 @@ class B11BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
         for value in ("大权", "大全", "dsqt", "dsqtv", "offline-batch"):
             self.assertIn(value, reply, results)
         self.assertEqual(self.http.errors, [])
+
+    async def test_change_header_swap_writes_both_items_with_real_tools(self):
+        await self.assert_change_header_swap_writes_real_tools("喵喵 修改\ndsqt 大全\ndsqtv 大权")
+
+    async def test_inline_change_header_swap_writes_both_items_with_real_tools(self):
+        await self.assert_change_header_swap_writes_real_tools("喵喵，修改：dsqt 大全 dsqtv 大权")
 
     async def test_duplicate_blocked_shift_stops_on_second_attempt(self):
         agent, create, execute = self.orchestrator([
@@ -2880,6 +2892,80 @@ class MoveToCodeGrammarTests(unittest.TestCase):
     context = MoveToCodeGrammarTests_context
 
     assert_bound_move = MoveToCodeGrammarTests_assert_bound_move
+
+    def test_inline_change_header_binds_exact_pairs_with_separators_and_addresses(self):
+        items = [
+            {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全", "type": "Phrase"},
+            {"action": "Change", "code": "dsqtv", "old_word": "大全", "word": "大权", "type": "Phrase"},
+        ]
+        for prefix in ("修改 ", "改 ", "喵喵，修改 ", "喵喵:改：", "@owner 修改：", "@owner，修改：",
+                       "修改，", "修改 ：", "修改 ，"):
+            for tokens in (("dsqt", "大全", "dsqtv", "大权"), ("大全", "dsqt", "大权", "dsqtv")):
+                for separators in ((" ", " ", " "), (" ", "，", " "), (" ", "、", " "),
+                                   (" ", "；", " "), ("\n", "；\n", "\t")):
+                    message = prefix + "".join(token + separator for token, separator in
+                                               zip(tokens, (*separators, "")))
+                    with self.subTest(message=message):
+                        self.assertEqual(grammar._parse_code_word_changes(message),
+                                         (("dsqt", "大全"), ("dsqtv", "大权")))
+                        context = ToolContext(current_message=message, trusted_phrase_types_by_key={
+                            ("大权", "dsqt"): frozenset({"Phrase"}),
+                            ("大全", "dsqtv"): frozenset({"Phrase"}),
+                        })
+                        self.assertTrue(grammar.message_authorizes_mutation(message))
+                        self.assertIsNone(grammar._validate_current_message_binding(
+                            "keytao_batch_add_to_draft", {"items": items}, context,
+                        ))
+
+    def test_inline_change_header_single_pair_binds_both_tool_entry_points(self):
+        item = {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全"}
+        for message in ("修改：dsqt 大全", "改，大全 dsqt", "喵喵，修改 dsqt 大全", "@owner 改：大全 dsqt"):
+            for tool, arguments in (("keytao_create_phrase", item),
+                                    ("keytao_batch_add_to_draft", {"items": [item]})):
+                with self.subTest(message=message, tool=tool):
+                    context = ToolContext(current_message=message, trusted_phrase_types_by_key={
+                        ("大权", "dsqt"): frozenset({"Phrase"}),
+                    })
+                    self.assertIsNone(grammar._validate_current_message_binding(tool, arguments, context))
+
+    def test_inline_change_header_rejects_ambiguous_or_untrusted_tokens(self):
+        for message in (
+            "修改 dsqt 大全 dsqtv", "修改 dsqt dsqtv 大全 大权",
+            "修改 大全 大权 dsqt dsqtv", "修改 dsqt 大全 大权 dsqtv",
+            "修改 大全 dsqt dsqtv 大权", "修改 dsqt 大全 dsqt 大权",
+            "修改 dsqt 大全 DSQT 大权", "修改 dsqt 大全 dsqtv 大全",
+            "修改 dsqt1 大全 dsqtv 大权", "修改 ｄｓｑｔ 大全 dsqtv 大权",
+            "修改 dsqt 大全- dsqtv 大权", "修改 dsqt 大全🙂 dsqtv 大权",
+            "修改 dsqt 大全 dsqtv 大权？", "不要修改 dsqt 大全 dsqtv 大权",
+            "例如：修改 dsqt 大全 dsqtv 大权", "他说「修改 dsqt 大全 dsqtv 大权」",
+            "以下是命令：「修改 dsqt 大全 dsqtv 大权」",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(grammar._parse_code_word_changes(message), ())
+
+    def test_inline_change_header_requires_complete_exact_trusted_change_set(self):
+        items = [
+            {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全"},
+            {"action": "Change", "code": "dsqtv", "old_word": "大全", "word": "大权"},
+        ]
+        message = "喵喵，修改：dsqt 大全 dsqtv 大权"
+        context = ToolContext(current_message=message, trusted_phrase_types_by_key={
+            ("大权", "dsqt"): frozenset({"Phrase"}),
+            ("大全", "dsqtv"): frozenset({"Phrase"}),
+        })
+        invalid = [items[:1], [*items, items[0]],
+                   [{**items[0], "code": "dsqtv"}, {**items[1], "code": "dsqt"}]]
+        for field, value in (("word", "大地"), ("old_word", "大地"), ("action", "Create"),
+                             ("code", "dsqtvv")):
+            invalid.append([{**items[0], field: value}, items[1]])
+        for changed in invalid:
+            with self.subTest(items=changed):
+                self.assertIsNotNone(grammar._validate_current_message_binding(
+                    "keytao_batch_add_to_draft", {"items": changed}, context,
+                ))
+        self.assertIsNotNone(grammar._validate_current_message_binding(
+            "keytao_batch_add_to_draft", {"items": items}, ToolContext(current_message=message),
+        ))
 
     def test_change_header_binds_exact_code_word_pairs_in_both_orders(self):
         items = [

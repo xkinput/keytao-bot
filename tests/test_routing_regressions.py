@@ -925,6 +925,136 @@ class B7PhrasingRouteTests(unittest.IsolatedAsyncioTestCase):
 
     assert_recodes = B7PhrasingRouteTests_assert_recodes
 
+    async def test_inline_change_header_serialized_turn_writes_exact_swap_with_real_tools(self):
+        from tests.helpers import TOOLS
+        from tests.test_displace_shift_and_undo import set_up_change_header_swap_http
+
+        for message, pairs in (
+            ("喵喵 修改 dsqt 大全 dsqtv 大权", (("dsqt", "大全"), ("dsqtv", "大权"))),
+            ("喵喵，修改：dsqt 大全，dsqtv 大权", (("dsqt", "大全"), ("dsqtv", "大权"))),
+            ("@owner，改：大全 dsqt、\n大权 dsqtv", (("dsqt", "大全"), ("dsqtv", "大权"))),
+            ("修改：大全 dsqt；大泉 dsqtv\n大权 dsqtvv",
+             (("dsqt", "大全"), ("dsqtv", "大泉"), ("dsqtvv", "大权"))),
+        ):
+            with self.subTest(message=message):
+                fixture = unittest.TestCase()
+                try:
+                    set_up_change_header_swap_http(fixture)
+                    if len(pairs) == 3:
+                        fixture.http.entries.append({"word": "大泉", "code": "dsqtvv", "type": "Phrase", "weight": 100})
+                    old_words = {row["code"]: row["word"] for row in fixture.http.entries}
+                    functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS,
+                                 **TOOLS.TOOL_FUNCTIONS}
+                    with patch.object(fixture.replay.chat.tool_executor, "_get_tool_function", functions.get):
+                        await fixture.replay.turn({"message": message, "to_me": True}, raw_operation(
+                            op="recode", operands=[word for _code, word in pairs], codes=[code for code, _word in pairs],
+                        ))
+                    reply = fixture.replay.last_response
+                    self.assertEqual([(row["action"], row.get("oldWord"), row["word"], row["code"])
+                                      for row in fixture.http.rows],
+                                     [("Change", old_words[code], word, code) for code, word in pairs],
+                                     (reply, fixture.http.requests))
+                    self.assertEqual(len(fixture.http.writes), 1, reply)
+                    self.assertIn("已加入草稿", reply)
+                    for value in ("大权", "大全", "dsqt", "dsqtv", "offline-batch"):
+                        self.assertIn(value, reply)
+                    self.assertEqual(fixture.http.errors, [])
+                finally:
+                    fixture.doCleanups()
+
+    async def test_inline_change_header_confirmation_round_trips_exact_literal_pairs(self):
+        from keytao_bot.harness.operation_request import OperationRequest
+        from tests.helpers import TOOLS
+        from tests.test_displace_shift_and_undo import set_up_change_header_swap_http
+
+        set_up_change_header_swap_http(self)
+        message = "喵喵 修改 大全 dsqt；大权 dsqtv"
+        commands = self.replay.commands
+        resolved, options, error = await commands.resolve_model_replace(
+            OperationRequest(op="recode", operands=("大权", "大全"), codes=("dsqtv", "dsqt")),
+            "qq", self.replay.author.actor_id, message=message,
+        )
+        self.assertEqual((options, error), ((), ""))
+        self.assertEqual((resolved.operands, resolved.codes), (("大全", "大权"), ("dsqt", "dsqtv")))
+        self.assertEqual(commands.render_understood_command(resolved), "修改 dsqt 大全 dsqtv 大权")
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS,
+                     **TOOLS.TOOL_FUNCTIONS}
+        with patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get), patch.dict(
+            os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "recode"},
+        ):
+            await self.replay.turn({"message": message, "to_me": True}, raw_operation(
+                op="recode", operands=["大权", "大全"], codes=["dsqtv", "dsqt"],
+            ))
+            state = self.replay.store.get(self.replay.author)
+            self.assertIsNotNone(state, self.replay.last_response)
+            sealed = commands._understood_command_request(state)
+            self.assertIsNotNone(sealed, self.replay.last_response)
+            self.assertEqual((sealed.op, sealed.operands, sealed.codes),
+                             (resolved.op, resolved.operands, resolved.codes))
+            self.assertIn("回复「确认」执行", self.replay.last_response)
+            self.assertEqual(self.http.writes, [])
+            self.assertEqual(self.http.rows, [])
+            await self.replay.turn({"message": "确认", "to_me": True}, raw_operation(
+                op="confirm", operands=[], codes=[], refers_to_pending=True,
+            ))
+            self.assertEqual(self.http.writes, [])
+            self.assertIn("回复「确认」执行", self.replay.last_response)
+            await self.replay.turn({"message": "确认", "to_me": True}, raw_operation(
+                op="confirm", operands=[], codes=[], refers_to_pending=True,
+            ))
+        reply = self.replay.last_response
+        self.assertEqual([(row["action"], row.get("oldWord"), row["word"], row["code"])
+                          for row in self.http.rows],
+                         [("Change", "大权", "大全", "dsqt"), ("Change", "大全", "大权", "dsqtv")],
+                         (reply, self.http.requests))
+        self.assertEqual(len(self.http.writes), 1, reply)
+        self.assertIn("已加入草稿", reply)
+        for value in ("大权", "大全", "dsqt", "dsqtv", "offline-batch"):
+            self.assertIn(value, reply)
+        self.assertEqual(self.http.errors, [])
+
+    async def test_inline_change_header_invalid_code_lookup_never_writes(self):
+        from tests.helpers import OfflineResponse, TOOLS
+        from tests.test_displace_shift_and_undo import set_up_change_header_swap_http
+
+        for failure in ("missing", "duplicate", "ambiguous"):
+            with self.subTest(failure=failure):
+                fixture = unittest.TestCase()
+                try:
+                    set_up_change_header_swap_http(fixture)
+                    before = copy.deepcopy(fixture.http.entries)
+                    results = [{"code": row["code"], "phrases": [row]} for row in before]
+                    if failure == "missing":
+                        results.pop()
+                    elif failure == "duplicate":
+                        results[1] = copy.deepcopy(results[0])
+                    else:
+                        results[0]["phrases"].append({**before[0], "word": "大券", "weight": 101})
+                    original = fixture.http._response
+
+                    def response(method, url, kwargs):
+                        if urlsplit(url).path == "/api/bot/phrases/by-code/batch":
+                            fixture.http.requests.append((method, urlsplit(url).path, copy.deepcopy(kwargs)))
+                            return OfflineResponse({"success": True, "results": results})
+                        return original(method, url, kwargs)
+
+                    functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS,
+                                 **TOOLS.TOOL_FUNCTIONS}
+                    with patch.object(fixture.http, "_response", side_effect=response), patch.object(
+                        fixture.replay.chat.tool_executor, "_get_tool_function", functions.get,
+                    ):
+                        await fixture.replay.turn({"message": "修改 dsqt 大全 dsqtv 大权", "to_me": True}, raw_operation(
+                            op="recode", operands=["大全", "大权"], codes=["dsqt", "dsqtv"],
+                        ))
+                    self.assertIn("无法唯一确定", fixture.replay.last_response)
+                    self.assertIn("本次未写入", fixture.replay.last_response)
+                    self.assertEqual(fixture.http.writes, [])
+                    self.assertEqual(fixture.http.rows, [])
+                    self.assertEqual(fixture.http.entries, before)
+                    self.assertEqual(fixture.http.errors, [])
+                finally:
+                    fixture.doCleanups()
+
     async def test_multiple_glued_recodes_write_one_exact_batch(self):
         handled, ctx = await self.stage(
             "修改编码: 我送给为wsgu， 纯音乐为jyya", "recode",

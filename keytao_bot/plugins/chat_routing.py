@@ -530,14 +530,17 @@ def _strip_leading_self_mentions(message_text: str) -> str:
 
 
 def _strip_command_message_prefixes(message_text: str) -> str:
+    from ..harness.authorization_grammar import _parse_code_word_changes, strip_add_command_modifier
+
+    changes = _parse_code_word_changes(message_text)
+    if changes:
+        return "修改 " + " ".join(f"{code} {word}" for code, word in changes)
     text = strip_self_mention_tokens(_strip_leading_self_mentions(message_text)).strip()
     while text:
         stripped = _LEADING_COMMAND_PREFIX_RE.sub("", text, count=1).strip()
         if stripped == text:
             break
         text = stripped
-    from ..harness.authorization_grammar import strip_add_command_modifier
-
     return strip_add_command_modifier(text)
 
 

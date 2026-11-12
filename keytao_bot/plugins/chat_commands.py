@@ -29,6 +29,7 @@ from ..harness.authorization_grammar import (
     _PHRASE_TYPE_BASE_WEIGHTS,
     _POSITIONAL_REPORTED_CONTEXT_RE,
     _QUESTION_RE,
+    _parse_code_word_changes,
     dictionary_recode_items_match,
     explicit_same_code_requested,
     explicit_complete_add_item,
@@ -12847,6 +12848,12 @@ async def _resolve_target_recodes(request, message, original_operands, platform,
 
 async def resolve_model_replace(request, platform, user_id, *, message="", original_operands=()):
     """Resolve model old/new fields against exact dictionary rows, never prose."""
+    changes = _parse_code_word_changes(message)
+    if (changes and request.op == "recode" and not request.relation and not request.submit_after
+        and sorted(request.operands) == sorted(word for _code, word in changes)
+        and sorted(request.codes) == sorted(code for code, _word in changes)):
+        return replace(request, operands=tuple(word for _code, word in changes),
+                       codes=tuple(code for code, _word in changes)), (), ""
     if request.op == "delete" and len(request.operands) == len(request.codes) == 1 and render_understood_command(request):
         word, code = request.operands[0], request.codes[0]
         try:
@@ -13072,6 +13079,9 @@ def render_understood_command(request) -> str:
         return ""
     if len(set(words)) != len(words):
         return ""
+    if op == "recode" and len(words) == len(codes) and words and not request.submit_after and not request.relation:
+        command = "修改 " + " ".join(f"{code} {word}" for word, code in zip(words, codes))
+        return command if _parse_code_word_changes(command) == tuple(zip(codes, words)) else ""
     if op == "recode" and len(words) > 1 and len(codes) == 2 * len(words) and not request.submit_after and not request.relation:
         commands = [render_understood_command(replace(request, operands=(word,), codes=codes[index * 2:index * 2 + 2]))
                     for index, word in enumerate(words)]
@@ -13308,6 +13318,10 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
     if active is not None:
         return _active_operation_message_for_request(active, platform, user_id)
     op, words, codes = request.op, request.operands, request.codes
+    changes = _parse_code_word_changes(command)
+    if (op == "recode" and changes and not request.relation and not request.submit_after
+        and len(codes) == len(words) and tuple(zip(codes, words)) == changes):
+        return await _execute_code_word_changes(changes, platform, user_id, conv_key, space_key, owner_label)
     if op == "add":
         if render_understood_command(request) != command:
             return "规范加词指令校验失败，本次未写入。"
@@ -13436,6 +13450,42 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
             intent = replace(intent, intent="code_chain_reorder")
         response = await _try_handle_draft_management_command(command, platform, user_id, space_key, owner_label, intent)
     return response or "规范指令无法执行，本次未写入。"
+
+
+async def _execute_code_word_changes(changes, platform, user_id, conv_key, space_key, owner_label):
+    """Replace each literal code's unique server occupant in one draft batch."""
+    set_turn_flow("draft-op")
+    codes = [code for code, _word in changes]
+    try:
+        data = json.loads(await call_tool_function(
+            "keytao_lookup_by_codes_batch", {"codes": codes}, platform, user_id,
+        ))
+        if not isinstance(data, dict):
+            raise ValueError("invalid code lookup")
+        results = data.get("results")
+        if data.get("success") is not True or not isinstance(results, list) or len(results) != len(codes):
+            raise ValueError("incomplete code lookup")
+        entries = {}
+        for result in results:
+            if not isinstance(result, dict) or result.get("code") not in codes or result["code"] in entries:
+                raise ValueError("invalid code lookup")
+            rows = _validated_code_chain_entries(result, result["code"])
+            if rows is None or len(rows) != 1:
+                raise ValueError("ambiguous code occupant")
+            entries[result["code"]] = rows[0]
+    except (ValueError, TypeError, OSError, TimeoutError):
+        return "词条或旧码无法唯一确定。请指定旧码；本次未写入。"
+    items = []
+    for code, word in changes:
+        target = entries[code]
+        if target["word"] == word:
+            return f"「{word}」已经是 {code}，无需修改。本次未写入。"
+        items.append({"action": "Change", "old_word": target["word"], "word": word,
+                      "code": code, "type": target["type"]})
+    return await _execute_confirmed_tool(
+        PendingToolConfirm("keytao_batch_add_to_draft", {"items": items}),
+        platform, user_id, conv_key, space_key, owner_label,
+    )
 
 
 async def execute_model_command_direct(request, named_words, platform, user_id, conv_key, space_key, owner_label):

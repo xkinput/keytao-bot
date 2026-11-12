@@ -2378,28 +2378,29 @@ def trusted_mutation_source(message: str) -> str:
 
 
 def _parse_code_word_changes(message: str) -> Tuple[Tuple[str, str], ...]:
-    """Parse a change header followed by one literal code/word pair per line."""
-    source = trusted_mutation_source(message)
-    match = re.fullmatch(r"(?:修改|改)\s+(.+)", source, re.DOTALL)
+    """Parse a change header followed by strictly alternating code/word tokens."""
+    source = re.sub(
+        r"^\s*(?:[@＠][^\s@＠,，:：]{1,24}|喵喵)[\s,，:：]+", "", message, count=1,
+    )
+    source = trusted_mutation_source(source)
+    match = re.fullmatch(r"(?:修改|改)(?:\s*[,，:：]\s*|\s+)(.+)", source, re.DOTALL)
     if match is None:
         return ()
+    tokens = re.split(r"[\s,，、;；]+", match.group(1).strip())
+    if len(tokens) % 2:
+        return ()
+    code_first = re.fullmatch(r"[A-Za-z]{1,6}", tokens[0]) is not None
     pairs: List[Tuple[str, str]] = []
-    for line in match.group(1).splitlines():
-        if not line.strip():
-            continue
-        tokens = line.split()
-        if len(tokens) != 2:
-            return ()
-        code, word = tokens
-        if re.fullmatch(r"[A-Za-z]{1,6}", word):
-            word, code = code, word
+    for index in range(0, len(tokens), 2):
+        code, word = tokens[index:index + 2] if code_first else tokens[index:index + 2][::-1]
         if not (
             re.fullmatch(r"[A-Za-z]{1,6}", code)
             and re.fullmatch(r"[\u3400-\u9fff]{1,16}", word)
         ):
             return ()
         pairs.append((code.lower(), word))
-    if len({code for code, _word in pairs}) != len(pairs):
+    if (len({code for code, _word in pairs}) != len(pairs)
+        or len({word for _code, word in pairs}) != len(pairs)):
         return ()
     return tuple(pairs)
 
