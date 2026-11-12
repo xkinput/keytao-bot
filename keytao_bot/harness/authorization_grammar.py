@@ -2377,6 +2377,58 @@ def trusted_mutation_source(message: str) -> str:
     return _UNTRUSTED_DATA_TAIL_RE.sub("", text)
 
 
+def _parse_code_word_changes(message: str) -> Tuple[Tuple[str, str], ...]:
+    """Parse a change header followed by one literal code/word pair per line."""
+    source = trusted_mutation_source(message)
+    match = re.fullmatch(r"(?:修改|改)\s+(.+)", source, re.DOTALL)
+    if match is None:
+        return ()
+    pairs: List[Tuple[str, str]] = []
+    for line in match.group(1).splitlines():
+        if not line.strip():
+            continue
+        tokens = line.split()
+        if len(tokens) != 2:
+            return ()
+        code, word = tokens
+        if re.fullmatch(r"[A-Za-z]{1,6}", word):
+            word, code = code, word
+        if not (
+            re.fullmatch(r"[A-Za-z]{1,6}", code)
+            and re.fullmatch(r"[\u3400-\u9fff]{1,16}", word)
+        ):
+            return ()
+        pairs.append((code.lower(), word))
+    if len({code for code, _word in pairs}) != len(pairs):
+        return ()
+    return tuple(pairs)
+
+
+def _code_word_changes_match(
+    pairs: Tuple[Tuple[str, str], ...], items: object, context: ToolContext,
+) -> bool:
+    """Bind replacement sources to server reads and destinations to raw pairs."""
+    from .tools import ToolExecutor
+
+    if not pairs or not isinstance(items, list) or len(items) != len(pairs):
+        return False
+    actual = []
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or "").strip().lower()
+        old_word = str(item.get("old_word") or "").strip()
+        if (
+            item.get("action") != "Change"
+            or not old_word or old_word == word
+            or ToolExecutor._trusted_phrase_type(context, old_word, code) is None
+        ):
+            return False
+        actual.append((code, word))
+    return sorted(actual) == sorted(pairs)
+
+
 def _has_standalone_negation_before_mutation(message: str) -> bool:
     """Bind an unambiguous standalone negation to the immediately next clause."""
     text = _LEADING_MENTION_RE.sub("", trusted_mutation_source(message), count=1)
@@ -2398,6 +2450,9 @@ def _has_standalone_negation_before_mutation(message: str) -> bool:
 
 def _mutation_authorization_view(message: str) -> str:
     """Return only positive command clauses plus explicit protection clauses."""
+    changes = _parse_code_word_changes(message)
+    if changes:
+        return "；".join(f"修改 {code} {word}" for code, word in changes)
     text = _LEADING_MENTION_RE.sub("", trusted_mutation_source(message), count=1)
 
     trusted_clauses: List[str] = []
@@ -5308,6 +5363,7 @@ def _validate_current_message_binding(
     from .tools import ToolExecutor
 
     message = _mutation_authorization_view(context.current_message or "")
+    code_word_changes = _parse_code_word_changes(context.current_message or "")
     multi_add = _multi_add_authorization_contract(
         context.current_message or ""
     )
@@ -5593,7 +5649,9 @@ def _validate_current_message_binding(
         if (
             action == "Create"
             and not create_is_bound
-        ) or (action != "Create" and (
+        ) or (action != "Create" and not _code_word_changes_match(
+            code_word_changes, [arguments], context,
+        ) and (
             missing_targets
             or not _action_is_bound_to_target(message, word, action)
             or any(_is_word_protected(message, target) for target in targets)
@@ -5806,6 +5864,7 @@ def _validate_current_message_binding(
                 or dictionary_delete_is_bound
                 or dictionary_recode_is_bound
                 or replace_at_code_is_bound
+                or _code_word_changes_match(code_word_changes, items, context)
             )
             else items
         ):

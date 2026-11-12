@@ -6,6 +6,7 @@ import re
 import time
 import unicodedata
 import uuid
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -30,6 +31,7 @@ from keytao_bot.utils.offered_options import (
     structural_option_questions,
 )
 from keytao_bot.utils.observability import (
+    current_turn_id,
     current_turn_metrics,
     mark_turn_outcome,
     observe_model_call,
@@ -87,6 +89,8 @@ from .state import (
 )
 from .conversation import ConversationAddress
 from .authorization_grammar import (
+    _code_word_changes_match,
+    _parse_code_word_changes,
     _tool_intent_pattern,
     explicit_same_code_requested,
     is_character_composition_question,
@@ -95,6 +99,7 @@ from .authorization_grammar import (
     message_authorizes_mutation,
     parse_eviction_modified_add,
     review_flow_candidates_are_plausible,
+    server_warning_confirmation_binding,
     suggestion_preserves_expressed_operation,
 )
 from .tools import (
@@ -398,6 +403,16 @@ _BLOCK_REASON_USER_LABELS = {
     "untrusted_batch_reference": "批次引用未经可信记录核验",
 }
 
+_binding_remediation_reply: ContextVar[Optional[tuple[str, str, str]]] = ContextVar(
+    "binding_remediation_reply", default=None,
+)
+
+
+def matches_binding_remediation_reply(reply: object, message: str) -> bool:
+    """Keep only this turn's exact gate-generated retry command at delivery."""
+    return _binding_remediation_reply.get() == (current_turn_id(), message, str(reply or ""))
+
+
 _FUTURE_BATCH_ASSENT_OFFER_RE = re.compile(
     r"(?:"
     r"(?:末尾|最后|结尾)[^\r\n]{0,48}(?:说明|注明|写明)[^\r\n]{0,32}"
@@ -693,6 +708,7 @@ class AgentOrchestrator:
         max_iterations: int = 20,
     ) -> Optional[str]:
         """Emit every final reply through one same-turn loop breaker."""
+        _binding_remediation_reply.set(None)
         self._server_backed_query_reply = None
         log_grammar_gap_if_needed(
             message,
@@ -4248,13 +4264,17 @@ class AgentOrchestrator:
             suggestion = str(
                 failure_state.get("suggestedCommand") or ""
             ).strip()
-            return render_remediation_reply(
+            rendered = render_remediation_reply(
                 raw_reason.rstrip("；;。 "),
                 command=suggestion,
             )
+            if suggestion:
+                _binding_remediation_reply.set((current_turn_id(), current_message, rendered))
+            return rendered
         if (
             failure_state.get("blockReason") == "binding_incomplete"
-            and (binding_reply_is_internal or binding_reply_retries_same_turn)
+            and (binding_reply_is_internal or binding_reply_retries_same_turn
+                 or failure_state.get("suggestedCommand"))
         ):
             raw_reason = cls._public_failure_reason(
                 failure_state.get("message"),
@@ -4269,10 +4289,13 @@ class AgentOrchestrator:
             suggestion = str(
                 failure_state.get("suggestedCommand") or ""
             ).strip()
-            return render_remediation_reply(
+            rendered = render_remediation_reply(
                 f"{FAILED_WRITE_TEMPLATE_PREFIX}，{FAILED_WRITE_TEMPLATE_MARKER}；原因：{reason}",
                 command=suggestion,
             )
+            if suggestion:
+                _binding_remediation_reply.set((current_turn_id(), current_message, rendered))
+            return rendered
         if is_interrogative_message(current_message) and not failure_state and not receipts:
             # A direct meta/process answer may legitimately mention retrying a
             # previous candidate. It is not asking the user to resend this
@@ -5761,6 +5784,16 @@ class AgentOrchestrator:
                 if fn_name == "keytao_create_phrase"
                 else batch_warning_confirmation_binding(result_data, fn_args)
             )
+            if (
+                binding is None
+                and not result_data.get("warnings")
+                and _code_word_changes_match(
+                    _parse_code_word_changes(tool_context.current_message or ""),
+                    fn_args.get("items") if fn_name == "keytao_batch_add_to_draft" else [fn_args],
+                    tool_context,
+                )
+            ):
+                binding = server_warning_confirmation_binding(result_data)
         if binding is None:
             return None
         logger.info(

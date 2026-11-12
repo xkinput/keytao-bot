@@ -548,6 +548,91 @@ class B11BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
     policy_message = B7BlockedToolLoopTests_policy_message
     orchestrator = B7BlockedToolLoopTests_orchestrator
 
+    async def test_change_header_swap_writes_both_items_with_real_tools(self):
+        from urllib.parse import urlsplit
+        from tests.helpers import (
+            B18RealToolTests_setUp, OfflineResponse, REAL_REVIEW_READS, TOOLS,
+            b19_partial_reply_binding_DraftHTTP, completed_draft_undo, review,
+        )
+
+        B18RealToolTests_setUp(self)
+
+        class SwapHTTP(b19_partial_reply_binding_DraftHTTP):
+            def _response(self, method, url, kwargs):
+                if urlsplit(url).path == "/api/phrases/encode":
+                    word = kwargs["params"]["word"]
+                    self.requests.append((method, "/api/phrases/encode", {"word": word}))
+                    return OfflineResponse({
+                        "input": word, "type": "二字词", "codes": ["dsqt", "dsqtv", "dsqtvv"],
+                        "altCodes": [], "flyKeyVariants": [], "phrasePinyins": ["da", "quan"],
+                        "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                        "chars": [{"char": char, "pinyin": pinyin, "pinyins": [pinyin],
+                                   "phoneticCode": code, "shapeCode": "v"}
+                                  for char, pinyin, code in zip(word, ("da", "quan"), ("ds", "qt"))],
+                    })
+                return super()._response(method, url, kwargs)
+
+        self.http = SwapHTTP()
+        self.http.entries = [
+            {"word": "大权", "code": "dsqt", "type": "Phrase", "weight": 100},
+            {"word": "大全", "code": "dsqtv", "type": "Phrase", "weight": 100},
+        ]
+        self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
+        self.enterContext(patch.multiple(review, **REAL_REVIEW_READS))
+        self.enterContext(patch.object(review.http_client, "guarded_fetch", AsyncMock(return_value=OfflineResponse({}, 404))))
+        token = completed_draft_undo.current_operation_capture.set(None)
+        self.addCleanup(completed_draft_undo.current_operation_capture.reset, token)
+        completed_draft_undo.start_operation_turn(self.replay.author)
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS,
+                     **TOOLS.TOOL_FUNCTIONS}
+        items = [
+            {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全", "type": "Phrase"},
+            {"action": "Change", "code": "dsqtv", "old_word": "大全", "word": "大权", "type": "Phrase"},
+        ]
+        calls = [("keytao_lookup_by_codes_batch", {"codes": ["dsqt", "dsqtv"]}),
+                 ("keytao_batch_add_to_draft", {"items": items})]
+        client = harness._FakeClient([
+            harness._FakeAIResponse("tool_calls", tool_calls=[SimpleNamespace(
+                id=str(index), type="function", function=SimpleNamespace(
+                    name=name, arguments=json.dumps(args, ensure_ascii=False),
+                ),
+            )]) for index, (name, args) in enumerate(calls)
+        ] + [harness._FakeAIResponse("stop", content="已完成。")])
+
+        class Skills(harness._FakeToolSkillsManager):
+            def get_tools(self):
+                return [tool for tool in (*harness._lookup_tools.TOOLS, *TOOLS.TOOLS)
+                        if tool["function"]["name"] in dict(calls)]
+
+        executor = ToolExecutor(functions.get, self.replay.chat._INJECT_PLATFORM_TOOLS)
+        results = []
+        real_call = executor.call
+
+        async def capture_call(*args, **kwargs):
+            result = await real_call(*args, **kwargs)
+            results.append((args[0], result))
+            return result
+
+        executor.call = capture_call
+        agent = AgentOrchestrator(
+            client_factory=lambda: client, runtime=AgentRuntimeConfig("offline-model", 1000, 0.0, 1.0),
+            skills_manager=Skills(), tool_executor=executor,
+            state_store=self.replay.store, bind_help_text="Offline binding help", system_prompt_core="Offline prompt",
+        )
+        reply = await agent.run("喵喵 修改\ndsqt 大全\ndsqtv 大权", AgentRequestContext(
+            platform="qq", user_id=self.replay.author.actor_id, space_type="group", space_id="prod-replay",
+            mutations_allowed=True, actor_is_bound=True,
+        ))
+        self.assertEqual([(row["action"], row.get("oldWord"), row["word"], row["code"])
+                          for row in self.http.rows],
+                         [("Change", "大权", "大全", "dsqt"), ("Change", "大全", "大权", "dsqtv")],
+                         (reply, self.http.requests, results))
+        self.assertEqual(len(self.http.writes), 1, reply)
+        self.assertIn("已加入草稿", reply)
+        for value in ("大权", "大全", "dsqt", "dsqtv", "offline-batch"):
+            self.assertIn(value, reply, results)
+        self.assertEqual(self.http.errors, [])
+
     async def test_duplicate_blocked_shift_stops_on_second_attempt(self):
         agent, create, execute = self.orchestrator([
             ("keytao_shift_phrase_code", {"word": b11_shift_WORD, "target_code": "xlblu"}),
@@ -2795,6 +2880,69 @@ class MoveToCodeGrammarTests(unittest.TestCase):
     context = MoveToCodeGrammarTests_context
 
     assert_bound_move = MoveToCodeGrammarTests_assert_bound_move
+
+    def test_change_header_binds_exact_code_word_pairs_in_both_orders(self):
+        items = [
+            {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全", "type": "Phrase"},
+            {"action": "Change", "code": "dsqtv", "old_word": "大全", "word": "大权", "type": "Phrase"},
+        ]
+        for header in ("修改", "改"):
+            for pairs in ("dsqt 大全\ndsqtv 大权", "大全 dsqt\n大权 dsqtv"):
+                message = f"喵喵 {header}\n{pairs}"
+                with self.subTest(message=message):
+                    context = ToolContext(
+                        current_message=message,
+                        trusted_phrase_types_by_key={
+                            ("大权", "dsqt"): frozenset({"Phrase"}),
+                            ("大全", "dsqtv"): frozenset({"Phrase"}),
+                        },
+                    )
+                    self.assertIsNone(grammar._validate_current_message_binding(
+                        "keytao_batch_add_to_draft", {"items": items}, context,
+                    ))
+                    self.assertTrue(grammar.message_authorizes_mutation(message))
+
+    def test_change_header_single_pair_binds_both_tool_entry_points(self):
+        item = {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全"}
+        for message in ("修改 dsqt 大全", "改 大全 dsqt", "修改\ndsqt 大全"):
+            for tool, args in (("keytao_create_phrase", item),
+                               ("keytao_batch_add_to_draft", {"items": [item]})):
+                with self.subTest(message=message, tool=tool):
+                    context = ToolContext(current_message=message, trusted_phrase_types_by_key={
+                        ("大权", "dsqt"): frozenset({"Phrase"}),
+                    })
+                    self.assertTrue(grammar.message_authorizes_mutation(message))
+                    self.assertIsNone(grammar._validate_current_message_binding(tool, args, context))
+
+    def test_change_header_rejects_absent_crossed_or_untrusted_targets(self):
+        items = [
+            {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全"},
+            {"action": "Change", "code": "dsqtv", "old_word": "大全", "word": "大权"},
+        ]
+        context = ToolContext(current_message="修改\ndsqt 大全\ndsqtv 大权",
+                              trusted_phrase_types_by_key={
+                                  ("大权", "dsqt"): frozenset({"Phrase"}),
+                                  ("大全", "dsqtv"): frozenset({"Phrase"}),
+                              })
+        invalid = [items[:1], [*items, items[0]]]
+        for field, value in (("code", "dsqtvv"), ("word", "大地"),
+                             ("old_word", "大地"), ("action", "Create")):
+            invalid.append([{**items[0], field: value}, items[1]])
+        invalid.append([{**items[0], "code": "dsqtv"}, {**items[1], "code": "dsqt"}])
+        for changed in invalid:
+            with self.subTest(items=changed):
+                self.assertIsNotNone(grammar._validate_current_message_binding(
+                    "keytao_batch_add_to_draft", {"items": changed}, context,
+                ))
+        self.assertIsNotNone(grammar._validate_current_message_binding(
+            "keytao_batch_add_to_draft", {"items": items},
+            ToolContext(current_message=context.current_message),
+        ))
+        for message in ("不要修改\ndsqt 大全", "例如：修改 dsqt 大全",
+                        "修改 dsqt 大全？", "改\ndsqt 大全\ndsqt 大权"):
+            with self.subTest(message=message):
+                self.assertFalse(grammar._parse_code_word_changes(message))
+
 
     def test_incident_binds_live_existing_word_without_candidate_inventory(self):
         self.assert_bound_move("喵喵 把 奈飞 调到 nhfw")

@@ -28,6 +28,7 @@ from ..harness.orchestrator import (
     AgentRuntimeConfig,
     _command_suggestions_match_pending_batch,
     build_system_prompt,
+    matches_binding_remediation_reply,
 )
 from ..harness.conversation import (
     ConversationAddress,
@@ -2581,6 +2582,8 @@ def _enforce_advertised_reply_contract(
     query_words: Tuple[str, ...] = (),
 ) -> str:
     """Validate commands first, then append this actor's verified account notice."""
+    if matches_binding_remediation_reply(response, _current_turn_message.get("")):
+        return response
     conversational_turn = _current_conversational_turn.get()
     if conversational_turn is not None and conversational_turn[0] == _current_turn_message.get(""):
         return enforce_conversational_reply(conversational_turn[0], response, conversational_turn[1])

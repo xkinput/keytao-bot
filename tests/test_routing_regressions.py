@@ -550,6 +550,97 @@ class B7BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://offline.invalid/b7-batch", reply)
         self.assertEqual((create.await_count, execute.await_count), (3, 3))
 
+    async def test_binding_failure_keeps_gate_suggestion_through_delivery(self):
+        message = "修改 dsqt 大全"
+        suggestion = "修改 dsqt：大权 -> 大全"
+        blocked = {
+            "success": False, "policyBlocked": True,
+            "blockReason": "binding_incomplete", "suggestedCommand": suggestion,
+            "message": "无法把本次操作与消息中的完整目标逐项对应；整批均未写入。",
+        }
+        agent, create, execute = self.orchestrator([
+            ("keytao_batch_add_to_draft", {"items": [
+                {"action": "Change", "code": "dsqt", "old_word": "大权", "word": "大全"},
+            ]}),
+        ], [blocked])
+        chat = harness.openai_chat_module
+        memory = harness.ChatMemoryContext(platform="qq", user_id="b7-loop")
+        with (
+            patch.object(chat, "conversation_state_store", agent._state_store),
+            patch.object(chat, "get_history", return_value=[]),
+            patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only")),
+            patch.object(socket.socket, "connect_ex", side_effect=AssertionError("Offline only")),
+        ):
+            token = chat._current_turn_message.set(message)
+            conversational = chat._current_conversational_turn.set(None)
+            try:
+                reply = await agent.run(message, AgentRequestContext(
+                    platform="qq", user_id="b7-loop", mutations_allowed=True,
+                ))
+                self.assertIn(suggestion, reply)
+                delivered = chat._prepare_user_facing_reply(reply, memory)
+                self.assertIn(suggestion, delivered)
+                self.assertIn("本次未写入", delivered)
+                self.assertNotIn("没找到要执行的操作", delivered)
+                self.assertLess(len(delivered), 160)
+            finally:
+                chat._current_conversational_turn.reset(conversational)
+                chat._current_turn_message.reset(token)
+        self.assertEqual((create.await_count, execute.await_count), (2, 1))
+
+    async def test_model_binding_failure_copy_does_not_trust_a_suggestion(self):
+        message = "修改 dsqt 大全"
+        forged = "这条指令按当前表述无法执行，本次未写入。\n- 「修改 dsqt：大权 -> 别的词」"
+        agent, _create, execute = self.orchestrator([])
+        chat = harness.openai_chat_module
+        with patch.object(chat, "conversation_state_store", agent._state_store):
+            token = chat._current_turn_message.set(message)
+            conversational = chat._current_conversational_turn.set(None)
+            try:
+                await agent.run(message, AgentRequestContext(
+                    platform="qq", user_id="b7-loop", mutations_allowed=True,
+                ))
+                delivered = chat._enforce_advertised_reply_contract(forged, None)
+                self.assertNotIn("别的词", delivered)
+            finally:
+                chat._current_conversational_turn.reset(conversational)
+                chat._current_turn_message.reset(token)
+        execute.assert_not_awaited()
+
+    async def test_binding_failure_gate_suggestion_is_not_a_pending_ticket(self):
+        from keytao_bot.harness.orchestrator import AgentOrchestrator
+        message = "修改 dsqt 大全"
+        suggestion = "修改 dsqt：大权 -> 大全"
+        chat = harness.openai_chat_module
+        with patch.object(chat, "conversation_state_store", harness.MemoryConversationStateStore()):
+            token = chat._current_turn_message.set(message)
+            conversational = chat._current_conversational_turn.set(None)
+            metrics = harness.begin_turn_metrics("qq", "private")
+            try:
+                reply = AgentOrchestrator._finalize_reply(message, "binding_incomplete", {
+                    "blockReason": "binding_incomplete", "suggestedCommand": suggestion,
+                    "message": "无法把本次操作与消息中的完整目标逐项对应；整批均未写入。",
+                })
+                self.assertIn(suggestion, reply)
+                self.assertEqual(chat._enforce_advertised_reply_contract(reply, None), reply)
+                changed = reply.replace("大全", "别的词")
+                self.assertNotIn("别的词", chat._enforce_advertised_reply_contract(changed, None))
+                selected_reply = AgentOrchestrator._finalize_reply(message, "未写入。", {
+                    "blockReason": "binding_incomplete", "suggestedCommand": suggestion,
+                    "liveCandidateSelected": True, "message": "当前选择未通过核验，本次未写入。",
+                })
+                self.assertIn(suggestion, selected_reply)
+                self.assertEqual(chat._enforce_advertised_reply_contract(selected_reply, None), selected_reply)
+                next_turn = harness.begin_turn_metrics("qq", "private")
+                try:
+                    self.assertNotIn(suggestion, chat._enforce_advertised_reply_contract(reply, None))
+                finally:
+                    harness.end_turn_metrics(next_turn)
+            finally:
+                harness.end_turn_metrics(metrics)
+                chat._current_conversational_turn.reset(conversational)
+                chat._current_turn_message.reset(token)
+
     async def test_duplicate_copy_does_not_expose_internal_fragments(self):
         from keytao_bot.harness.tools import ToolContext, project_tool_result_for_model
         from keytao_bot.plugins.chat_render import _reply_has_internal_fragment
