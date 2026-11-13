@@ -1527,6 +1527,39 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
 
     created = B18RealToolTests_created
 
+    async def test_completed_duplicate_multiselect_receipt_uses_past_tense_and_merges_codes(self):
+        from tests.helpers import DuplicateWarningHTTP, REAL_REVIEW_READS, review
+
+        self.http = DuplicateWarningHTTP()
+        self.http.entries = [{"word": "晁错", "code": code, "type": "Phrase", "weight": 100}
+                             for code in ("jzcl", "wzcl")]
+        self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
+        self.enterContext(patch.dict(b18_rest_real_tools_FACTS, {
+            "抄错": ("jzcli", ["jzcl", "jzcli", "jzcliv", "wzcl", "wzcli", "wzcliv"], "chao cuo"),
+        }))
+        self.enterContext(patch.multiple(review, **REAL_REVIEW_READS))
+        self.enterContext(patch.object(review.http_client, "guarded_fetch", AsyncMock(return_value=OfflineResponse({}, 404))))
+        self.enterContext(patch.object(review, "AsyncOpenAI", None))
+        self.enterContext(patch.object(review, "_review_cache", OrderedDict()))
+        self.enterContext(patch.object(review, "_semantic_review_cache", OrderedDict()))
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(review, "reference_db_path", return_value=Path(directory) / "reference.db"))
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS,
+                     **harness._review_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
+        self.enterContext(patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get))
+
+        await self.turn("抄错", raw_operation(op="query", operands=["抄错"], codes=[], refers_to_pending=False))
+        self.assertIsNotNone(self.replay.store.get_record(self.replay.author), self.replay.last_response)
+        await self.turn("添加 1、4")
+        self.assertEqual(self.http.writes, [])
+        self.assertIn("确认后「抄错」将作为重码写入", self.replay.last_response)
+        await self.turn("确认", raw_operation(op="confirm", refers_to_pending=True))
+        self.assertEqual(self.created(), [("抄错", "jzcl"), ("抄错", "wzcl")], self.replay.last_response)
+        self.assertIn("已加入草稿", self.replay.last_response)
+        self.assertIn("⚠️ jzcl、wzcl 与「晁错」同码，已作为重码加入", self.replay.last_response)
+        self.assertNotIn("确认后", self.replay.last_response)
+        self.assertEqual(self.replay.last_response.count("与「晁错」同码"), 1)
+
     async def test_a3_word_first_and_adjacent_quoted_add_codes_reach_real_tools(self):
         for message in (
             "「大绿」添加「dsllva」", "给大绿添加编码 dsllva",

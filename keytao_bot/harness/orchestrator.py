@@ -3850,7 +3850,7 @@ class AgentOrchestrator:
         if vote_reply:
             return vote_reply
         if any("writtenItems" in receipt or "updatedItems" in receipt for receipt in receipts):
-            from ..plugins.chat_render import finalize_draft_receipt, _plain_warning_line
+            from ..plugins.chat_render import finalize_draft_receipt, _create_notice_lines
             batches: Dict[str, List[Dict[str, Any]]] = {}
             for receipt in receipts:
                 batch_id = str(receipt.get("batchId") or receipt.get("batchUrl") or "")
@@ -3863,10 +3863,9 @@ class AgentOrchestrator:
                 if submitted is not None:
                     status = "✅ 已入库：" if submitted.get("autoApproved") else "✅ 已提交审核："
                 text = finalize_draft_receipt(status, *reversed(batch_receipts))
-                warnings = list(dict.fromkeys(
-                    _plain_warning_line(warning)
-                    for receipt in batch_receipts for warning in receipt.get("warnings") or []
-                ))
+                warnings = _create_notice_lines({"warnings": [
+                    warning for receipt in batch_receipts for warning in receipt.get("warnings") or []
+                ]})
                 parts.append("\n".join([text, *filter(None, warnings)]))
             return "\n".join(parts)
         written: List[Dict[str, str]] = []

@@ -61,6 +61,7 @@ from tests.helpers import (
     OLD_ITEM,
     OTHER,
     OrderedDict,
+    OfflineResponse,
     PROBES,
     QUERY_WORDS,
     REAL_FINISH,
@@ -712,6 +713,81 @@ class B19PartialReplyBindingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_r1_partial_reply_default_writes_remaining(self):
         await self.complete("其它的用默认编码", True)
+
+    def recall_http(self):
+        original = self.http._response
+
+        def response(method, url, kwargs):
+            if url.endswith("/api/bot/batches/recall"):
+                self.http.requests.append((method, "/api/bot/batches/recall", {}))
+                self.assertEqual(method, "GET", "Recall preview must not write")
+                return OfflineResponse({
+                    "success": True, "batchId": "submitted-batch", "contentVersion": 7,
+                    "status": "Submitted", "pullRequestCount": 2,
+                })
+            return original(method, url, kwargs)
+
+        self.enterContext(patch.object(self.http, "_response", side_effect=response))
+
+    async def recall_preview(self):
+        return await self.replay.chat._execute_confirmed_tool(
+            harness.PendingToolConfirm("keytao_recall_batch", {}, confirmation_source="local_preview"),
+            "qq", self.replay.author.actor_id, self.replay.author,
+            self.replay.author.space_key, "Offline owner",
+        )
+
+    async def test_recall_nonempty_current_draft_refuses_before_confirmation(self):
+        self.recall_http()
+        self.http.rows[:] = [
+            {"id": index, "word": "保留词", "code": code, "action": "Create", "type": "Phrase"}
+            for index, code in enumerate(("bzlk", "bzlki"), 1)
+        ]
+        response = await self.recall_preview()
+        self.assertIn("当前草稿", response)
+        self.assertIn("2 条", response)
+        self.assertIn("提交", response)
+        self.assertIn("清空", response)
+        self.assertIn(self.http.batch_id, response)
+        self.assertNotIn("submitted-batch", response)
+        self.assertNotIn("回复「确认」", response)
+        self.assertIsNone(self.replay.store.get_record(self.replay.author))
+        self.assertEqual(self.http.writes, [])
+
+    async def test_recall_empty_current_draft_names_batch_and_count_without_replacement(self):
+        self.recall_http()
+        response = await self.recall_preview()
+        self.assertIn("2 条", response)
+        self.assertIn("submitted-batch", response)
+        self.assertIn("确认", response)
+        self.assertNotIn("原待确认提交已取消", response)
+        record = self.replay.store.get_record(self.replay.author)
+        self.assertEqual(self.replay.commands._pending_execution_args(record.state), {
+            "batch_id": "submitted-batch", "expected_content_version": 7,
+        })
+        self.assertIn("2 条", chat_render._format_pending_state_details(record.state))
+        self.assertEqual(self.http.writes, [])
+
+    async def test_recall_does_not_announce_cancellation_of_already_submitted_batch(self):
+        self.recall_http()
+        self.replay.store.set(self.replay.author, harness.PendingToolConfirm(
+            "keytao_submit_batch", {"batch_id": "submitted-batch"},
+        ))
+        previous = self.replay.store.get_record(self.replay.author)
+        response = await self.recall_preview()
+        response = self.replay.commands._announce_replaced_submit(previous, self.replay.author, response)
+        self.assertNotIn("原待确认提交已取消", response)
+        self.assertFalse(any(receipt.get("operationKind") == "ticket_replacement"
+                             for receipt in self.replay.chat.current_draft_delivery_claims.get() or []))
+
+    async def test_recall_keeps_notice_for_another_real_pending_submit(self):
+        self.recall_http()
+        self.replay.store.set(self.replay.author, harness.PendingToolConfirm(
+            "keytao_submit_batch", {"batch_id": "another-draft"},
+        ))
+        previous = self.replay.store.get_record(self.replay.author)
+        response = await self.recall_preview()
+        response = self.replay.commands._announce_replaced_submit(previous, self.replay.author, response)
+        self.assertIn("原待确认提交已取消", response)
 
     async def test_r1_partial_reply_add_writes_remaining(self):
         await self.complete("加入", True)

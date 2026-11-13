@@ -849,6 +849,24 @@ def shift_plan_warnings(data: dict[str, Any]) -> list[Any]:
     return result
 
 
+def _duplicate_code_existing_words(warning: dict[str, Any], code: str) -> tuple[str, ...]:
+    raw_existing = warning.get("existing")
+    existing_rows = (
+        raw_existing
+        if isinstance(raw_existing, list)
+        else [raw_existing]
+        if isinstance(raw_existing, dict)
+        else []
+    )
+    return tuple(dict.fromkeys(
+        str(row.get("word") or "").strip()
+        for row in existing_rows
+        if isinstance(row, dict)
+        and str(row.get("word") or "").strip()
+        and str(row.get("code") or code).strip().lower() == code
+    ))
+
+
 def plain_warning_message(warning: Any) -> str:
     """Verbalize one structured server warning without reducing it to a count."""
     if is_dataclass(warning) and not isinstance(warning, type):
@@ -874,21 +892,7 @@ def plain_warning_message(warning: Any) -> str:
     )
 
     if warning_type == "duplicate_code" and code:
-        raw_existing = warning.get("existing")
-        existing_rows = (
-            raw_existing
-            if isinstance(raw_existing, list)
-            else [raw_existing]
-            if isinstance(raw_existing, dict)
-            else []
-        )
-        existing_words = tuple(dict.fromkeys(
-            str(row.get("word") or "").strip()
-            for row in existing_rows
-            if isinstance(row, dict)
-            and str(row.get("word") or "").strip()
-            and str(row.get("code") or code).strip().lower() == code
-        ))
+        existing_words = _duplicate_code_existing_words(warning, code)
         if existing_words:
             target_copy = f"「{word}」" if word else "该词"
             if word and word in existing_words:
@@ -925,6 +929,43 @@ def plain_warning_message(warning: Any) -> str:
     if word:
         return f"「{word}」写入前需要确认{weight_copy}"
     return "服务端返回了一项需要确认的风险"
+
+
+def completed_warning_messages(warnings: Iterable[Any]) -> list[str]:
+    """Merge completed duplicate writes by occupant without asking to write again."""
+    messages: list[str] = []
+    groups: dict[tuple[tuple[str, ...], str], tuple[int, list[str]]] = {}
+    for warning in warnings:
+        if is_dataclass(warning) and not isinstance(warning, type):
+            warning = asdict(warning)
+        if not isinstance(warning, dict) or warning.get("warningType") != "duplicate_code":
+            messages.append(plain_warning_message(warning))
+            continue
+        item = warning.get("item")
+        source = item if isinstance(item, dict) else warning
+        code = str(source.get("code") or warning.get("code") or "").strip().lower()
+        existing_words = _duplicate_code_existing_words(warning, code)
+        if not code or not existing_words:
+            messages.append(plain_warning_message(warning))
+            continue
+        weight = source.get("weight", warning.get("weight"))
+        weight_copy = (
+            f"（权重 {weight}）"
+            if isinstance(weight, int) and not isinstance(weight, bool) and weight != 100
+            else ""
+        )
+        key = (existing_words, weight_copy)
+        if key not in groups:
+            groups[key] = (len(messages), [])
+            messages.append("")
+        index, codes = groups[key]
+        if code not in codes:
+            codes.append(code)
+        messages[index] = (
+            f"{'、'.join(codes)} 与「{'、'.join(existing_words)}」同码，"
+            f"已作为重码加入{weight_copy}"
+        )
+    return list(dict.fromkeys(messages))
 
 
 def already_existing_words_copy(word_codes: dict[str, tuple[str, ...]]) -> str:
@@ -1191,6 +1232,16 @@ def parse_pending_candidate_selection(text: str) -> PendingCandidateSelection | 
 def pending_confirmation_copy() -> str:
     """Render the generic forms accepted by a single actor-owned ticket."""
     return "回复「确认」执行，或「取消」。"
+
+
+def recall_batch_copy(data: dict[str, Any]) -> str:
+    """Name the submitted batch and its known item count in recall previews."""
+    count = data.get("pullRequestCount")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        items = data.get("items")
+        count = len(items) if isinstance(items, list) else None
+    detail = f"{count} 条" if count is not None else "条目数未知"
+    return f"撤回已提交批次（{detail}）"
 
 
 def pending_batch_confirmation_copy() -> str:

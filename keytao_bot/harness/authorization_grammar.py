@@ -3203,6 +3203,18 @@ def parse_standalone_shift(
     return ExistingEntryMove(value.strip('「」“”"『』'), match["code"] or "", verb="顺延")
 
 
+def parse_displayed_word_shift(message: str, known_words: Tuple[str, ...]) -> Optional[ExistingEntryMove]:
+    """Accept only an exact displayed operand, without guessing a word boundary."""
+    source = strip_self_mention_tokens(message).strip().rstrip("。.!！").strip()
+    for word in sorted(set(known_words), key=len, reverse=True):
+        if re.fullmatch(r"[\u3400-\u9fff]{1,32}", word) and re.fullmatch(
+            rf"(?:把\s*|将\s*)?{re.escape(word)}\s*(?:顺延|往后移|后移|后置)(?:\s*一码|\s*一位)?",
+            source,
+        ):
+            return ExistingEntryMove(word, "", verb="顺延")
+    return None
+
+
 def parse_reviewed_shift_words(
     message: str, *, known_words: Tuple[str, ...] = (),
 ) -> Optional[Tuple[str, ...]]:

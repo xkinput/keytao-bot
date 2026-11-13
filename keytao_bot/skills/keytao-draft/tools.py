@@ -3068,6 +3068,23 @@ async def keytao_recall_batch(
                 )
             reuse_existing_claim = True
 
+    if not batch_id and existing_recall_payload is None:
+        current_draft = await keytao_list_draft_items(platform, platform_id)
+        current_items = current_draft.get("items")
+        if not current_draft.get("success") or not isinstance(current_items, list):
+            return {
+                **current_draft,
+                "success": False,
+                "message": "无法核验当前草稿，请先查看草稿后再撤回。",
+            }
+        if current_items:
+            return {
+                "success": False,
+                "batchId": current_draft.get("batchId"),
+                "batchUrl": current_draft.get("batchUrl"),
+                "message": f"当前草稿已有 {len(current_items)} 条，暂不能撤回。请先提交或清空当前草稿。",
+            }
+
     url = f"{KEYTAO_API_BASE}/api/bot/batches/recall"
     logger.info(f"[keytao_recall_batch] platform={platform} platformId={platform_id}")
 

@@ -139,6 +139,7 @@ from ..utils.pending_confirmation import (
     pending_confirmation_copy,
     pending_word_reminder_lines,
     prepend_pending_word_reminders,
+    recall_batch_copy,
     render_executable_suggestion,
     render_server_backed_batch_candidates,
     render_remediation_reply,
@@ -6391,7 +6392,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
 
     if function_name == "keytao_recall_batch":
         batch_url = _trusted_batch_url(data)
-        lines = ["↩️ 撤回批次："]
+        lines = ["↩️ " + recall_batch_copy(data)]
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
         lines.append(pending_confirmation_copy())
@@ -10343,13 +10344,66 @@ def _standalone_shift_bound_words(record, address, reply_reference=None) -> Tupl
     return tuple(dict.fromkeys(words))
 
 
+def _recent_displayed_shift_words(history) -> Tuple[str, ...]:
+    """Read exact word subjects from the latest bot reply group in actor history."""
+    replies = []
+    for item in reversed(history or []):
+        if item.get("role") == "assistant":
+            replies.append(str(item.get("content") or ""))
+        elif replies or item.get("role") == "user":
+            break
+    words = []
+    literal = r'[\u3400-\u9fff]{1,32}'
+    code = r'[a-z]{1,12}(?![a-z])'
+    for reply in replies:
+        displayed = _parse_pending_add_word(reply)
+        if isinstance(displayed, PendingAddWord):
+            words.append(displayed.word)
+            words.extend(word for occupants in displayed.occupied_words.values() for word in occupants)
+        word = advertised_single_word_lookup_word(reply)
+        if word:
+            words.append(word)
+        words.extend(_standalone_shift_bound_words(None, None, ReplyReferenceInfo(
+            is_reply=True, is_to_bot=True, text=reply,
+        )))
+        for line in reply.splitlines():
+            words.extend(re.findall(rf'(?:^|[：:、，,；;\s])({literal})(?:\s+|\s*[→@]\s*){code}', line))
+            words.extend(re.findall(rf'{code}\s*[—–-]\s*[「“]?({literal})', line))
+            words.extend(re.findall(rf'{code}\s*(?:与|和)\s*[「“"『]({literal})[」”"』]\s*同码', line))
+            words.extend(re.findall(rf'{code}\s*[—–-]\s*已有\s*[「“"『]({literal})[」”"』]', line))
+            words.extend(re.findall(rf'[「“"『]({literal})[」”"』](?=\s*已在当前草稿)', line))
+    return tuple(dict.fromkeys(words))
+
+
+async def _load_merged_code_reorder_entries(code, platform, user_id):
+    try:
+        lookup = json.loads(await call_tool_function("keytao_lookup_by_code", {"code": code}, platform, user_id))
+        draft = json.loads(await call_tool_function("keytao_list_draft_items", {}, platform, user_id))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(lookup, dict) or lookup.get("success") is not True:
+        return None
+    phrases = lookup.get("phrases")
+    if not isinstance(phrases, list) or any(not isinstance(row, dict) or row.get("code") != code for row in phrases):
+        return None
+    words = tuple(dict.fromkeys(row.get("word") for row in phrases))
+    live = _validated_word_lookup_entries({"success": True, "results": [
+        {"word": word, "phrases": [row for row in phrases if row.get("word") == word]} for word in words
+    ]}, words)
+    snapshot = _validated_draft_reorder_snapshot(draft)
+    if live is None or snapshot is None:
+        return None
+    merged = _merge_live_and_draft_reorder_entries(live, snapshot)
+    return None if merged is None else [row for row in merged if row["code"] == code]
+
+
 async def try_handle_advertised_shift(
     message: str, platform: str, user_id: str, conv_key: Optional[ConversationKey],
     space_key: Optional[Tuple[str, str]], owner_label: str, *, reply_reference=None,
-    require_bound_operand: bool = False,
+    require_bound_operand: bool = False, history=None,
 ) -> Optional[str]:
     """Keep the B7 pair API; user-message callers must require bound operands."""
-    from ..harness.authorization_grammar import parse_reviewed_shift_words, parse_standalone_shift
+    from ..harness.authorization_grammar import parse_displayed_word_shift, parse_reviewed_shift_words, parse_standalone_shift
     from .chat_routing import _multi_word_candidate_scope_rows
 
     address = normalize_conversation_key(conv_key or (platform, user_id), space_key)
@@ -10360,6 +10414,17 @@ async def try_handle_advertised_shift(
     shift = parse_standalone_shift(message, known_words=_standalone_shift_bound_words(
         record, normalize_conversation_key((platform, user_id), space_key), reply_reference,
     ))
+    if shift is None and address == normalize_conversation_key((platform, user_id), space_key) and not (
+        record is not None and (record.execution_id or isinstance(record.state, PendingToolConfirm)
+                               and record.state.confirmation_source == "server_warning")
+    ):
+        displayed_shift = parse_displayed_word_shift(message, _recent_displayed_shift_words(history))
+        if displayed_shift is not None:
+            response = await _try_handle_standalone_shift(
+                displayed_shift, platform, user_id, address, space_key, owner_label, require_shared_code=True,
+            )
+            if response is not None:
+                return response
     if (shift is None and require_bound_operand
             and _strip_command_message_prefixes(message).lstrip().startswith("顺延")
             and address == normalize_conversation_key((platform, user_id), space_key)):
@@ -10505,7 +10570,7 @@ async def try_handle_advertised_shift(
         _semantic_direct_words.reset(token)
 
 
-async def _try_handle_standalone_shift(shift, platform, user_id, conv_key, space_key, owner_label):
+async def _try_handle_standalone_shift(shift, platform, user_id, conv_key, space_key, owner_label, *, require_shared_code=False):
     from ..harness.operation_request import OperationRequest
 
     if shift.target_code and not shift.target_code.isalpha():
@@ -10515,8 +10580,19 @@ async def _try_handle_standalone_shift(shift, platform, user_id, conv_key, space
         return _active_operation_message_for_request(active, platform, user_id)
     entries = await _load_merged_reorder_entries((shift.word,), platform, user_id)
     if not entries:
+        if require_shared_code:
+            return None
         return f"无法读取「{shift.word}」的现有词库或草稿编码，本次未执行顺延。"
     entries = [row for row in entries if row["word"] == shift.word]
+    if require_shared_code:
+        shared = []
+        for row in entries:
+            occupants = await _load_merged_code_reorder_entries(row["code"], platform, user_id)
+            if occupants is not None and any(other["word"] != shift.word for other in occupants):
+                shared.append(row)
+        entries = shared
+        if not entries:
+            return None
     options = []
     for row in entries:
         code = row["code"]
@@ -10532,15 +10608,29 @@ async def _try_handle_standalone_shift(shift, platform, user_id, conv_key, space
             if code not in chain or chain.index(code) + 1 >= len(chain):
                 return f"「{shift.word}」的当前编码之后没有可核验的候选位置，本次未执行顺延。"
             target = chain[chain.index(code) + 1]
+            if require_shared_code:
+                target = ""
+                for candidate in chain[chain.index(code) + 1:]:
+                    occupants = await _load_merged_code_reorder_entries(candidate, platform, user_id)
+                    if occupants is None:
+                        return f"无法核验编码 {candidate} 的占用记录，本次未写入。"
+                    if not occupants:
+                        target = candidate
+                        break
+                if not target:
+                    return f"「{shift.word}」的当前编码之后没有空位，本次未写入。"
         options.append(OperationRequest(
             op="move" if code == target else "recode", operands=(shift.word,),
             codes=(code,) if code == target else (code, target),
         ))
     if len(options) > 1:
-        return await try_handle_model_command_options(options, "", conv_key, space_key, owner_label, shift_options=True)
+        return await try_handle_model_command_options(
+            options, "", conv_key, space_key, owner_label, shift_options=True,
+            require_shift_confirmation=require_shared_code,
+        )
     if not options or options[0].op == "move":
         return "目标编码与现有编码相同，本次未执行顺延。"
-    direct = "direct_exec" in {token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")}
+    direct = not require_shared_code and "direct_exec" in {token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")}
     return await _execute_existing_shift(entries[0], options[0].codes[1], platform, user_id, space_key, owner_label, direct=direct)
 
 
@@ -11623,6 +11713,10 @@ def _announce_replaced_submit(previous, conv_key, response):
         and current is not None and current is not previous
         and current.owner_key == previous.owner_key
     ):
+        if isinstance(current.state, PendingToolConfirm) and current.state.function_name == "keytao_recall_batch":
+            previous_batch_id = str(previous.state.args.get("batch_id") or "")
+            if not previous_batch_id or previous_batch_id == current.state.args.get("batch_id"):
+                return response
         if _candidate_origin_for_ticket(current.state):
             # Add-and-submit still previews the whole draft, including old items.
             return response
@@ -13280,10 +13374,11 @@ async def try_handle_model_command(request, platform, user_id, conv_key, space_k
     return _announce_replaced_submit(record, conv_key, response)
 
 
-async def try_handle_model_command_options(options, explanation, conv_key, space_key, owner_label, *, word_code_choice=False, shift_options=False):
+async def try_handle_model_command_options(options, explanation, conv_key, space_key, owner_label, *, word_code_choice=False, shift_options=False, require_shift_confirmation=False):
     record = conversation_state_store.get_record(conv_key)
     args = {"options": [], **({"word_code_choice": True} if word_code_choice else {}),
-            **({"shift_options": True} if shift_options else {})}
+            **({"shift_options": True} if shift_options else {}),
+            **({"require_shift_confirmation": True} if require_shift_confirmation else {})}
     for request in options:
         command = render_understood_command(request)
         if not command:
@@ -13386,7 +13481,10 @@ async def handle_pending_understood_command(record, message, platform, user_id, 
             return "选中的原编码已变化，本次未执行顺延。"
         if request.op == "move":
             return f"「{request.operands[0]}」已在 {request.codes[0]}，本次未移动。"
-        return await _execute_existing_shift(sources[0], request.codes[1], platform, user_id, space_key, owner_label)
+        return await _execute_existing_shift(
+            sources[0], request.codes[1], platform, user_id, space_key, owner_label,
+            direct=record.state.args.get("require_shift_confirmation") is not True,
+        )
     if record.state.args.get("word_code_choice") is True:
         if request.op == "recode":
             entries = await _load_merged_reorder_entries(request.operands, platform, user_id)

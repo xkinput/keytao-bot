@@ -173,13 +173,16 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
                 self.replay.entries.append({"word": "保留词", "code": "xlbl", "type": "Phrase", "weight": 100})
             for message in (f"顺延{b11_shift_WORD}", f"{b11_shift_WORD}顺延", f"把{b11_shift_WORD}顺延", f"顺延{b11_shift_WORD}一位"):
                 with self.subTest(message=message, has_keeper=has_keeper):
+                    self.replay.store.delete(self.replay.author)
                     self.replay.history[:] = [{"role": "assistant", "content": f"「{b11_shift_WORD}」目前在 xlbl。"}]
                     self.replay.calls.clear()
                     await self.replay.turn({"message": message, "to_me": True}, raw_operation(
                         op="other", operands=[], codes=[], frame="question",
                     ))
                     self.assertEqual(self.replay.writes, [])
-                    self.assertFalse(any(name == "keytao_shift_phrase_code" for name, args in self.replay.calls))
+                    previews = [args for name, args in self.replay.calls if name == "keytao_shift_phrase_code"]
+                    self.assertEqual(bool(previews), has_keeper and message.endswith("顺延"))
+                    self.assertFalse(any(args.get("confirmed_plan_digest") for args in previews))
 
     async def test_bound_shift_rejects_extra_text_or_different_word(self):
         for message in (
@@ -1237,6 +1240,159 @@ class B25SessionTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(review.reference_db_path())) as connection, connection:
             connection.executemany("INSERT OR REPLACE INTO word_commonness VALUES (?, 3, NULL, 2)",
                                    [(word,) for word in facts])
+
+    async def assert_recent_codeless_shift(self, message, word, codes, displayed, *, draft_keeper=False):
+        self.configure_audit_move({word: (codes, "cha bao")}, [(word, codes[0])])
+        keeper = {"word": "同码词", "code": codes[0], "type": "Phrase", "weight": 100}
+        if draft_keeper:
+            self.http.rows.append({"id": 1, "action": "Create", **keeper})
+        else:
+            self.http.entries.append(keeper)
+        self.replay.history[:] = [{"role": "assistant", "content": displayed}]
+        await self.turn(message, await self.greeting())
+        self.assertEqual(self.http.writes, [], self.replay.last_response)
+        record = self.replay.store.get_record(self.replay.author)
+        self.assertIsNotNone(record, self.replay.last_response)
+        self.assertIsInstance(record.state, PendingToolConfirm, self.replay.last_response)
+        self.assertEqual(record.state.function_name, "keytao_shift_phrase_code", self.replay.last_response)
+        self.assertEqual(record.state.args["word"], word)
+        self.assertEqual(record.state.args["target_code"], codes[1])
+        self.assertIn("确认", self.replay.last_response)
+        await self.turn("确认", self.bot.last_id)
+        self.assertEqual(len(self.http.writes), 1, self.replay.last_response)
+        self.assertIn((word, codes[1]), self.created())
+        self.assertIn((word, codes[0]), [(row["word"], row["code"]) for row in self.http.rows if row["action"] == "Delete"])
+
+    async def test_a1_dalv_codeless_shift_after_display_with_real_tools(self):
+        # Production rows 10540/10543; the export has no display before 10540.
+        await self.assert_recent_codeless_shift("大绿后移一码", "大绿", ["dsllv", "dsllva", "dsllvai"],
+                                                "「大绿」已在词库（dsllv）。")
+
+    async def test_c3_chabao_postpose_after_lookup_with_real_tools(self):
+        # Production rows 10743/10744.
+        await self.assert_recent_codeless_shift("把查报后置", "查报", ["wsbz", "wsbzi", "wsbziv"],
+                                                "已在词库：查词 wsck、查报 wsbz、茶包 wsbz")
+
+    async def test_c4_chabao_spaced_shift_after_lookup_with_real_tools(self):
+        # Production row 10746, replayed after its lookup rather than the failed card.
+        await self.assert_recent_codeless_shift("把 查报 顺延", "查报", ["wsbz", "wsbzi", "wsbziv"],
+                                                "已在词库：查词 wsck、查报 wsbz、茶包 wsbz")
+
+    async def test_d3_chaocuo_shift_after_draft_receipt_with_real_tools(self):
+        # Production receipt and command in audit2/new-cases.md, 22:51:54.
+        await self.assert_recent_codeless_shift("晁错顺延", "晁错", ["jzcl", "jzcli", "jzcliv"],
+                                                "✅ 已加入草稿：抄错 jzcl、抄错 wzcl\n"
+                                                "⚠️ jzcl 与「晁错」同码，确认后「抄错」将作为重码写入\n"
+                                                "⚠️ wzcl 与「晁错」同码，确认后「抄错」将作为重码写入",
+                                                draft_keeper=True)
+
+    async def test_d3_chaocuo_two_codes_select_then_preview_and_confirm(self):
+        self.configure_audit_move({"晁错": (["jzcl", "jzcli", "jzcliv", "wzcl", "wzcli", "wzcliv"], "chao cuo")},
+                                  [("晁错", "jzcl"), ("晁错", "wzcl")])
+        self.http.rows[:] = [{"id": index, "action": "Create", "word": "抄错", "code": code,
+                             "type": "Phrase", "weight": 100} for index, code in enumerate(("jzcl", "wzcl"), 1)]
+        self.replay.history[:] = [{"role": "assistant", "content":
+            "✅ 已加入草稿：抄错 jzcl、抄错 wzcl\n⚠️ jzcl 与「晁错」同码\n⚠️ wzcl 与「晁错」同码"}]
+        await self.turn("晁错顺延", await self.greeting())
+        self.assertEqual(self.http.writes, [])
+        self.assertIn("1.", self.replay.last_response)
+        self.assertIn("2.", self.replay.last_response)
+        await self.turn("2", self.bot.last_id)
+        record = self.replay.store.get_record(self.replay.author)
+        self.assertIsNotNone(record, self.replay.last_response)
+        self.assertEqual(record.state.function_name, "keytao_shift_phrase_code", self.replay.last_response)
+        self.assertEqual(record.state.args["target_code"], "wzcli")
+        self.assertEqual(self.http.writes, [])
+        await self.turn("确认", self.bot.last_id)
+        self.assertEqual(len(self.http.writes), 1, self.replay.last_response)
+        self.assertIn(("晁错", "wzcli"), self.created())
+        self.assertNotIn(("晁错", "jzcli"), self.created())
+
+    async def test_recent_shift_skips_dictionary_and_draft_occupied_codes(self):
+        self.configure_audit_move({"查报": (["wsbz", "wsbzi", "wsbziv", "wsbziva"], "cha bao")},
+                                  [("查报", "wsbz"), ("茶包", "wsbz"), ("占位", "wsbzi")])
+        self.http.rows[:] = [{"id": 1, "action": "Create", "word": "草稿占位", "code": "wsbziv",
+                             "type": "Phrase", "weight": 100}]
+        self.replay.history[:] = [{"role": "assistant", "content": "「查报」已在当前草稿中（→ wsbz）。"}]
+        await self.turn("查报往后移", await self.greeting())
+        record = self.replay.store.get_record(self.replay.author)
+        self.assertIsNotNone(record, self.replay.last_response)
+        self.assertEqual(record.state.function_name, "keytao_shift_phrase_code")
+        self.assertEqual(record.state.args["target_code"], "wsbziva")
+        self.assertEqual(self.http.writes, [])
+        await self.turn("确认", self.bot.last_id)
+        self.assertIn(("查报", "wsbziva"), self.created())
+        self.assertNotIn(("占位", "wsbziv"), self.created())
+
+    async def test_codeless_shift_requires_latest_exact_display_and_current_duplicate(self):
+        self.configure_audit_move({"查报": (["wsbz", "wsbzi"], "cha bao")}, [("查报", "wsbz"), ("茶包", "wsbz")])
+        shown = {"role": "assistant", "content": "已在词库：查报 wsbz、茶包 wsbz"}
+        cases = (
+            ([], True),
+            ([{"role": "user", "content": "查报 wsbz"}], True),
+            ([shown, {"role": "user", "content": "你好"}, {"role": "assistant", "content": "你好。"}], True),
+            ([{"role": "assistant", "content": "「把查报后置」未收录：bǎ chá bào hòu zhì\n1. bwbf — ✅推荐"}], True),
+            ([shown], False),
+        )
+        for history, duplicate in cases:
+            with self.subTest(history=history, duplicate=duplicate):
+                self.http.entries[:] = self.http.entries[:1] + ([{"word": "茶包", "code": "wsbz", "type": "Phrase", "weight": 100}] if duplicate else [])
+                response = await b25_session_commands.try_handle_advertised_shift(
+                    "查报后移", "qq", self.replay.author.actor_id, self.replay.author,
+                    self.replay.author.space_key, "", history=history, require_bound_operand=True,
+                )
+                self.assertIsNone(response)
+                self.assertIsNone(self.replay.store.get_record(self.replay.author))
+                self.assertEqual(self.http.writes, [])
+
+    async def test_recent_shift_history_does_not_bind_other_user(self):
+        self.configure_audit_move({"查报": (["wsbz", "wsbzi"], "cha bao"), "查报后移": ([], "a")},
+                                  [("查报", "wsbz"), ("茶包", "wsbz")])
+        self.replay.history[:] = [{"role": "assistant", "content": "已在词库：查报 wsbz、茶包 wsbz"}]
+        await self.turn("查报后移", await self.greeting(), actor="other-user")
+        await self.turn("确认", self.bot.last_id, actor="other-user")
+        self.assertEqual(self.http.writes, [])
+
+    async def test_recent_shift_does_not_bind_controls_or_chitchat(self):
+        self.configure_audit_move({"确认": (["xlbl", "xlblu"], "que ren"), "是的": (["xlbl", "xlblu"], "shi de")},
+                                  [("确认", "xlbl"), ("是的", "xlbl"), ("保留词", "xlbl")])
+        for message, displayed in (
+            ("确认后移", "「查报」目前在 wsbz，回复「确认」执行，或「取消」。"),
+            ("是的后移", "是的"),
+        ):
+            with self.subTest(message=message):
+                response = await b25_session_commands.try_handle_advertised_shift(
+                    message, "qq", self.replay.author.actor_id, self.replay.author,
+                    self.replay.author.space_key, "", history=[{"role": "assistant", "content": displayed}],
+                    require_bound_operand=True,
+                )
+                self.assertIsNone(response)
+                self.assertIsNone(self.replay.store.get_record(self.replay.author))
+                self.assertEqual(self.http.writes, [])
+
+    async def test_recent_shift_uses_display_structure_instead_of_operand_stopwords(self):
+        await self.assert_recent_codeless_shift("怎么后移", "怎么", ["xlbl", "xlblu", "xlbluv"],
+                                                "「怎么」已在词库（xlbl）。")
+
+    async def test_codeless_shift_fragments_never_preview_or_write(self):
+        words = ("是的", "还是", "嗯", "好的", "那就", "它", "把它")
+        messages = ("是的后移", "还是 顺延", "嗯后移", "好的后移", "那就顺延", "把它顺延")
+        self.configure_audit_move({**{word: (["xlbl", "xlblu"], "a") for word in words},
+                                   **{message: ([], "a") for message in messages}},
+                                  [(word, "xlbl") for word in (*words, "保留词")])
+        for message in messages:
+            with self.subTest(message=message):
+                self.replay.store.delete(self.replay.author)
+                self.replay.history[:] = [{"role": "assistant", "content": "已在词库：查报 wsbz、茶包 wsbz"}]
+                self.http.requests.clear()
+                await self.turn(message, await self.greeting())
+                record = self.replay.store.get_record(self.replay.author)
+                self.assertFalse(record is not None and isinstance(record.state, PendingToolConfirm)
+                                 and record.state.function_name == "keytao_shift_phrase_code", self.replay.last_response)
+                await self.turn("确认", self.bot.last_id)
+                self.assertEqual(self.http.writes, [], self.replay.last_response)
+                self.assertFalse(any(path.endswith(("/pull-requests/batch", "/pull-requests/batch-draft"))
+                                     for _, path, _ in self.http.requests))
 
     async def test_c1_merged_recommendation_shifts_named_occupant_with_real_tools(self):
         self.configure_audit_move({

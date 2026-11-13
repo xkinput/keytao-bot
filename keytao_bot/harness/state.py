@@ -364,6 +364,9 @@ def _server_confirmation_display(data: Dict) -> Dict:
         and re.fullmatch(r"https?://[^\s]+", batch_url)
     ):
         display["batchUrl"] = batch_url
+    count = data.get("pullRequestCount")
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        display["pullRequestCount"] = count
 
     for key in ("warnings", "snapshotItems", "targets", "items"):
         value = data.get(key)

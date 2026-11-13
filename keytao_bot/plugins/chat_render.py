@@ -37,10 +37,12 @@ from ..utils.pending_confirmation import (
     _humanize_warning_text,
     already_existing_word_copy,
     candidate_commonness_guard_copy,
+    completed_warning_messages,
     pending_confirmation_copy,
     pending_word_reminder_lines,
     prepend_pending_word_reminders,
     plain_warning_message,
+    recall_batch_copy,
     shift_plan_warnings,
     front_insert_recommendation_copy,
     render_executable_suggestion,
@@ -879,7 +881,7 @@ def _format_pending_state_details(state: PendingState) -> str:
             draft_id = str(args.get("draft_id") or args.get("id") or "").strip()
             lines[0] = f"删除草稿条目 {draft_id}" if draft_id else "删除草稿条目"
     elif function_name == "keytao_recall_batch":
-        lines.append("撤回当前批次")
+        lines.append(recall_batch_copy(display))
         items = (
             display.get("items")
             if isinstance(display.get("items"), list)
@@ -1856,8 +1858,8 @@ def _capture_trusted_result_links(
 def _create_notice_lines(data: Dict) -> List[str]:
     """Render preserved warnings and the authoritative code-chain summary."""
     lines = [
-        _plain_warning_line(warning)
-        for warning in data.get("warnings") or []
+        _assert_plain_user_facing_reply(f"⚠️ {message}")
+        for message in completed_warning_messages(data.get("warnings") or [])
     ]
     ordering_summary = str(data.get("orderingSummary") or "").strip()
     if ordering_summary:

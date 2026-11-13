@@ -1469,6 +1469,41 @@ class b19_partial_reply_binding_DraftHTTP(b18_rest_real_tools_DraftHTTP):
             }})
         return super()._response(method, url, kwargs)
 
+
+class DuplicateWarningHTTP(b19_partial_reply_binding_DraftHTTP):
+    """Keep duplicate warnings on both the preview and confirmed HTTP receipt."""
+
+    def _response(self, method, url, kwargs):
+        path = urlsplit(url).path
+        if path.endswith("/evidence/fetch"):
+            return OfflineResponse({}, 404)
+        if path in {"/api/phrases/encode", "/api/bot/phrases/encode"}:
+            word = kwargs["params"]["word"]
+            _recommended, codes, reading = b18_rest_real_tools_FACTS[word]
+            self.requests.append((method, path, {"word": word}))
+            return OfflineResponse({
+                "input": word, "type": "二字词", "codes": codes,
+                "altCodes": [], "flyKeyVariants": [], "phrasePinyins": reading.split(),
+                "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                "semanticPronunciationNeeded": False,
+                "chars": [{"char": char, "pinyin": syllable, "pinyins": [syllable],
+                           "pronunciationLookupStatus": "found"}
+                          for char, syllable in zip(word, reading.split())],
+            })
+        response = super()._response(method, url, kwargs)
+        if path.endswith(("/pull-requests/batch", "/pull-requests/batch-draft")):
+            body = json.loads(kwargs["content"]) if kwargs.get("content") is not None else kwargs.get("json") or {}
+            payload = response.json()
+            payload["warnings"] = [{
+                "warningType": "duplicate_code", "item": copy.deepcopy(item),
+                "existing": [entry for entry in self.entries if entry["code"] == item["code"]],
+            } for item in body["items"] if any(
+                entry["code"] == item["code"] for entry in self.entries
+            )]
+            return OfflineResponse(payload, response.status_code)
+        return response
+
+
 def B19PartialReplyBindingTests_setUp(self):
     B18RealToolTests_setUp(self)
     self.http = b19_partial_reply_binding_DraftHTTP()

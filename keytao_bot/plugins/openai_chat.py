@@ -5214,7 +5214,7 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
         response = await _chat_commands.try_handle_advertised_shift(
             ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
             ctx.space_key, ctx.owner_label, reply_reference=ctx.reply_reference,
-            require_bound_operand=True,
+            require_bound_operand=True, history=get_history(ctx.conv_key),
         )
     if response is not None:
         ctx.operation_understood_early = True
