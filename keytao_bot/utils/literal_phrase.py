@@ -4,7 +4,7 @@ import re
 from typing import Optional
 
 from ..harness.authorization_grammar import (
-    looks_like_lexical_review_target,
+    looks_like_explicit_lexical_review_target,
     message_mentions_change_request,
 )
 
@@ -39,7 +39,7 @@ def _literal_operand(operand: str) -> Optional[str]:
             return None
         segments = re.split(r"[，,、；;]", phrase)
         if any(
-            not looks_like_lexical_review_target(segment)
+            not looks_like_explicit_lexical_review_target(segment)
             or _DATA_FRAGMENT_RE.search(segment)
             or _COMMAND_FRAGMENT_RE.search(segment)
             or message_mentions_change_request(segment)

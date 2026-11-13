@@ -2763,6 +2763,207 @@ class ReceiptDeltaTests(unittest.IsolatedAsyncioTestCase):
 
     invoke = ReceiptDeltaTests_invoke
 
+    async def test_a5_replacement_warning_survives_confirmation(self):
+        from tests.helpers import (
+            DraftMutationClaimStore, OfflineResponse, b19_partial_reply_binding_DraftHTTP,
+        )
+        pending = {
+            "batchId": "offline-batch", "batchUrl": "https://offline.invalid/batch/offline-batch",
+            "itemStatus": "Pending", "word": "大绿", "code": "dsllv", "type": "Phrase",
+        }
+        class ReplacementHTTP(b19_partial_reply_binding_DraftHTTP):
+            lookup_response = None
+
+            def _response(self, method, url, kwargs):
+                if url.endswith("/by-word/batch") and self.lookup_response is not None:
+                    self.requests.append((method, "/api/bot/phrases/by-word/batch", copy.deepcopy(kwargs["json"])))
+                    return OfflineResponse(self.lookup_response)
+                if method == "GET" and url.endswith("/api/phrases/encode"):
+                    self.requests.append((method, "/api/phrases/encode", copy.deepcopy(kwargs["params"])))
+                    return OfflineResponse({
+                        "input": "大绿", "codes": ["dsll", "dsllv", "dsllva"],
+                        "altCodes": [], "flyKeyVariants": [], "phrasePinyins": ["da", "lv"],
+                        "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                        "semanticPronunciationNeeded": False, "semanticPronunciationAccepted": False,
+                    })
+                response = super()._response(method, url, kwargs)
+                if method == "POST" and url.endswith(("/pull-requests/batch", "/pull-requests/batch-draft")):
+                    body = json.loads(kwargs["content"])
+                    if body["items"][0]["action"] == "Create":
+                        return OfflineResponse({**response.json(), "warnings": [{
+                            "warningType": "multiple_code", "item": body["items"][0],
+                            "existing": copy.deepcopy(self.entries),
+                        }]}, response.status_code)
+                return response
+
+        tools = harness._draft_tools
+        commands = harness.chat_commands_module
+        http = ReplacementHTTP()
+        http.entries = [{"word": "大绿", "code": "dsllv", "type": "Phrase", "weight": 100}]
+        with tempfile.TemporaryDirectory() as directory:
+            claims = DraftMutationClaimStore(directory + "/claims.db")
+            with (
+                patch.object(tools.httpx, "AsyncClient", return_value=http, create=True),
+                patch.object(tools.http_client, "_keytao_client", http),
+                patch.object(tools, "get_default_draft_mutation_claim_store", return_value=claims),
+                patch.object(completed_draft_undo, "get_default_draft_mutation_claim_store", return_value=claims),
+                patch.dict("os.environ", {"BOT_API_TOKEN": "offline-token",
+                    "KEYTAO_PENDING_CONFIRMATIONS_DB": directory + "/pending.db"}),
+            ):
+                deleted = [{"action": "Delete", "word": "大绿", "code": "dsllv", "type": "Phrase"}]
+                deletion_preview = await tools.keytao_batch_add_to_draft(
+                    "qq", "a5-owner", deleted, batch_id=http.batch_id, preview_only=True,
+                )
+                deletion = await tools.keytao_batch_add_to_draft(
+                    "qq", "a5-owner", deleted, batch_id=http.batch_id, confirmed=True,
+                    expected_content_version=deletion_preview["contentVersion"],
+                    expected_warning_digest=deletion_preview["warningDigest"],
+                )
+                self.assertEqual(deletion.get("successCount"), 1, deletion)
+                args = {"word": "大绿", "code": "dsllva", "batch_id": http.batch_id}
+                preview = await tools.keytao_create_phrase("qq", "a5-owner", **args, preview_only=True)
+                state = server_warning_pending_state(harness.PendingToolConfirm("keytao_create_phrase", args), preview)
+                self.assertTrue(server_warning_ticket_is_complete(state), state)
+                self.assertEqual(state.args["expected_warning_digest"], "a" * 64)
+                with self.subTest(part="preview"):
+                    prompt = commands._format_server_warning_confirmation("keytao_create_phrase", preview)
+                    self.assertNotIn("多编码", prompt)
+                    self.assertIn("旧编码已在草稿中标记删除", prompt)
+                with self.subTest(part="sealed_confirmation"):
+                    prompt = render._format_pending_state_details(state)
+                    self.assertNotIn("多编码", prompt)
+                    self.assertIn("旧编码已在草稿中标记删除", prompt)
+                confirmed_args = {key: value for key, value in state.args.items() if key != "_pending_display"}
+                confirmed = await tools.keytao_create_phrase("qq", "a5-owner", **confirmed_args, confirmed=True)
+                self.assertTrue(confirmed.get("success"), confirmed)
+                with self.subTest(part="receipt"):
+                    receipt = "\n".join(render._create_notice_lines(confirmed))
+                    self.assertNotIn("多编码", receipt)
+                    self.assertIn("旧编码已在草稿中标记删除", receipt)
+                self.assertEqual([row["action"] for row in http.rows], ["Delete", "Create"])
+                self.assertEqual(http.writes[-1][1]["expectedWarningDigest"], "a" * 64)
+                batch_preview = await tools.keytao_batch_add_to_draft(
+                    "qq", "a5-owner", [{"action": "Create", "word": "大绿", "code": "dsllva", "type": "Phrase"}],
+                    batch_id=http.batch_id, preview_only=True,
+                )
+                self.assertNotIn("多编码", commands._format_server_warning_confirmation("keytao_batch_add_to_draft", batch_preview))
+                self.assertEqual(batch_preview["warningDigest"], "a" * 64)
+                warning = copy.deepcopy(preview["warnings"][0])
+                for items in ([], [{**pending, "source": "submitted", "batchStatus": "Submitted", "action": "Delete"}],
+                              [{**pending, "source": "draft", "batchStatus": "Draft", "action": "Delete", "code": "dsll"}]):
+                    with self.subTest(part="uncovered_existing", items=items):
+                        raw = copy.deepcopy(warning)
+                        kept = tools._attach_pending_items({"warnings": [raw]}, items)
+                        if asyncio.iscoroutine(kept):
+                            kept = await kept
+                        self.assertIn("多编码", render._plain_warning_message(kept["warnings"][0]))
+                http.entries.append({"word": "大绿", "code": "dsll", "type": "Phrase"})
+                with self.subTest(part="remaining_existing_code"):
+                    kept = tools._attach_pending_items({"warnings": [warning]}, preview["pendingItems"])
+                    if asyncio.iscoroutine(kept):
+                        kept = await kept
+                    self.assertIn("多编码", render._plain_warning_message(kept["warnings"][0]))
+                with self.subTest(part="all_existing_codes_deleted"):
+                    deletes = [*preview["pendingItems"], {**preview["pendingItems"][0], "code": "dsll"}]
+                    kept = tools._attach_pending_items({"warnings": [copy.deepcopy(warning)]}, deletes)
+                    if asyncio.iscoroutine(kept):
+                        kept = await kept
+                    self.assertNotIn("多编码", render._plain_warning_message(kept["warnings"][0]))
+                for response in (
+                    {"success": False},
+                    {"success": True, "results": []},
+                    {"success": True, "results": [{"word": "其他词", "phrases": http.entries[:1]}]},
+                    {"success": True, "results": [{"word": [], "phrases": http.entries[:1]}]},
+                    {"success": True, "results": [{"word": "大绿", "phrases": [http.entries[0], {}]}]},
+                    {"success": True, "results": [{"word": "大绿", "phrases": [{**http.entries[0], "type": {}}]}]},
+                    {"success": True, "results": [{"word": "大绿", "success": False, "phrases": http.entries[:1]}]},
+                ):
+                    with self.subTest(part="incomplete_lookup", response=response):
+                        http.lookup_response = response
+                        kept = tools._attach_pending_items({"warnings": [copy.deepcopy(warning)]}, preview["pendingItems"])
+                        if asyncio.iscoroutine(kept):
+                            kept = await kept
+                        self.assertIn("多编码", render._plain_warning_message(kept["warnings"][0]))
+        self.assertEqual(http.errors, [])
+        self.assertEqual(len(http.writes), 2)
+
+    async def test_c2_delete_only_pending_allows_review_and_action_reminders(self):
+        from pathlib import Path
+        from tests.helpers import DraftMutationClaimStore, OfflineResponse, REAL_REVIEW_READS, b19_partial_reply_binding_DraftHTTP
+        from keytao_bot.utils.pending_confirmation import pending_word_reminder_lines
+
+        class PendingDeleteHTTP(b19_partial_reply_binding_DraftHTTP):
+            def _response(self, method, url, kwargs):
+                if url.endswith("/api/bot/evidence/fetch"):
+                    self.requests.append((method, "/api/bot/evidence/fetch", copy.deepcopy(kwargs.get("json") or {})))
+                    return OfflineResponse({}, 404)
+                if url.endswith("/api/phrases/encode"):
+                    self.requests.append((method, "/api/phrases/encode", copy.deepcopy(kwargs["params"])))
+                    return OfflineResponse({
+                        "input": "较妥", "type": "二字词", "codes": ["jctl", "jctlo", "jctloo"],
+                        "altCodes": [], "flyKeyVariants": [], "phrasePinyins": ["jiao", "tuo"],
+                        "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                        "chars": [{"char": char, "pinyin": pinyin, "pinyins": [pinyin],
+                                   "pronunciationLookupStatus": "found", "phoneticCode": code, "shapeCode": shape}
+                                  for char, pinyin, code, shape in zip("较妥", ("jiao", "tuo"), ("jc", "tl"), ("o", "oo"))],
+                    })
+                return super()._response(method, url, kwargs)
+
+        tools = harness._draft_tools
+        commands = harness.chat_commands_module
+        http = PendingDeleteHTTP()
+        http.entries = [{"word": "较妥", "code": "jctl", "type": "Phrase", "weight": 100}]
+        store = harness.MemoryConversationStateStore()
+        owner = harness.ConversationAddress.private("qq", "c2-owner")
+        with tempfile.TemporaryDirectory() as directory:
+            claims = DraftMutationClaimStore(directory + "/claims.db")
+            functions = {**harness._lookup_tools.TOOL_FUNCTIONS,
+                         **harness._review_tools.TOOL_FUNCTIONS, **tools.TOOL_FUNCTIONS}
+            with (
+                patch.object(tools.httpx, "AsyncClient", return_value=http, create=True),
+                patch.object(tools.http_client, "_keytao_client", http),
+                patch.object(tools, "get_default_draft_mutation_claim_store", return_value=claims),
+                patch.object(completed_draft_undo, "get_default_draft_mutation_claim_store", return_value=claims),
+                patch.object(commands.tool_executor, "_get_tool_function", functions.get),
+                patch.object(s58_advertisement_chat, "conversation_state_store", store),
+                patch.multiple(review, **REAL_REVIEW_READS),
+                patch.object(review.http_client, "guarded_fetch", AsyncMock(return_value=OfflineResponse({}, 404))),
+                patch.object(review, "_review_cache", OrderedDict()),
+                patch.object(review, "_evidence_host_failures", {}),
+                patch.object(review, "reference_db_path", return_value=Path(directory) / "reference.db"),
+                patch.dict("os.environ", {"BOT_API_TOKEN": "offline-token",
+                    "KEYTAO_PENDING_CONFIRMATIONS_DB": directory + "/pending.db"}),
+            ):
+                items = [{"action": "Delete", "word": "较妥", "code": "jctl", "type": "Phrase"}]
+                preview = await tools.keytao_batch_add_to_draft("qq", owner.actor_id, items, batch_id=http.batch_id, preview_only=True)
+                result = await tools.keytao_batch_add_to_draft(
+                    "qq", owner.actor_id, items, batch_id=http.batch_id, confirmed=True,
+                    expected_content_version=preview["contentVersion"], expected_warning_digest=preview["warningDigest"],
+                )
+                self.assertEqual(result.get("successCount"), 1, result)
+                for message in ("较妥", "加词：较妥"):
+                    with self.subTest(message=message):
+                        store.delete(owner)
+                        reply = await commands._try_handle_simple_single_word_query(message, "qq", owner.actor_id, owner)
+                        self.assertIn("在当前草稿中待删除（jctl）", reply)
+                        self.assertNotIn("需要提供实际编码", reply)
+                        self.assertIsInstance(store.get(owner), harness.PendingAddWord)
+                        self.assertIn("jctlo", reply)
+                pending = {"batchId": http.batch_id, "batchUrl": "https://offline.invalid/batch/" + http.batch_id,
+                           "itemStatus": "Pending", "word": "较妥", "code": "jctl", "type": "Phrase"}
+                for source, status in (("draft", "Draft"), ("submitted", "Submitted"), ("others_submitted", "Submitted")):
+                    for action, text in (("Delete", "待删除" if source != "others_submitted" else "提交删除"),
+                                         ("Change", "待修改" if source != "others_submitted" else "提交修改")):
+                        item = {**pending, "source": source, "batchStatus": status, "action": action, "oldWord": "交妥"}
+                        reminder = pending_word_reminder_lines([item])[0]
+                        self.assertIn(text, reminder)
+                        self.assertIn("jctl", reminder)
+                        if action == "Change":
+                            self.assertIn("交妥→较妥", reminder)
+                            self.assertTrue(pending_word_reminder_lines([item], words=("交妥",)))
+        self.assertEqual(http.errors, [])
+        self.assertEqual(len(http.writes), 1)
+
     async def test_f3_m3_11_already_moved_occupant_receipt_uses_current_draft_code(self):
         from tests.helpers import b19_partial_reply_binding_DraftHTTP
 

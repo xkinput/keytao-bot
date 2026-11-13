@@ -5146,11 +5146,40 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
         )
         ctx.operation_understood_early = True
         return False
-    from ..harness.authorization_grammar import parse_compound_entry_command
+    from ..harness.authorization_grammar import parse_compound_entry_command, parse_existing_entry_move
 
-    if parse_compound_entry_command(_strip_command_message_prefixes(ctx.normalized_message_text)) is not None:
+    if (parse_compound_entry_command(_strip_command_message_prefixes(ctx.normalized_message_text)) is not None
+            or parse_existing_entry_move(_strip_command_message_prefixes(ctx.normalized_message_text)) is not None):
         if await _stage_handle_explicit_entry_operation(ctx):
             return True
+    pending_state = record.state if record is not None else None
+    candidate_ticket = isinstance(pending_state, PendingAddWord) or (
+        isinstance(pending_state, PendingToolConfirm) and bool(pending_state.args.get("_candidate_scopes"))
+    )
+    alternative_words = _alternative_query_words(ctx.normalized_message_text, pending_state)
+    bare_words = (
+        _chat_commands._bare_multi_word_query_words(ctx.normalized_message_text)
+        if not candidate_ticket else ()
+    )
+    if alternative_words or bare_words:
+        from ..harness.operation_request import OperationRequest
+
+        words = alternative_words or bare_words
+        ctx.operation_request = OperationRequest(
+            op="query", operands=words, frame="none", source="fast_path:lexical_query",
+        )
+        ctx.simple_word_query_words = words
+        ctx.semantic_nonwrite_route = "query"
+        ctx.operation_understood_early = True
+        ctx.response = await _chat_commands._prepare_multi_word_query(
+            words, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+            preserve_pending=bool(alternative_words), exclude_existing_words=True,
+        )
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+        await _finish_ai_chat_response(
+            ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+        )
+        return True
     if await _try_reviewed_operand_reply(ctx):
         return True
     if await _try_stale_displacement_reply(ctx):
@@ -5203,6 +5232,27 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     handled = await _stage_understand_operation(ctx)
     ctx.operation_understood_early = True
     return handled
+
+
+def _bare_lexical_query_words(message: str) -> Tuple[str, ...]:
+    source = _strip_command_message_prefixes(message).strip()
+    if message_authorizes_mutation(source) or _authorization_grammar.looks_like_mutation_grammar_gap(source):
+        return ()
+    words = _chat_commands._bare_multi_word_query_words(source)
+    if words:
+        return words
+    return (source,) if (
+        _chat_routing._is_chat_word_query_target(source)
+        and not message_authorizes_mutation(source)
+        and not _authorization_grammar.looks_like_mutation_grammar_gap(source)
+    ) else ()
+
+
+def _alternative_query_words(message: str, pending_state=None) -> Tuple[str, ...]:
+    known_words = (pending_state.word,) if isinstance(pending_state, PendingAddWord) else tuple(
+        pending_state.args.get("_query_words", ())
+    ) if isinstance(pending_state, PendingToolConfirm) else ()
+    return _chat_routing._coordinated_word_query_words(message, known_words=known_words)
 
 
 async def _stage_understand_operation(ctx: TurnContext) -> bool:
@@ -5285,6 +5335,50 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 except ValueError:
                     pending_decision = None
         high_confidence = isinstance(pending_decision, dict) and pending_decision.get("confidence") == "high"
+        candidate_ticket = isinstance(pending_snapshot, PendingAddWord) or (
+            isinstance(pending_snapshot, PendingToolConfirm) and bool(pending_snapshot.args.get("_candidate_scopes"))
+        )
+        if (validated.op in {"chat", "other", "help"}
+                and not parse_pending_assent_phrase(message).matched
+                and _extract_explicit_reviewed_add_word(message)):
+            response = await _try_handle_simple_single_word_query(
+                message, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+            )
+            if response is not None:
+                ctx.response = response
+                remember_conversation(ctx.conv_key, ctx.memory_context, message, response)
+                await _finish_ai_chat_response(
+                    ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
+                )
+                return True
+        # Preserve complete commands before recovering a model-misclassified lexical query.
+        bare_words = _bare_lexical_query_words(message) if (
+            fast_op == "none" and not validated.codes
+            and validated.op in {"chat", "none", "other", "recode", "move", "delete", "swap", "reorder", "batch_replace"}
+        ) else ()
+        # A live card owns bare replies (都要/好嘞/明白), so only look up words without one.
+        if candidate_ticket:
+            bare_words = ()
+        if bare_words:
+            words = bare_words
+            ctx.operation_request = replace(validated, op="query", operands=words, codes=())
+            ctx.semantic_nonwrite_route = "query"
+            ctx.simple_word_query_words = words
+            ctx.response = await _chat_commands._prepare_multi_word_query(
+                words, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+                preserve_pending=candidate_ticket,
+            )
+            record = conversation_state_store.get_record(ctx.conv_key)
+            if len(words) == 1 and isinstance(getattr(record, "state", None), PendingTrustedWordRecord):
+                ctx.response = await _augment_simple_word_query_response(
+                    message, ctx.response, ctx.platform, ctx.user_id, query_words=words,
+                )
+            ctx.response = _prepare_user_facing_reply(ctx.response, ctx.memory_context)
+            remember_conversation(ctx.conv_key, ctx.memory_context, message, ctx.response)
+            await _finish_ai_chat_response(
+                ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+            )
+            return True
         bare_add = bool(
             validated.op == "add" and len(validated.operands) == len(validated.codes) == 1
             and message.strip() == f"{validated.operands[0]} {validated.codes[0]}"
@@ -5396,11 +5490,14 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     else:
                         ctx.response = UnansweredChatReply("暂时没有更多信息。")
             if validated.op == "query":
-                ctx.simple_word_query_words = validated.operands
+                operands = tuple(
+                    word for word in validated.operands if _chat_routing._is_bare_word_query_target(word)
+                )
+                ctx.simple_word_query_words = operands
                 replies = []
                 missing_words = []
-                present_word_codes = {} if len(validated.operands) > 1 else None
-                for word in validated.operands:
+                present_word_codes = {} if len(operands) > 1 else None
+                for word in operands:
                     replies.append(await _try_handle_simple_single_word_query(
                         word, ctx.platform, ctx.user_id, ctx.conv_key,
                         ctx.space_key, ctx.owner_label,
@@ -5410,17 +5507,33 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     ))
                 if present_word_codes:
                     replies.append(already_existing_words_copy(present_word_codes))
-                missing_words = list(dict.fromkeys(missing_words))
+                missing_words = list(dict.fromkeys(
+                    word for word in missing_words if _chat_routing._is_bare_word_query_target(word)
+                ))
                 ctx.semantic_query_reply = "\n\n".join(reply for reply in replies if reply)
                 if missing_words:
+                    if candidate_ticket and len(validated.operands) > 1:
+                        ctx.response = await _chat_commands._prepare_multi_word_query(
+                            tuple(word for word in validated.operands if _chat_routing._is_bare_word_query_target(word)),
+                            ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+                            preserve_pending=True,
+                        )
+                        ctx.semantic_query_candidates_prepared = True
+                        for stage in RESPONSE_STAGES:
+                            if await stage(ctx):
+                                return True
+                        return True
                     if message.strip() != " ".join(validated.operands):
                         ctx.semantic_query_reply += "\n\n" + "\n".join(
                             f"「{word}」未在词库中找到。" for word in missing_words
                         )
                         await _stage_generate_ai_response(ctx)
                         # Keep model prose separate from the record-backed candidate renderer.
-                        explanation = _scope_language_only_reply("词义", str(ctx.response))
-                        replies.append(_NUMBERED_CANDIDATE_ROW_RE.sub("", explanation).strip())
+                        explanation = _scope_language_only_reply("词义", str(ctx.response), empty_fallback=False)
+                        explanation = _NUMBERED_CANDIDATE_ROW_RE.sub("", explanation).strip()
+                        explanation = re.sub(r"^[-*•]\s*", "", explanation).strip()
+                        if explanation:
+                            replies.append(explanation)
                     if len(missing_words) == 1:
                         candidates = await _try_handle_simple_single_word_query(
                             missing_words[0], ctx.platform, ctx.user_id, ctx.conv_key,
@@ -5445,7 +5558,8 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     + r'(?:[\s，,、；;「」“”\"\']+' + word_pattern + r')*[\s。.!！「」“”\"\']*',
                     query_source,
                 )
-                if missing_words or plain_lookup or message.strip() == " ".join(validated.operands):
+                if (missing_words or plain_lookup or message.strip() == " ".join(validated.operands)
+                        or ctx.simple_word_query_words and len(ctx.simple_word_query_words) < len(validated.operands)):
                     ctx.response = ServerBackedQueryReply(ctx.semantic_query_reply)
             for stage in RESPONSE_STAGES:
                 if await stage(ctx):
@@ -7384,10 +7498,17 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
             return True
     if getattr(ctx, "semantic_pending_released", False):
         if ctx.response is None:
-            ctx.response = await _try_handle_simple_single_word_query(
-                ctx.normalized_message_text, ctx.platform, ctx.user_id,
-                ctx.conv_key, ctx.space_key, ctx.owner_label, preserve_pending=True,
-            )
+            words = _bare_lexical_query_words(ctx.normalized_message_text)
+            if words:
+                ctx.response = await _chat_commands._prepare_multi_word_query(
+                    words, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+                    preserve_pending=True,
+                )
+            else:
+                ctx.response = await _try_handle_simple_single_word_query(
+                    ctx.normalized_message_text, ctx.platform, ctx.user_id,
+                    ctx.conv_key, ctx.space_key, ctx.owner_label, preserve_pending=True,
+                )
         return False
     if ctx.response is None:
         _set_conversational_turn(

@@ -434,13 +434,21 @@ def is_character_composition_question(message: str) -> bool:
     )
 
 
-def looks_like_lexical_review_target(value: str) -> bool:
-    """Accept Han lexical shapes while rejecting questions and sentence fragments."""
+def looks_like_explicit_lexical_review_target(value: str) -> bool:
+    """Keep explicitly named Han operands without guessing their prose intent."""
     target = str(value or "").strip()
     return bool(
         re.fullmatch(r"[\u3400-\u9fff]{1,20}", target)
         and not is_interrogative_message(target)
         and not _NON_LEXICAL_COMPONENT_FRAGMENT_RE.search(target)
+    )
+
+
+def looks_like_lexical_review_target(value: str) -> bool:
+    """Accept Han lexical shapes while rejecting questions and sentence fragments."""
+    target = str(value or "").strip()
+    return bool(
+        looks_like_explicit_lexical_review_target(target)
         and not _NON_LEXICAL_PROSE_FRAGMENT_RE.search(target)
     )
 
@@ -1797,6 +1805,18 @@ def parse_existing_entry_move(message: str) -> Optional[ExistingEntryMove]:
     source = source.rstrip("。.!！").strip()
     return _parse_existing_entry_move_clause(source)
 
+
+def parse_code_only_recode(message: str) -> Optional[Tuple[str, str]]:
+    """Bind an old-code lookup only to a complete literal recode clause."""
+    source = trusted_mutation_source(message).strip().rstrip("。.!！").strip()
+    match = re.fullmatch(
+        r"(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+        r"(?:把\s*|将\s*)?编码\s*(?:由|从)\s*(?P<old>[a-z]{1,6})\s*"
+        r"(?:改为|改成)\s*(?P<new>[a-z]{1,6})", source,
+    )
+    return (match["old"], match["new"]) if match is not None else None
+
+
 def _unquote_positional_entry(value: str) -> Optional[str]:
     pairs = {"「": "」", "“": "”", "‘": "’"}
     if len(value) >= 3 and pairs.get(value[0]) == value[-1]:
@@ -3083,7 +3103,13 @@ def message_authorizes_mutation(message: str) -> bool:
         return True
     if parse_compound_eviction_add_plan(message) is not None:
         return True
+    from ..utils.explicit_code import parse_explicit_entry_code_request
+
+    if parse_explicit_entry_code_request(message) is not None:
+        return True
     if parse_existing_entry_move(message) is not None:
+        return True
+    if parse_code_only_recode(message) is not None:
         return True
     if parse_entry_swap(message) is not None:
         return True

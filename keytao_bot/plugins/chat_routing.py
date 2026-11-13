@@ -25,10 +25,12 @@ from ..harness.state import (
     trusted_word_record_is_complete,
 )
 from ..harness.authorization_grammar import (
+    DISPLACEMENT_VERBS,
     _NEGATIVE_MODAL_RE,
     _POSITIONAL_REPORTED_CONTEXT_RE,
     explicit_complete_add_item,
     is_interrogative_message,
+    looks_like_explicit_lexical_review_target,
     looks_like_lexical_review_target,
     looks_like_mutation_grammar_gap,
     strip_self_mention_tokens,
@@ -3220,7 +3222,8 @@ def _is_bare_word_query_target(word: str) -> bool:
     return bool(
         looks_like_lexical_review_target(word)
         and not _is_deictic_add_command(word)
-        and word not in _PENDING_CONTROL_TEXTS | {"加", "删", "查", "审词"}
+        and word not in _PENDING_CONTROL_TEXTS | DISPLACEMENT_VERBS | {"加", "删", "查", "审词"}
+        and not re.match(rf"^(?:{_NEGATIVE_MODAL_RE.pattern})(?:把|将)", word)
         and not parse_pending_assent_phrase(word).cancel_requested
         and not re.match(
             r"^(?:请|麻烦|帮我|帮忙|给我|加词|添加|加入|删除|删掉|顺延|提交|查询|查词|查看|解释|比较|批量|不要|取消|确认)",
@@ -3228,8 +3231,36 @@ def _is_bare_word_query_target(word: str) -> bool:
         )
         and not re.match(r"^(?:我|你|他|她|它|我们|你们|他们)(?:说|觉得|认为|感觉|想|要)", word)
         and not re.match(r"^(?:把|将).+(?:换成|改成|替换为)", word)
+        and not re.fullmatch(
+            r"(?:调|挪|移|放)(?:在|到|至|往)(?:[a-z]{1,6}|"
+            r"第[一二三四五六七八九十百两\d]+(?:个|位)|"
+            r"[\u3400-\u9fff]*(?:前面|后面|之前|之后|前|后))", word,
+        )
         and not re.search(r"(?:哪个|哪种|哪一个|用得多|(?:先|暂时|也)?(?:不要|不加|别加|保留|取消)$)", word)
     )
+
+
+def _coordinated_word_query_words(message_text: str, *, known_words: Tuple[str, ...] = ()) -> Tuple[str, ...]:
+    """Extract closed alternatives without treating the connecting prose as a word."""
+    source = _strip_command_message_prefixes(message_text).strip().rstrip("。？?！!")
+    if message_authorizes_mutation(source) or looks_like_mutation_grammar_gap(source):
+        return ()
+    source = re.sub(r"(?:呢|吗)$", "", source).strip()
+    command_source = re.sub(r"^(?:加词|添加|新增|查词|查询|(?:查|加)\s+)\s*[:：]?\s*", "", source)
+    if command_source == source and source[:1] in {"加", "查"}:
+        first, separator, last = source.partition("还是")
+        if any(source[1:].startswith(word) for word in known_words) or (
+            source.startswith("加") and separator and len(first) >= 3 and not last.startswith("加")
+        ):
+            command_source = source[1:]
+    for candidate in (command_source, source):
+        tokens = re.split(r"\s*(?:还是|和|或)\s*", candidate)
+        words = tuple(dict.fromkeys(token.strip(" 「」“”\"'") for token in tokens))
+        if len(words) > 1 and all(
+            len(word) >= 2 and _is_chat_word_query_target(word) for word in words
+        ):
+            return words
+    return ()
 
 
 def _is_chat_word_query_target(word: str) -> bool:
@@ -3237,6 +3268,10 @@ def _is_chat_word_query_target(word: str) -> bool:
     return bool(
         _is_bare_word_query_target(word)
         and not is_conversational_text(word)
+        and not re.fullmatch(
+            rf"(?:{_NEGATIVE_MODAL_RE.pattern})(?:行|好|可以|同意|接受|愿意)[啊呀吧]?", word,
+        )
+        and not re.search(r"(?:就|都)按(?:这|那|此)", word)
         and not re.match(
             r"^(?:(?:我|你|他|她|它|我们|你们|他们)(?:也|都)?"
             r"(?:真|好|很|太|挺|蛮|可真|有点|有些|这么|那么)|"
@@ -3246,6 +3281,7 @@ def _is_chat_word_query_target(word: str) -> bool:
             r"(?:刚才|刚刚|方才|之前|前面|上面|后面|下面)(?:的|这|那)|"
             r"(?:好|行|对|是)(?:的|了|哒|呀|啊|吧|呢)|"
             r"(?:谢谢|多谢|辛苦)|"
+            r"(?:哈哈|嘿嘿|呵呵)|"
             r"(?:原来|果然|确实)(?:如此|这样|是这样|是的))",
             word,
         )
@@ -3270,12 +3306,14 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     if is_interrogative_message(message_text) or _is_deictic_add_command(message_text):
         return ()
     explicit = re.fullmatch(
-        r"(?:查词|查询词条)\s*[:：]?\s*(?P<word>[\u3400-\u9fff]{1,20})",
+        r"(?:查词|查询词条|查询|查(?=\s|[:：]))\s*[:：]?\s*"
+        r"(?P<words>[\u3400-\u9fff]{1,20}(?:[\s、，,]+[\u3400-\u9fff]{1,20})*)",
         _strip_command_message_prefixes(message_text),
     )
     if explicit is not None:
         note_rule_use("R:_get_simple_word_query_words:re.fullmatch")
-        return (explicit.group("word"),)
+        words = tuple(dict.fromkeys(re.split(r"[\s、，,]+", explicit.group("words"))))
+        return words if all(_is_bare_word_query_target(word) for word in words) else ()
     if is_conversational_text(_strip_command_message_prefixes(message_text)):
         return ()
     if (
@@ -3366,7 +3404,7 @@ def command_intent_memoizer(
 _EXPLICIT_REVIEWED_ADD_WORD_RE = re.compile(
     r"^(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
     r"(?:加词|添加词|新增词|加一个词|添加一个词)"
-    r"\s*[:：,，]?\s*(?P<word>[\u3400-\u9fff]{1,20})$"
+    r"\s*[:：,，]?\s*(?P<word>.+)$"
 )
 
 
@@ -3408,7 +3446,8 @@ def _extract_explicit_reviewed_add_word(message_text: str) -> Optional[str]:
     if not match or is_interrogative_message(text):
         return None
     word = match.group("word").strip()
-    return word if looks_like_lexical_review_target(word) else None
+    literal = parse_literal_phrase_query(word)
+    return literal or (word if looks_like_explicit_lexical_review_target(word) else None)
 
 
 _CODE_APPENDIX_CONTEXT_RE = re.compile(
@@ -3457,7 +3496,9 @@ def _is_explicit_code_question(message_text: str) -> bool:
     return bool(_EXPLICIT_CODE_QUESTION_RE.search(message_text.strip()))
 
 
-def _scope_language_only_reply(message_text: str, response: str) -> str:
+def _scope_language_only_reply(
+    message_text: str, response: str, *, empty_fallback: bool = True,
+) -> str:
     """Remove model-generated code diagnostics from a reading/meaning reply."""
     if not _is_language_only_question(message_text):
         return response
@@ -3485,7 +3526,7 @@ def _scope_language_only_reply(message_text: str, response: str) -> str:
     while kept_lines and not kept_lines[-1]:
         kept_lines.pop()
     scoped = "\n".join(kept_lines).strip()
-    return scoped or "这条回复没有留下可核实的读音或语义说明，请再问一次。"
+    return scoped or ("这条回复没有留下可核实的读音或语义说明，请再问一次。" if empty_fallback else "")
 
 
 def _should_augment_simple_word_query(message_text: str, response: str) -> bool:

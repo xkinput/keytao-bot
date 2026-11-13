@@ -4333,7 +4333,7 @@ class AgentOrchestrator:
 
         raw_reason = cls._public_failure_reason(
             failure_state.get("message") or failure_state.get("error"),
-            "本轮没有可执行的已绑定写操作",
+            "还没有确定词条和编码",
         )
         reason = re.split(
             r"请把下面这条指令|请在下一条消息中|"

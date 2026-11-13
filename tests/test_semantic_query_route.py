@@ -76,6 +76,8 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def lookup(self, name, args, platform, user_id, **kwargs):
         self.assertEqual((platform, user_id), ("qq", self.author.actor_id))
+        if name == "keytao_encode":
+            return json.dumps({"success": False, "word": args["word"]})
         if name == "keytao_lookup_by_words_batch":
             return json.dumps({"success": True, "results": [
                 {"success": True, "word": word, "phrases": [
@@ -133,10 +135,10 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.client.create.return_value.choices[0].message.content = json.dumps(raw, ensure_ascii=False)
         return raw
 
-    def ticket(self, owner):
+    def ticket(self, owner, word="午时", code="wj"):
         pending = PendingAddWord(
-            "午时", "wj", [("wj", False), ("wja", False)],
-            server_candidates=[("wj", False), ("wja", False)],
+            word, code, [(code, False), (code + "a", False)],
+            server_candidates=[(code, False), (code + "a", False)],
         )
         self.assertTrue(self.store.set(owner, pending, space_key=owner.space_key, owner_label="Offline owner"))
         record = self.store.get_record(owner)
@@ -251,6 +253,155 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         return [call.args[1]["word"] for call in self.tool.await_args_list
                 if call.args[0] == "keytao_prepare_reviewed_add"]
 
+    async def test_a4_mixed_code_query_reviews_only_han_without_empty_explanation(self):
+        self.candidate_codes["大绿"] = "dsllv"
+        for existing in (True, False):
+            with self.subTest(existing=existing):
+                self.store.delete(self.author)
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.main.reset_mock()
+                self.main.return_value = "候选编码：dsllva，词库查询完成。"
+                if existing:
+                    self.entries["大绿"] = "dsllv"
+                else:
+                    self.entries.pop("大绿", None)
+                self.set_model(operands=("ds", "大绿"))
+                ctx = self.context("ds大绿")
+                await self.assert_finished(ctx)
+                self.assertEqual(self.prepared_words(), [] if existing else ["大绿"])
+                self.assertIn("大绿", ctx.response)
+                self.assertIn("dsllv", ctx.response)
+                self.assertNotIn("这条回复没有留下", ctx.response)
+                self.assertNotIn("读音服务", ctx.response)
+                self.assertNotIn("「ds」", ctx.response)
+                self.assertTrue(all(
+                    "ds" not in (call.args[1].get("words") or [call.args[1].get("word")])
+                    for call in self.tool.await_args_list
+                ))
+
+    async def test_b2_bare_lexical_list_precedes_semantic_after_write(self):
+        self.candidate_codes.update({"气笑了": "qxle", "看笑了": "kxle"})
+        for recent_write in (False, True):
+            with self.subTest(recent_write=recent_write):
+                self.store.delete(self.author)
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.client.create.reset_mock()
+                self.main.reset_mock()
+                if recent_write:
+                    self.store.set(self.author, PendingToolConfirm(
+                        "keytao_submit_batch", {"_recent_own_write": True},
+                    ), space_key=self.author.space_key)
+                self.set_model("chat", ())
+                ctx = self.context("气笑了 看笑了")
+                await self.assert_finished(ctx)
+                self.assertEqual(ctx.operation_request.op, "query")
+                self.assertEqual(ctx.operation_request.operands, ("气笑了", "看笑了"))
+                self.assertEqual(self.prepared_words(), ["气笑了", "看笑了"])
+                self.assertIn("气笑了", ctx.response)
+                self.assertIn("看笑了", ctx.response)
+                self.assertIsInstance(self.store.get(self.author), PendingToolConfirm)
+                self.client.create.assert_not_awaited()
+                self.main.assert_not_awaited()
+        fallback = self.chat.AgentOrchestrator._finalize_reply(
+            "气笑了 看笑了", "请原样重新发送这条指令。", {},
+        )
+        self.assertIn("还没有确定词条和编码", fallback)
+        self.assertNotIn("已绑定写操作", fallback)
+
+    async def test_b3_coordinated_query_preserves_live_ticket_and_looks_up_all_words(self):
+        self.candidate_codes.update({"禁塑": "jbsi", "禁塑令": "jsl", "加班": "jsbj", "休息": "xqxy",
+                                     "加速度": "jsd", "加速器": "jsq"})
+        for message, op, operands, expected_words, live_ticket in (
+            ("加禁塑还是禁塑令呢", "chat", (), ("禁塑", "禁塑令"), True),
+            ("加禁塑还是禁塑令呢", "add", ("禁塑",), ("禁塑", "禁塑令"), False),
+            ("禁塑和禁塑令", "chat", (), ("禁塑", "禁塑令"), True),
+            ("禁塑或禁塑令", "query", ("禁塑", "禁塑令"), ("禁塑", "禁塑令"), True),
+            ("比较一下禁塑、禁塑令", "query", ("禁塑", "禁塑令"), ("禁塑", "禁塑令"), True),
+            ("加班还是休息", "chat", (), ("加班", "休息"), False),
+            ("加速度和加速器", "chat", (), ("加速度", "加速器"), False),
+            ("加速度或加速器", "query", ("加速度", "加速器"), ("加速度", "加速器"), False),
+        ):
+            with self.subTest(message=message):
+                self.store.delete(self.author)
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.main.reset_mock()
+                if live_ticket:
+                    record, original, _prompt = self.ticket(self.author, "禁塑", "jbsi")
+                else:
+                    self.history.clear()
+                self.set_model(op, operands)
+                ctx = self.context(message)
+                await self.assert_finished(ctx)
+                self.assertEqual(self.prepared_words(), list(expected_words))
+                for word in expected_words:
+                    self.assertIn(word, ctx.response)
+                self.assertFalse(str(ctx.response).startswith("- "))
+                if live_ticket:
+                    self.assert_preserved(self.author, record, original)
+                else:
+                    self.assertIsNone(self.store.get_record(self.author))
+                self.main.assert_not_awaited()
+        self.assertEqual(
+            self.chat._chat_routing._coordinated_word_query_words("把禁塑和禁塑令删除"), (),
+        )
+        self.assertEqual(
+            self.chat._chat_routing._coordinated_word_query_words("午时和务实就按这个组合吧"), (),
+        )
+
+    async def test_c5_bare_single_word_overrides_chat_text(self):
+        self.assertFalse(self.chat._chat_routing._is_chat_word_query_target("不行"))
+        self.entries["看不懂"] = "kbdi"
+        for op, reply in (
+            ("chat", "之后想再加词，直接发「加词 + 词语」就行。"),
+            ("chat", "暂时没有更多信息。"),
+            ("other", "暂时没有更多信息。"),
+            ("swap", "暂时没有更多信息。"),
+        ):
+            for live_ticket in (False,):
+                with self.subTest(op=op, reply=reply, live_ticket=live_ticket):
+                    self.store.delete(self.author)
+                    self.tool.reset_mock()
+                    self.finish.reset_mock()
+                    self.remember.reset_mock()
+                    self.main.reset_mock()
+                    self.main.return_value = reply
+                    if live_ticket:
+                        record, original, _prompt = self.ticket(self.author)
+                    self.set_model(op, ())
+                    ctx = self.context("看不懂")
+                    await self.assert_finished(ctx)
+                    self.assertIn("看不懂", ctx.response)
+                    self.assertIn("kbdi", ctx.response)
+                    self.main.assert_not_awaited()
+                    if live_ticket:
+                        self.assert_preserved(self.author, record, original)
+
+    async def test_c6_explicit_query_list_drops_leading_verb(self):
+        self.entries.update({"查报": "wsbz", "茶包": "wsbz"})
+        for message in ("查词 查报 茶包", "查询：查报、茶包", "查:查报，茶包"):
+            with self.subTest(message=message):
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.set_model(operands=("查词", "查报", "茶包"))
+                ctx = self.context(message)
+                await self.assert_finished(ctx)
+                self.assertIn("查报 wsbz", ctx.response)
+                self.assertIn("茶包 wsbz", ctx.response)
+                self.assertEqual(
+                    await self.chat._get_simple_word_query_words(message), ("查报", "茶包"),
+                )
+                self.assertEqual(
+                    self.tool.await_args_list[0].args[1], {"words": ["查报", "茶包"]},
+                )
+                self.assertNotIn("「查词」", ctx.response)
+
     async def test_repeated_missing_operand_creates_one_single_word_ticket(self):
         ctx = self.context("发薪 发薪")
         self.set_model(operands=("发薪", "发薪"))
@@ -282,7 +433,7 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, record))
         self.assert_preserved(self.other, other_record, original)
         self.main.assert_not_awaited()
-        self.client.create.assert_awaited_once()
+        self.client.create.assert_not_awaited()
         execute = AsyncMock(return_value="Offline batch saved")
         stranger = ConversationAddress.group("qq", self.author.space_id, "stranger")
         with patch.object(self.commands, "_execute_confirmed_tool", execute):
@@ -308,17 +459,17 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1. fsxb", ctx.response)
         self.assertEqual(self.prepared_words(), ["发薪"])
         record = self.store.get_record(self.author)
-        self.assertIsInstance(record.state, PendingAddWord)
-        self.assertEqual(record.state.word, "发薪")
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(record.state.args["_query_words"], ["发薪"])
         execute = AsyncMock(return_value="Offline addition")
-        with patch.object(self.chat, "_execute_add_to_draft", execute):
+        with patch.object(self.commands, "_execute_confirmed_tool", execute):
             result = await self.chat.handle_pending_message_core(
-                "2", "qq", self.author.actor_id, self.author,
+                "发薪 添加2", "qq", self.author.actor_id, self.author,
                 history=[], space_key=self.author.space_key, allow_intent_model=False,
             )
         self.assertIn("Offline addition", result)
         execute.assert_awaited_once()
-        self.assertEqual(execute.await_args.args[:2], ("发薪", "fsxba"))
+        self.assertEqual(execute.await_args.args[0].args["items"][0]["code"], "fsxba")
         self.assertIsNone(self.store.get_record(self.author))
         self.main.assert_not_awaited()
 
@@ -541,7 +692,6 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_finished(ctx)
         self.assertIn("frame_backstop:question", ctx.operation_violations)
         self.assert_main("济济怎么打？", "济济", "jjes")
-
 
 if __name__ == "__main__":
     unittest.main()

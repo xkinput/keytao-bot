@@ -925,6 +925,90 @@ class B7PhrasingRouteTests(unittest.IsolatedAsyncioTestCase):
 
     assert_recodes = B7PhrasingRouteTests_assert_recodes
 
+    async def test_code_only_recode_binds_unique_old_code_with_real_tools(self):
+        from collections import OrderedDict
+        from keytao_bot.harness.operation_request import OperationRequest
+        from tests.helpers import OfflineResponse, TOOLS, create_schema
+        from tests.test_displace_shift_and_undo import set_up_change_header_swap_http
+
+        for occupants, extra_code in ((1, False), (1, True), (0, False), (2, False)):
+            with self.subTest(occupants=occupants, extra_code=extra_code):
+                fixture = unittest.TestCase()
+                try:
+                    set_up_change_header_swap_http(fixture)
+                    fixture.http.entries = [
+                        {"word": word, "code": "dsllv", "type": "Phrase", "weight": 100}
+                        for word in ("大绿", "大律")[:occupants]
+                    ]
+                    if extra_code:
+                        fixture.http.entries.append({"word": "大绿", "code": "dsll", "type": "Phrase", "weight": 100})
+                    directory = fixture.enterContext(tempfile.TemporaryDirectory())
+                    reference = Path(directory) / "reference.db"
+                    with closing(sqlite3.connect(reference)) as connection, connection:
+                        create_schema(connection)
+                        connection.execute("CREATE TABLE word_commonness (word TEXT PRIMARY KEY, "
+                                           "corpus_frequency INTEGER, part_of_speech TEXT, "
+                                           "dictionary_presence_count INTEGER)")
+                        connection.execute("INSERT INTO word_commonness VALUES ('大绿', 1000, NULL, 2)")
+                    fixture.enterContext(patch.object(review, "reference_db_path", return_value=reference))
+                    fixture.enterContext(patch.object(review, "_review_cache", OrderedDict()))
+                    original = fixture.http._response
+
+                    def response(method, url, kwargs):
+                        if urlsplit(url).path == "/api/phrases/encode":
+                            fixture.http.requests.append((method, "/api/phrases/encode", kwargs["params"]))
+                            return OfflineResponse({
+                                "input": "大绿", "type": "二字词", "codes": ["dsll", "dsllv", "dsllva"],
+                                "altCodes": [], "flyKeyVariants": [], "phrasePinyins": ["da", "lv"],
+                                "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                                "chars": [{"char": char, "pinyin": pinyin, "pinyins": [pinyin],
+                                           "phoneticCode": code, "shapeCode": shape}
+                                          for char, pinyin, code, shape in (
+                                              ("大", "da", "ds", "v"), ("绿", "lv", "ll", "a"),
+                                          )],
+                            })
+                        return original(method, url, kwargs)
+
+                    functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS,
+                                 **TOOLS.TOOL_FUNCTIONS}
+                    with patch.object(fixture.http, "_response", side_effect=response), patch.object(
+                        fixture.replay.chat.tool_executor, "_get_tool_function", functions.get,
+                    ):
+                        await fixture.replay.turn({"message": "把编码由dsllv改为dsllva", "to_me": True},
+                                                  raw_operation(op="recode", operands=[], codes=["dsllv", "dsllva"]))
+                    reply = fixture.replay.last_response
+                    if occupants == 1:
+                        self.assertEqual([(row["action"], row["word"], row["code"]) for row in fixture.http.rows],
+                                         [("Delete", "大绿", "dsllv"), ("Create", "大绿", "dsllva")],
+                                         (reply, fixture.http.requests))
+                        self.assertEqual(len(fixture.http.writes), 1, reply)
+                        self.assertIn("已加入草稿", reply)
+                    else:
+                        self.assertEqual(fixture.http.rows, [], reply)
+                        self.assertEqual(fixture.http.writes, [], reply)
+                        self.assertIn("dsllv", reply)
+                        self.assertRegex(reply, "没有词条|多个词条")
+                        self.assertRegex(reply, "请确认旧码|请写明要修改的词")
+                    self.assertNotIn("还没有核对出可执行", reply)
+                    before = list(fixture.http.requests)
+                    for message, codes in (
+                        ("dsllv dsllva", ("dsllv", "dsllva")),
+                        ("把编码由dsllv改为dsllva吗", ("dsllv", "dsllva")),
+                        ("把编码由dsllv改为dsllva", ("dsll", "dsllva")),
+                        ("把编码由dsllv改为dsllva", ("dsllv", "dsll")),
+                    ):
+                        resolved, options, error = await fixture.replay.chat._chat_commands.resolve_model_replace(
+                            OperationRequest(op="recode", codes=codes), "qq", fixture.replay.author.actor_id,
+                            message=message,
+                        )
+                        self.assertIsNone(resolved, (message, codes, resolved))
+                        self.assertEqual(options, ())
+                        self.assertTrue(error)
+                    self.assertEqual(fixture.http.requests, before)
+                    self.assertEqual(fixture.http.errors, [])
+                finally:
+                    fixture.doCleanups()
+
     async def test_inline_change_header_serialized_turn_writes_exact_swap_with_real_tools(self):
         from tests.helpers import TOOLS
         from tests.test_displace_shift_and_undo import set_up_change_header_swap_http
@@ -2351,7 +2435,9 @@ class QueryPrecedenceTests(unittest.IsolatedAsyncioTestCase):
                     if word == "哈基米":
                         self.assertIn("已在词库", reply)
                         self.assertIn("hjm", reply)
-                        self.assertIsNone(fixture.replay.store.get(fixture.replay.author))
+                        state = fixture.replay.store.get(fixture.replay.author)
+                        self.assertIsInstance(state, fixture.replay.chat.PendingTrustedWordRecord)
+                        self.assertEqual((state.word, state.code), ("哈基米", "hjm"))
                     else:
                         self.assertIn("— ✅推荐", reply)
                         self.assertIsNotNone(fixture.replay.store.get(fixture.replay.author))
@@ -2468,6 +2554,46 @@ class QueryPrecedenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(b17_rest_recommended_routing._is_bare_word_query_target(word))
                 self.assertEqual(await b17_rest_recommended_routing._get_simple_word_query_words(word), (word,))
                 classifier.assert_not_awaited()
+
+    async def test_r2_move_verb_words_reach_real_query_tools(self):
+        from tests.test_add_and_select import B18RealToolTests
+
+        fixture = B18RealToolTests()
+        fixture.addCleanup = self.addCleanup
+        fixture.setUp()
+        facts = {"提前": ("tqqm", "tí qián"), "前置": ("qmqi", "qián zhì"),
+                 "后置": ("hzqi", "hòu zhì"), "后移": ("hzyk", "hòu yí"),
+                 "放在心上": ("fzxe", "fàng zài xīn shàng")}
+        review = fixture.install_f2_review_http(facts, set())
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(review, "reference_db_path", return_value=Path(directory) / "reference.db"))
+        fixture.http.entries[:] = [
+            {"word": word, "code": code, "type": "Phrase", "weight": 100}
+            for word, (code, _reading) in facts.items()
+        ]
+        try:
+            for word, (code, _reading) in facts.items():
+                for message in (word, "查词 " + word):
+                    with self.subTest(message=message):
+                        self.assertEqual(
+                            await b17_rest_recommended_routing._get_simple_word_query_words(message), (word,),
+                        )
+                fixture.replay.store.delete(fixture.replay.author)
+                fixture.replay.history.clear()
+                fixture.http.requests.clear()
+                await fixture.turn(word, raw_operation(op="query", operands=[word], codes=[]))
+                self.assertIn(word, fixture.replay.last_response)
+                self.assertIn(code, fixture.replay.last_response)
+                self.assertTrue(any(
+                    path.endswith("/by-word/batch") and body["words"] == [word]
+                    for _method, path, body in fixture.http.requests
+                ), fixture.http.requests)
+            for command in ("放在前面", "移到第一位", "调到第二个", "放在abcd"):
+                with self.subTest(command=command):
+                    self.assertFalse(b17_rest_recommended_routing._is_bare_word_query_target(command))
+            self.assertEqual(fixture.http.writes, [])
+        finally:
+            fixture.tearDown()
 
     async def test_query_matrix_wins_over_no_intent_classifier(self):
         for message, words in (

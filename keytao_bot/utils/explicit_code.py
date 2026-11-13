@@ -27,7 +27,10 @@ class ExplicitEntryCodeRequest:
 def parse_explicit_entry_code_request(message: str):
     """Bind a complete add-code command to its explicitly named item."""
     from ..harness.authorization_grammar import (
-        DISPLACEMENT_VERBS, EXPLICIT_ADD_FILLER_WORDS, strip_add_command_modifier,
+        DISPLACEMENT_VERBS, EXPLICIT_ADD_FILLER_WORDS, _NEGATIVE_MODAL_RE,
+        _POSITIONAL_REPORTED_CONTEXT_RE,
+        looks_like_explicit_lexical_review_target,
+        strip_add_command_modifier,
     )
 
     source = unicodedata.normalize("NFKC", message).strip().rstrip("。.!！").strip()
@@ -51,19 +54,13 @@ def parse_explicit_entry_code_request(message: str):
     if combined is None:
         combined = re.fullmatch(action + separator + pair, source)
     if combined is not None:
-        from ..harness.authorization_grammar import (
-            _NEGATIVE_MODAL_RE,
-            _POSITIONAL_REPORTED_CONTEXT_RE,
-            looks_like_lexical_review_target,
-        )
-
         selected_word = combined.group("word").strip(' "“”「」『』')
         selected_code = combined.group("code").strip(' "“”「」『』')
         if (
             re.search(r"[A-Za-z]", selected_code) is None
             or combined.group("word") in DISPLACEMENT_VERBS
             or selected_word in EXPLICIT_ADD_FILLER_WORDS
-            or not looks_like_lexical_review_target(selected_word)
+            or not looks_like_explicit_lexical_review_target(selected_word)
             or re.match(r"^(?:请)?(?:先|暂时|暂)?" + _NEGATIVE_MODAL_RE.pattern, selected_word)
             or _POSITIONAL_REPORTED_CONTEXT_RE.match(selected_word)
         ):
@@ -74,11 +71,14 @@ def parse_explicit_entry_code_request(message: str):
             bool(combined.group("submit")),
             str(combined.group("pinyin") or "").strip(),
         )
+    literal_code_operand = operand(r'[a-zA-Z][a-zA-Z0-9]*')
     patterns = (
+        rf'(?:给\s*)?(?P<word>{operand(word + "?")})\s*(?:添加|新增|加)'
+        rf'\s*(?:编码\s*)?(?P<code>{literal_code_operand})',
         rf'(?P<word>{word_operand})\s+加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
         rf'(?P<word>{quoted_word})\s*加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
         rf'给\s*(?P<word>{word_operand})\s*加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
-        rf'(?:添加|加入|加词)\s*[:：]?\s*(?P<word>{quoted_word})\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
+        rf'(?:添加|新增|加入|加词)\s*[:：]?\s*(?P<word>{quoted_word})\s*(?P<code>{code_operand})',
         rf'(?:添加|加入|加词)\s*[:：]?\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
         rf'\s*[,，]?\s*的编码\s*(?=改为|[为是:：])(?:改为|为|是)?\s*[:：]?\s*(?P<code>{code_operand})',
         rf'(?:添加|加入|加词)\s*[:：]?\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
@@ -96,6 +96,8 @@ def parse_explicit_entry_code_request(message: str):
             re.search(r"[A-Za-z]", selected_code) is None
             or match.group("word") in DISPLACEMENT_VERBS
             or selected_word in EXPLICIT_ADD_FILLER_WORDS
+            or re.match(r"^(?:请)?(?:先|暂时|暂)?" + _NEGATIVE_MODAL_RE.pattern, selected_word)
+            or _POSITIONAL_REPORTED_CONTEXT_RE.match(selected_word)
         ):
             return None
         if match.groupdict().get("type") == "单字" and len(selected_word) != 1:

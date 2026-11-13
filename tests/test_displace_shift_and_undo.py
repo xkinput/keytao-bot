@@ -1219,6 +1219,58 @@ class B25SessionTests(unittest.IsolatedAsyncioTestCase):
 
     finish_replacement = B25SessionTests_finish_replacement
 
+    def configure_audit_move(self, facts, entries):
+        self.enterContext(patch.dict(b25_session_FACTS, facts))
+        self.http.entries = [{"word": word, "code": code, "type": "Phrase", "weight": 100}
+                             for word, code in entries]
+        from tests.helpers import closing, sqlite3, urlsplit
+
+        original = self.http._response
+
+        def response(method, url, kwargs):
+            if urlsplit(url).path == "/api/bot/phrases/encode":
+                url = url.replace("/api/bot/phrases/encode", "/api/phrases/encode")
+            return original(method, url, kwargs)
+
+        self.enterContext(patch.object(self.http, "_response", side_effect=response))
+
+        with closing(sqlite3.connect(review.reference_db_path())) as connection, connection:
+            connection.executemany("INSERT OR REPLACE INTO word_commonness VALUES (?, 3, NULL, 2)",
+                                   [(word,) for word in facts])
+
+    async def test_c1_merged_recommendation_shifts_named_occupant_with_real_tools(self):
+        self.configure_audit_move({
+            "交托": (["jctl", "jctlo", "jctloo"], "jiao tuo"),
+            "较妥": (["jctl", "jctlo", "jctloo"], "jiao tuo"),
+        }, [("较妥", "jctl")])
+        from tests.helpers import closing, sqlite3
+
+        with closing(sqlite3.connect(review.reference_db_path())) as connection, connection:
+            connection.execute("UPDATE word_commonness SET corpus_frequency = 1000 WHERE word = '交托'")
+            connection.execute("UPDATE word_commonness SET dictionary_presence_count = 0 WHERE word = '较妥'")
+            connection.executemany("INSERT INTO bcc_frequency VALUES (?, '交托', 17, 17, 1)",
+                                   [("多领域",), ("文学",)])
+        await self.seed("交托、公义")
+        record = self.replay.store.get_record(self.replay.author)
+        self.assertIsInstance(record.state, harness.PendingToolConfirm, self.replay.last_response)
+        scopes = record.state.args["_candidate_scopes"]
+        scope = next(scope for scope in scopes if scope["word"] == "交托")
+        self.assertIsNotNone(b25_session_commands.validated_front_insert_recommendation(
+            "交托", scope["candidates"], scope["occupiedWords"], scope["orderingAssessments"],
+        ), self.replay.last_response)
+        await self.turn('交托 1，顺延“较妥”', self.original_id)
+        record = self.replay.store.get_record(self.replay.author)
+        self.assertEqual(record.state.function_name, "keytao_shift_phrase_code", self.replay.last_response)
+        self.assertEqual(self.http.writes, [])
+        self.assertIn("「较妥」jctl → jctlo", self.replay.last_response)
+        await self.turn("确认", self.bot.last_id)
+        self.assertCountEqual([(row["action"], row["word"], row["code"]) for row in self.http.rows],
+                              [("Create", "交托", "jctl"), ("Delete", "较妥", "jctl"),
+                               ("Create", "较妥", "jctlo")])
+        record = self.replay.store.get_record(self.replay.author)
+        self.assertIn("公义", str(record.state.args))
+        self.assertEqual(self.http.errors, [])
+
     async def test_g1_internal_submit_metadata_never_reaches_real_tool(self):
         result = json.loads(await b25_session_commands.call_tool_function("keytao_submit_batch", {
             "batch_id": self.http.batch_id, "_recent_own_write": True,
@@ -1290,7 +1342,11 @@ class B25SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_g3_t1_t2_partial_then_t3_named_number_displacement(self):
         reply_id = await self.partial_session()
         self.http.writes.clear()
-        await self.finish_replacement('守时 3，顺延“首诗”', reply_id)
+        rows = copy.deepcopy(self.http.rows)
+        await self.turn('守时 3，顺延“首诗”', reply_id)
+        self.assertEqual(self.http.writes, [])
+        self.assertEqual(self.http.rows, rows)
+        self.assertIn("推荐顺延方案", self.replay.last_response)
 
     async def test_g3_t4_unquoted_replacement_is_not_a_new_word(self):
         await self.seed()
@@ -1403,7 +1459,7 @@ class B25SessionTests(unittest.IsolatedAsyncioTestCase):
                 await self.finish_replacement("用「守时」" + verb + "「首诗」")
 
     async def test_g3_named_number_displacement_variants(self):
-        for tail in ("，顶替首诗", "，替代首诗", " 顺延 首诗"):
+        for tail in ("，顶替首诗", "，替代首诗"):
             with self.subTest(tail=tail):
                 self.replay.store.delete(self.replay.author)
                 self.http.rows.clear()
@@ -1413,6 +1469,13 @@ class B25SessionTests(unittest.IsolatedAsyncioTestCase):
                 record = self.replay.store.get_record(self.replay.author)
                 if record is not None and record.state.function_name == "keytao_batch_add_to_draft":
                     self.assertNotIn(b25_session_WORD, record.state.args["_query_words"])
+        self.replay.store.delete(self.replay.author)
+        self.http.rows.clear()
+        self.http.writes.clear()
+        await self.seed("、".join(b25_session_WORDS))
+        await self.turn("守时 3 顺延 首诗", self.original_id)
+        self.assertEqual(self.http.writes, [])
+        self.assertIn("推荐顺延方案", self.replay.last_response)
 
     async def test_g3_wrong_occupant_refuses_without_concatenated_lookup(self):
         await self.seed()

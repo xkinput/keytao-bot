@@ -1725,7 +1725,7 @@ async def keytao_create_phrase(
         _reviewed_pinyin=_reviewed_pinyin,
         _reviewed_candidate_codes=_reviewed_candidate_codes,
     )
-    return _attach_pending_items(result, pending_items)
+    return await _attach_pending_items(result, pending_items)
 
 
 async def _keytao_create_phrase_after_pending_check(
@@ -3774,9 +3774,52 @@ async def _pending_create_guard(
     return None, pending_items
 
 
-def _attach_pending_items(result: Dict, pending_items: List[Dict]) -> Dict:
+async def _attach_pending_items(result: Dict, pending_items: List[Dict]) -> Dict:
     if pending_items:
         result["pendingItems"] = [dict(item) for item in pending_items]
+    deleted = {
+        (item["word"], item["code"], item["type"])
+        for item in trusted_pending_word_items(pending_items)
+        if item["source"] == "draft" and item["action"] == "Delete"
+    }
+    warnings = [
+        warning for warning in result.get("warnings") or []
+        if isinstance(warning, dict) and warning.get("warningType") == "multiple_code"
+    ]
+    words = list(dict.fromkeys(
+        str((warning.get("item") or warning).get("word") or "").strip()
+        for warning in warnings
+        if isinstance(warning.get("item") or warning, dict)
+    )) if deleted else []
+    lookup = await _lookup_words_raw(words) if words and all(words) else {}
+    results = lookup.get("results") if lookup.get("success") is True else None
+    existing_by_word = {}
+    if (
+        isinstance(results, list) and len(results) == len(words)
+        and all(
+            isinstance(row, dict) and isinstance(row.get("word"), str)
+            and row.get("success", True) is True
+            for row in results
+        )
+        and {row.get("word") for row in results} == set(words)
+    ):
+        for row in results:
+            if isinstance(row.get("phrases"), list):
+                existing_by_word[row["word"]] = row["phrases"]
+    for warning in warnings:
+        warning.pop("existingCodesDeletedInDraft", None)
+        item = warning.get("item") if isinstance(warning.get("item"), dict) else warning
+        word = str(item.get("word") or "").strip()
+        rows = existing_by_word.get(word)
+        if rows and all(
+            isinstance(row, dict)
+            and row.get("word") == word
+            and re.fullmatch(r"[a-z]{1,6}", str(row.get("code") or ""))
+            and isinstance(row.get("type"), str)
+            and (word, row.get("code"), row.get("type")) in deleted
+            for row in rows
+        ):
+            warning["existingCodesDeletedInDraft"] = True
     return result
 
 
@@ -4894,7 +4937,7 @@ async def keytao_batch_add_to_draft(
         preview_only=preview_only,
         _allow_same_code=_allow_same_code,
     )
-    return _attach_pending_items(result, pending_items)
+    return await _attach_pending_items(result, pending_items)
 
 
 async def _keytao_batch_add_to_draft_after_pending_check(

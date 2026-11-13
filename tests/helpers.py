@@ -2976,7 +2976,7 @@ async def HotfixMultiwordTests_query(self, words):
         self.assertTrue(await self.chat._stage_understand_operation_early(ctx))
     prepare.assert_awaited_once()
     self.assertEqual(prepare.await_args.args[0], words)
-    self.client.create.assert_awaited_once()
+    self.client.create.assert_not_awaited()
     self.main.assert_not_awaited()
     self.finish.assert_awaited_once()
     self.assertEqual([

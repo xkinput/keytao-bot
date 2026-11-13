@@ -570,6 +570,29 @@ class B14MultiSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     created = B14MultiSelectionTests_created
 
+    async def test_move_suffix_words_keep_query_operands(self):
+        words = ("宾语前置", "定语后置", "自动顺延")
+        self.replay.candidate_facts.update({
+            word: {"recommended": code, "codes": [code], "pinyin": "x y"}
+            for word, code in zip(words, ("zza", "zzb", "zzc"))
+        })
+        for message, operands, op in (
+            ("宾语前置", words[:1], "query"), ("查词 宾语前置", words[:1], "query"),
+            ("定语后置", words[1:2], "query"), ("查 自动顺延", words[2:], "query"),
+            ("确实 自动顺延", ("确实", "自动顺延"), "query"),
+            ("宾语前置 定语后置", words[:2], "query"),
+            ("宾语前置 定语后置", words[:2], "chat"),
+        ):
+            with self.subTest(message=message, op=op):
+                self.replay.store.delete(self.replay.author)
+                self.replay.history.clear()
+                await self.replay.turn({"message": message, "to_me": True}, raw_operation(
+                    op=op, operands=list(operands) if op == "query" else [], codes=[],
+                ))
+                for word in operands:
+                    self.assertIn(word, self.replay.last_response)
+                self.assertTrue("未收录" in self.replay.last_response or "候选" in self.replay.last_response)
+                self.assertEqual(self.replay.writes, [])
     async def test_r1_exact_t3_selects_seven_bound_creates(self):
         prompt = await self.candidates(*b14_multi_select_FACTS)
         record = self.replay.store.get_record(self.replay.author)
@@ -1504,6 +1527,58 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
 
     created = B18RealToolTests_created
 
+    async def test_a3_word_first_and_adjacent_quoted_add_codes_reach_real_tools(self):
+        for message in (
+            "「大绿」添加「dsllva」", "给大绿添加编码 dsllva",
+            "大绿加 dsllva", "大绿新增 dsllva", "添加「大绿」「dsllva」", "大绿添加dsllva",
+        ):
+            with self.subTest(message=message):
+                request = parse_explicit_entry_code_request(message)
+                self.assertIsNotNone(request)
+                self.assertEqual((request.word, request.code), ("大绿", "dsllva"))
+                self.assertTrue(grammar.message_authorizes_mutation(message))
+        for message in ("不要大绿添加dsllva", "他说大绿添加dsllva", "大绿添加dsllva？"):
+            with self.subTest(message=message):
+                self.assertIsNone(parse_explicit_entry_code_request(message))
+                self.assertFalse(grammar.message_authorizes_mutation(message))
+        review = self.install_f2_review_http({"大绿": ("dsllv", "dà lǜ")}, set())
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(review, "reference_db_path", return_value=Path(directory) / "reference.db"))
+        self.http.encode_overrides["大绿"] = {"codes": ["dsllv", "dsllva"]}
+        await self.turn("「大绿」添加「dsllva」", raw_operation(
+            op="add", operands=["大绿"], codes=["dsllva"],
+        ))
+        self.assertEqual(self.created(), [("大绿", "dsllva")], self.replay.last_response)
+        self.assertTrue(any(path == "/api/phrases/encode" for _, path, _ in self.http.requests))
+        self.assertEqual(len(self.http.writes), 1)
+
+    async def test_b1_explicit_and_quoted_prose_ending_words_reach_real_review(self):
+        from keytao_bot.utils.literal_phrase import parse_literal_phrase_query
+
+        routing = self.replay.chat._chat_routing
+        for message in ("加词 让我看看", "加词「让我看看」"):
+            with self.subTest(message=message):
+                self.assertEqual(routing._extract_explicit_reviewed_add_word(message), "让我看看")
+        self.assertEqual(parse_literal_phrase_query("「让我看看」"), "让我看看")
+        for message, word in (("加词 提交", "提交"), ("加词 并提交", "并提交")):
+            with self.subTest(message=message):
+                self.assertEqual(routing._extract_explicit_reviewed_add_word(message), word)
+        for message in ("添加并提交", "添加 并提交", "添加提交"):
+            with self.subTest(message=message):
+                self.assertIsNone(routing._extract_explicit_reviewed_add_word(message))
+        self.assertIsNone(routing._extract_explicit_reviewed_add_word("加词 怎么写"))
+        self.assertIsNone(routing._extract_explicit_reviewed_add_word("加词 木字旁加个青字"))
+        review = self.install_f2_review_http({"让我看看": ("rwkk", "ràng wǒ kàn kàn")}, set())
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(review, "reference_db_path", return_value=Path(directory) / "reference.db"))
+        await self.turn("加词 让我看看", raw_operation(op="chat", operands=[], codes=[]))
+        state = self.replay.store.get(self.replay.author)
+        self.assertIsInstance(state, PendingAddWord, self.replay.last_response)
+        self.assertEqual(state.word, "让我看看")
+        self.assertIn("rwkk", self.replay.last_response)
+        self.assertTrue(any(path == "/api/phrases/encode" for _, path, _ in self.http.requests))
+        self.assertEqual(self.http.writes, [])
+
     def install_f2_review_http(self, facts, unconfirmed_words):
         from tests.helpers import REAL_REVIEW_READS, review, urlsplit
 
@@ -1512,7 +1587,7 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
                 path = urlsplit(url).path
                 if path.endswith("/evidence/fetch"):
                     return OfflineResponse({}, 404)
-                if path == "/api/phrases/encode":
+                if path in {"/api/phrases/encode", "/api/bot/phrases/encode"}:
                     word = kwargs["params"]["word"]
                     code, reading = facts[word]
                     self.requests.append((method, path, {"word": word}))

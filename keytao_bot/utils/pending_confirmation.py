@@ -174,9 +174,7 @@ def trusted_pending_word_items(items: object) -> list[dict[str, str]]:
         ):
             continue
         old_word = str(raw.get("oldWord") or "").strip()
-        key = (source, batch_id, word, code)
-        if source == "others_submitted":
-            key += (action, old_word)
+        key = (source, batch_id, word, code, phrase_type, action, old_word)
         if key in seen:
             continue
         seen.add(key)
@@ -191,7 +189,7 @@ def trusted_pending_word_items(items: object) -> list[dict[str, str]]:
             "code": code,
             "type": phrase_type,
         })
-        if source == "others_submitted" and old_word:
+        if old_word:
             trusted[-1]["oldWord"] = old_word
     return trusted
 
@@ -212,20 +210,29 @@ def pending_word_reminder_lines(
             word = item.get("oldWord", "")
             if word not in word_filter:
                 continue
+        action = item["action"]
+        action_name = {"Create": "", "Change": "修改", "Delete": "删除"}[action]
+        action_copy = (
+            item["code"] if action == "Delete"
+            else f"{item.get('oldWord') or item['word']}→{item['word']} @ {item['code']}"
+            if action == "Change" else f"→ {item['code']}"
+        )
         if item["source"] == "others_submitted":
             line = (
-                f"「{word}」已有其他用户提交"
-                f"（→ {item['code']}，审核中）：{item['batchUrl']}"
+                f"「{word}」已有其他用户提交{action_name}"
+                f"（{action_copy}，审核中）：{item['batchUrl']}"
             )
         elif item["source"] == "submitted":
+            status_copy = f"在待审核批次中待{action_name}" if action_name else "已在待审核批次中"
             line = (
-                f"「{word}」已在待审核批次中"
-                f"（→ {item['code']}，审核中）：{item['batchUrl']}"
+                f"「{word}」{status_copy}"
+                f"（{action_copy}，审核中）：{item['batchUrl']}"
             )
         else:
+            status_copy = f"在当前草稿中待{action_name}" if action_name else "已在当前草稿中"
             line = (
-                f"「{word}」已在当前草稿中"
-                f"（→ {item['code']}）：{item['batchUrl']}"
+                f"「{word}」{status_copy}"
+                f"（{action_copy}）：{item['batchUrl']}"
             )
         if line not in lines:
             lines.append(line)
@@ -906,6 +913,8 @@ def plain_warning_message(warning: Any) -> str:
             return f"更短的 {'、'.join(skipped_codes)} 还空着，跳过会留空位。"
         return f"「{word}」将写入 {code}，并跳过更短的空位{weight_copy}"
     if warning_type == "multiple_code" and word and code:
+        if warning.get("existingCodesDeletedInDraft") is True:
+            return f"「{word}」的旧编码已在草稿中标记删除，将改用 {code}{weight_copy}"
         return f"「{word}」将以 {code} 形成多编码词条{weight_copy}"
     for field in ("message", "impact", "reason", "summary"):
         value = warning.get(field)
