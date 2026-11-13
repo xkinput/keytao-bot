@@ -32,6 +32,7 @@ COMPACT_CANDIDATE_HEADER_RE = re.compile(
 CANDIDATE_RECOMMENDATION_LABEL_RE = re.compile(
     r"✅\s*推荐|[（(]\s*(?:✅\s*)?推荐\s*[）)]|←\s*常用度推荐"
 )
+UNKNOWN_OCCUPANT_LABEL = "已有占用"
 PENDING_ADD_BINDING_RES = (
     re.compile(r"以编码\s*(?P<code>[a-z]+)\s*将「(?P<word>.+?)」加入草稿"),
     re.compile(
@@ -245,9 +246,11 @@ def candidate_label_occupants(label):
         return tuple(part.strip() for part in match[1].split("、") if part.strip())
     if candidate_label_is_available(label):
         return ()
-    label = re.sub(r"已有\s*", "", label.strip()).replace("✔️", "")
     label = re.split(r"✅|←", label, maxsplit=1)[0]
-    label = re.sub(r"[（(].*?[）)]", "", label)
+    label = re.sub(r"[（(].*?[）)]", "", label).strip()
+    if label == UNKNOWN_OCCUPANT_LABEL:
+        return ()
+    label = re.sub(r"已有\s*", "", label).replace("✔️", "")
     return tuple(part.strip() for part in re.split(r"[、,，]\s*", label) if part.strip())
 
 

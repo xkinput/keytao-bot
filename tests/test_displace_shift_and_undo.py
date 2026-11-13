@@ -1374,6 +1374,58 @@ class B25SessionTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_recent_codeless_shift("怎么后移", "怎么", ["xlbl", "xlblu", "xlbluv"],
                                                 "「怎么」已在词库（xlbl）。")
 
+    async def test_recent_shift_ignores_renderer_labels_but_keeps_entry_subjects(self):
+        from keytao_bot.plugins.chat_render import _format_candidate_status_line, _format_review_candidate_line
+
+        self.configure_audit_move(
+            {word: (["xlbl", "xlblu"], "a") for word in ("空位", "占用", "查报", "晁错")},
+            [(word, "xlbl") for word in ("空位", "占用", "查报", "晁错", "保留词")],
+        )
+        displayed = (
+            "「待加词」未收录：dai jia ci\n读音 shui\n逐字 shui\n已有 shui\n"
+            "加入编码 lfpci+形码\n"
+            + _format_candidate_status_line(2, {"code": "lfpci", "occupied": False}, "")
+            + "\n3. lfpciu — 推荐空位\n4. lfpciuv — ✅推荐"
+        )
+        displayed += "\n" + "\n".join((
+            _format_candidate_status_line(5, {"code": "lfpci", "occupied": True}, ""),
+            _format_candidate_status_line(6, {"code": "lfpci", "occupied": True, "flyKey": True}, ""),
+            _format_review_candidate_line(7, {"code": "lfpci", "occupied": True}, "lfpci"),
+            _format_review_candidate_line(8, {"code": "lfpci", "occupied": True, "flyKey": True}, "", "lfpci"),
+        ))
+        for message in ("空位顺延", "占用顺延"):
+            with self.subTest(message=message):
+                response = await b25_session_commands.try_handle_advertised_shift(
+                    message, "qq", self.replay.author.actor_id, self.replay.author,
+                    self.replay.author.space_key, "", history=[{"role": "assistant", "content": displayed}],
+                    require_bound_operand=True,
+                )
+                self.assertIsNone(response)
+                self.assertIsNone(self.replay.store.get_record(self.replay.author))
+                self.assertEqual(self.http.writes, [])
+        self.assertEqual(b25_session_commands._recent_displayed_shift_words([
+            {"role": "assistant", "content": displayed},
+        ]), ())
+        for word, shown in (
+            ("空位", b25_session_commands.already_existing_words_copy({"空位": ("xlbl",)})),
+            ("查报", b25_session_commands.already_existing_words_copy({"查报": ("xlbl",)})),
+            ("晁错", "⚠️ xlbl 与「晁错」同码"),
+            ("占用", _format_candidate_status_line(1, {"code": "xlbl", "occupied": True, "label": "已有「占用」"}, "")),
+            ("占用", _format_review_candidate_line(1, {"code": "xlbl", "occupied": True, "words": ["占用"]}, "")),
+        ):
+            with self.subTest(word=word):
+                response = await b25_session_commands.try_handle_advertised_shift(
+                    f"{word}顺延", "qq", self.replay.author.actor_id, self.replay.author,
+                    self.replay.author.space_key, "", history=[{"role": "assistant", "content": shown}],
+                    require_bound_operand=True,
+                )
+                self.assertIsNotNone(response)
+                record = self.replay.store.get_record(self.replay.author)
+                self.assertEqual(record.state.function_name, "keytao_shift_phrase_code")
+                self.assertEqual(record.state.args["word"], word)
+                self.assertEqual(self.http.writes, [])
+                self.replay.store.delete(self.replay.author)
+
     async def test_codeless_shift_fragments_never_preview_or_write(self):
         words = ("是的", "还是", "嗯", "好的", "那就", "它", "把它")
         messages = ("是的后移", "还是 顺延", "嗯后移", "好的后移", "那就顺延", "把它顺延")

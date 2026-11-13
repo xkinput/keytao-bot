@@ -30,6 +30,7 @@ from ..utils.reply_copy import (
     DRAFT_RECEIPT_REPLACED_PREFIXES,
     OPERATION_MEMORY_PREFIX_RE,
     PROVISIONAL_DRAFT_LINK_COPY,
+    UNKNOWN_OCCUPANT_LABEL,
     normalize_generated_review_copy,
 )
 from ..utils.pending_confirmation import (
@@ -1123,7 +1124,7 @@ def _format_candidate_status_line(index: int, status: Dict, recommended_code: st
     code = str(status.get("code") or "").strip()
     occupied = bool(status.get("occupied"))
     if occupied:
-        label = str(status.get("label") or "已有占用").strip()
+        label = str(status.get("label") or UNKNOWN_OCCUPANT_LABEL).strip()
     elif code == recommended_code:
         label = "✅ 推荐（空位）"
     else:
@@ -1378,7 +1379,7 @@ def _format_review_candidate_line(
     code = str(status.get("code") or "").strip()
     occupied = bool(status.get("occupied"))
     if occupied:
-        label = str(status.get("label") or "已有占用").strip()
+        label = str(status.get("label") or UNKNOWN_OCCUPANT_LABEL).strip()
         label = re.sub(r"已有「([^」]+)」", r"\1", label)
         words = status.get("words") or [item.get("word") for item in status.get("phrases", []) if isinstance(item, dict)]
         if words:

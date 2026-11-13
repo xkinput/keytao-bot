@@ -945,7 +945,8 @@ def completed_warning_messages(warnings: Iterable[Any]) -> list[str]:
         source = item if isinstance(item, dict) else warning
         code = str(source.get("code") or warning.get("code") or "").strip().lower()
         existing_words = _duplicate_code_existing_words(warning, code)
-        if not code or not existing_words:
+        word = str(source.get("word") or warning.get("word") or "").strip()
+        if not code or not existing_words or word in existing_words:
             messages.append(plain_warning_message(warning))
             continue
         weight = source.get("weight", warning.get("weight"))

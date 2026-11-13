@@ -753,6 +753,25 @@ class B19PartialReplyBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.replay.store.get_record(self.replay.author))
         self.assertEqual(self.http.writes, [])
 
+    async def test_recall_auth_failure_preserves_existing_bind_help(self):
+        from keytao_bot.utils.pending_confirmation import _BIND_HELP_TEXT
+
+        for message in ("未找到绑定账号，请先使用 /bind 命令绑定", "User not verified"):
+            with self.subTest(message=message):
+                self.http.requests.clear()
+
+                def response(method, url, kwargs):
+                    self.assertTrue(url.endswith("/api/bot/batches/latest-draft/items"))
+                    self.http.requests.append((method, "/api/bot/batches/latest-draft/items", {}))
+                    return OfflineResponse({"success": False, "message": message}, status=404)
+
+                with patch.object(self.http, "_response", side_effect=response):
+                    reply = await self.recall_preview()
+                self.assertEqual(reply, _BIND_HELP_TEXT)
+                self.assertEqual(self.http.requests, [("GET", "/api/bot/batches/latest-draft/items", {})])
+                self.assertIsNone(self.replay.store.get_record(self.replay.author))
+                self.assertEqual(self.http.writes, [])
+
     async def test_recall_empty_current_draft_names_batch_and_count_without_replacement(self):
         self.recall_http()
         response = await self.recall_preview()
@@ -3582,6 +3601,19 @@ class ReceiptFinalizerTests(unittest.TestCase):
 
 # Source: test_s60_receipt.py
 class ReceiptRegressionTests(unittest.TestCase):
+    def test_completed_self_duplicate_keeps_existing_dictionary_wording(self):
+        from keytao_bot.utils.pending_confirmation import plain_warning_message
+
+        warning = {
+            "warningType": "duplicate_code",
+            "item": {"word": "晁错", "code": "jccl", "weight": 100},
+            "existing": [{"word": "晁错", "code": "jccl"}],
+        }
+        lines = chat_render._create_notice_lines({"warnings": [warning]})
+        self.assertEqual(lines, [f"⚠️ {plain_warning_message(warning)}"])
+        self.assertIn("已在词库", lines[0])
+        self.assertNotIn("已作为重码加入", lines[0])
+
     def test_orchestrator_normal_and_failure_tails_keep_the_actual_delta(self):
         from keytao_bot.harness.orchestrator import AgentOrchestrator
         actual = mixed_receipt()

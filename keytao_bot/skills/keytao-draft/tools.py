@@ -3070,6 +3070,8 @@ async def keytao_recall_batch(
 
     if not batch_id and existing_recall_payload is None:
         current_draft = await keytao_list_draft_items(platform, platform_id)
+        if current_draft.get("not_bound"):
+            return current_draft
         current_items = current_draft.get("items")
         if not current_draft.get("success") or not isinstance(current_items, list):
             return {
@@ -3400,6 +3402,9 @@ async def keytao_list_draft_items(
             except Exception:
                 logger.error(f"[keytao_list_draft_items] Non-JSON response ({response.status_code}): {response.text[:200]}")
                 return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+
+            if response.status_code == 404:
+                return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
 
             logger.info(f"[keytao_list_draft_items] status={response.status_code} count={data.get('count', 0)}")
             if data.get("success") and isinstance(data.get("items"), list):

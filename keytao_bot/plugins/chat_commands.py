@@ -10367,10 +10367,12 @@ def _recent_displayed_shift_words(history) -> Tuple[str, ...]:
             is_reply=True, is_to_bot=True, text=reply,
         )))
         for line in reply.splitlines():
-            words.extend(re.findall(rf'(?:^|[：:、，,；;\s])({literal})(?:\s+|\s*[→@]\s*){code}', line))
-            words.extend(re.findall(rf'{code}\s*[—–-]\s*[「“]?({literal})', line))
+            if line.startswith(already_existing_words_copy({})) or has_completed_draft_receipt(line):
+                words.extend(re.findall(rf'(?:^|[：:、，,；;\s])({literal})(?:\s+|\s*[→@]\s*){code}', line))
+            candidate = CANDIDATE_CODE_LINE_RE.fullmatch(line)
+            if candidate is not None:
+                words.extend(candidate_label_occupants(candidate["label"]))
             words.extend(re.findall(rf'{code}\s*(?:与|和)\s*[「“"『]({literal})[」”"』]\s*同码', line))
-            words.extend(re.findall(rf'{code}\s*[—–-]\s*已有\s*[「“"『]({literal})[」”"』]', line))
             words.extend(re.findall(rf'[「“"『]({literal})[」”"』](?=\s*已在当前草稿)', line))
     return tuple(dict.fromkeys(words))
 
