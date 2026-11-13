@@ -1534,7 +1534,7 @@ class CommonnessRenderTests(unittest.TestCase):
 
     assert_delivery = CommonnessRenderTests_assert_delivery
 
-    def test_compact_web_values_are_ordered_numerically_and_keep_precision(self):
+    def test_compact_web_values_are_ordered_by_raw_values(self):
         assessment = {
             "newWord": "新词", "occupantWord": "旧词",
             "verdict": "behind_more_common", "webFallback": True,
@@ -1545,8 +1545,26 @@ class CommonnessRenderTests(unittest.TestCase):
                          commonness_copy.candidate_commonness_summary_copy(assessment))
         assessment["front"]["score"] = 1.0000001
         assessment["behind"]["score"] = 1.0000002
-        self.assertEqual("旧词 1.0000002 > 新词 1.0000001",
+        self.assertEqual("旧词 1.0001 > 新词 1.0001",
                          commonness_copy.render_commonness_comparison(assessment))
+
+    def test_compact_frequencies_round_up_to_five_significant_digits(self):
+        for value, expected in (
+            (44.691763529274844, "44.692"), (0.39216532290285044, "0.39217"),
+            (1.1612456963927658, "1.1613"), (40, "40"), (3.0, "3"),
+            (0.000123456, "0.00012346"), (123456.2, "123457"),
+            (10000.2, "10001"), (9999.9999, "10000"),
+            (1.23456e-7, "0.00000012346"), (1e30, "1000000000000000000000000000000"),
+            (0, "0"), (-0.0, "0"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    f"词频：新词 {expected} > 旧词 无",
+                    commonness_copy.candidate_commonness_summary_copy({
+                        "newWord": "新词", "occupantWord": "旧词", "webFallback": True,
+                        "front": {"score": value},
+                    }),
+                )
 
     def test_modern_semantic_override_omits_contradictory_frequency_comparison(self):
         pair = {

@@ -1,6 +1,7 @@
 """Render comparator-owned evidence without querying for another snapshot."""
 
 import math
+from decimal import Decimal, ROUND_CEILING
 
 
 def render_commonness_summary(assessment: dict) -> str:
@@ -81,6 +82,17 @@ def comparison_frequency_values(assessment: dict) -> tuple:
                  for side in ("front", "behind"))
 
 
+def _format_comparison_frequency(value: int | float) -> str:
+    number = Decimal(repr(value))
+    if number == 0:
+        return "0"
+    if number.adjusted() >= 4:
+        return format(number.to_integral_value(rounding=ROUND_CEILING), "f")
+    quantum = Decimal(1).scaleb(number.adjusted() - 4)
+    rounded = number.quantize(quantum, rounding=ROUND_CEILING)
+    return format(rounded, "f").rstrip("0").rstrip(".")
+
+
 def render_commonness_comparison(assessment: dict) -> str:
     """Show only snapshot values, ordered numerically rather than by verdict."""
     if assessment.get("decisionReason") == "modern_semantic_vs_dictionary_dominated":
@@ -94,7 +106,7 @@ def render_commonness_comparison(assessment: dict) -> str:
         return ""
     sides = list(zip(words, values))
     sides.sort(key=lambda item: (item[1] is not None, item[1] or 0), reverse=True)
-    formatted = [f"{word} {int(value) if value == int(value) else value}" if value is not None else f"{word} 无"
+    formatted = [f"{word} {_format_comparison_frequency(value)}" if value is not None else f"{word} 无"
                  for word, value in sides]
     operator = "=" if values[0] is not None and values[0] == values[1] else ">"
     return f"{formatted[0]} {operator} {formatted[1]}"
