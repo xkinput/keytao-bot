@@ -4962,6 +4962,7 @@ async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: 
         replies = [await _try_handle_simple_single_word_query(
             word, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
             preserve_pending=True, query_only=True,
+            _include_char_split=len(words) == 1,
         ) for word in words]
         ctx.response = (ServerBackedQueryReply("\n\n".join(reply for reply in replies if reply))
                         if words else _reply_copy.STALE_OPTION_EMPTY_COPY)
@@ -5543,6 +5544,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                         preserve_pending=True, query_only=True,
                         _missing_words=missing_words,
                         _prepared_existing_words=present_word_codes,
+                        _include_char_split=len(operands) == 1,
                     ))
                 if present_word_codes:
                     replies.append(already_existing_words_copy(present_word_codes))
@@ -5577,6 +5579,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                         candidates = await _try_handle_simple_single_word_query(
                             missing_words[0], ctx.platform, ctx.user_id, ctx.conv_key,
                             ctx.space_key, ctx.owner_label, _literal_word=True,
+                            _include_char_split=len(operands) == 1,
                         )
                         replies.append(candidates)
                         ctx.semantic_query_reply = "\n\n".join(reply for reply in replies if reply)

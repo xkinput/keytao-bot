@@ -220,11 +220,107 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
                 ctx.event = MagicMock(to_me=to_me)
                 await self.assert_finished(ctx)
                 self.assertEqual(ctx.response, "「浙」已在词库（fea、qea、feaiuu）。")
-                self.tool.assert_awaited_once_with(
-                    "keytao_lookup_by_word", {"word": "浙"}, "qq", self.author.actor_id,
-                )
+                self.assertEqual([call.args for call in self.tool.await_args_list], [
+                    ("keytao_lookup_by_word", {"word": "浙"}, "qq", self.author.actor_id),
+                    ("keytao_encode", {"word": "浙"}, "qq", self.author.actor_id),
+                ])
                 self.main.assert_not_awaited()
                 self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_single_character_query_includes_rule_split_once_and_skips_other_queries(self):
+        self.entries.update({"淅": "xkavu", "浙": "fea"})
+        self.candidate_codes["淅"] = "xkavu"
+        split = {"char": "淅", "pinyin": "xi", "phoneticCode": "xk",
+                 "c1": "氵", "c2": "析", "shapeCode": "avuu"}
+        encoding = {"success": True, "chars": [split]}
+
+        async def fake_tool(name, args, platform, user_id, **kwargs):
+            if name == "keytao_encode":
+                if isinstance(encoding, Exception):
+                    raise encoding
+                payload = copy.deepcopy(encoding)
+                for item in payload.get("chars") or []:
+                    item["char"] = args["word"]
+                return json.dumps(payload, ensure_ascii=False)
+            payload = json.loads(await self.lookup(name, args, platform, user_id, **kwargs))
+            for row in payload.get("results", [payload]):
+                for phrase in row.get("phrases", []):
+                    if len(phrase["word"]) == 1:
+                        phrase["type"] = "Single"
+            if name == "keytao_lookup_by_word" and args["word"] == "淅" and payload["phrases"]:
+                payload["phrases"].append({"word": "淅", "code": "xkavuu", "type": "Single"})
+            if name == "keytao_prepare_reviewed_add" and len(args["word"]) == 1:
+                payload["type"] = "Single"
+            return json.dumps(payload, ensure_ascii=False)
+
+        self.tool.side_effect = fake_tool
+        for message, word, to_me in (("喵喵查词淅", "淅", False), ("喵喵 查词 浙", "浙", False),
+                                     ("@喵喵 淅", "淅", True)):
+            with self.subTest(message=message):
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.set_model(operands=(word,))
+                ctx = self.context(message)
+                ctx.event = MagicMock(to_me=to_me)
+                await self.assert_finished(ctx)
+                self.assertIn(f"拆分：{word}（xi）　音码 xk　字根 氵｜析　形码 avuu", ctx.response)
+                self.assertEqual(ctx.response.count("拆分："), 1)
+                self.assertNotIn("• ", ctx.response)
+                self.assertEqual([call.args[0] for call in self.tool.await_args_list],
+                                 ["keytao_lookup_by_word", "keytao_encode"])
+                self.main.assert_not_awaited()
+
+        self.entries.pop("淅")
+        self.finish.reset_mock()
+        self.remember.reset_mock()
+        self.set_model(operands=("淅",))
+        ctx = self.context("淅")
+        await self.assert_finished(ctx)
+        self.assertEqual(ctx.response.count("拆分：淅（xi）　音码 xk　字根 氵｜析　形码 avuu"), 1)
+        for preserve_pending in (False, True):
+            with self.subTest(candidate_card=True, preserve_pending=preserve_pending):
+                self.tool.reset_mock()
+                response = await self.commands._prepare_multi_word_query(
+                    ("淅",), "qq", self.author.actor_id, self.author, self.author.space_key,
+                    "Offline owner", preserve_pending=preserve_pending,
+                )
+                self.assertIn("xkavu", response)
+                self.assertEqual(response.count("拆分：淅（xi）　音码 xk　字根 氵｜析　形码 avuu"), 1)
+                self.assertEqual(sum(call.args[0] == "keytao_encode" for call in self.tool.await_args_list), 1)
+                self.assertEqual(await self.commands._append_single_char_query_split(
+                    response, "淅", "qq", self.author.actor_id,
+                ), response)
+
+        self.entries["淅"] = "xkavu"
+        for encoding in ({"success": False, "message": "Offline encoder error"},
+                         {"success": True},
+                         {"success": True, "chars": []},
+                         {"success": True, "chars": [{"char": "淅", "pinyin": "xi", "phoneticCode": "xk"}]},
+                         RuntimeError("Offline encoder failure")):
+            with self.subTest(encoding=encoding):
+                response = await self.commands._try_handle_simple_single_word_query(
+                    "淅", "qq", self.author.actor_id, query_only=True,
+                )
+                self.assertEqual(response, "「淅」已在词库（xkavu、xkavuu）。")
+
+        encoding = {"success": True, "chars": [{**split, "pinyin": "xing"}, {**split, "pinyin": "hang"}]}
+        response = await self.commands._append_single_char_query_split("Offline lookup", "行", "qq", self.author.actor_id)
+        self.assertEqual(response.count("拆分：行（"), 2)
+
+        encoding = {"success": True, "chars": [split]}
+        for operands in (("积极",), ("淅", "浙"), ("淅", "云翻"), ("积极", "淅")):
+            with self.subTest(operands=operands):
+                if operands == ("积极", "淅"):
+                    self.entries.pop("淅")
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.set_model(operands=operands)
+                ctx = self.context(" ".join(operands))
+                await self.assert_finished(ctx)
+                self.assertNotIn("拆分：", ctx.response)
+                self.assertFalse(any(call.args[0] == "keytao_encode" for call in self.tool.await_args_list))
 
     async def test_missing_word_reuses_normal_single_word_candidates_and_ticket(self):
         ctx = self.context("云翻")

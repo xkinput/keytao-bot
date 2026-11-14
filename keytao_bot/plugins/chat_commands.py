@@ -173,6 +173,7 @@ from .chat_render import (
     _draft_item_display_line,
     _format_active_draft_operation_message,
     _format_changed_server_confirmation_prompt,
+    _format_encode_char_split,
     _format_full_add_and_submit_instruction,
     _format_operation_memory_for_reply,
     _format_pre_submit_audit_preview,
@@ -3696,9 +3697,12 @@ async def _prepare_multi_word_query(
                 scope["candidates"], scope["occupiedWords"],
                 scope["orderingAssessments"],
             ))
-        return ServerBackedQueryReply(prepend_pending_word_reminders(
+        response = prepend_pending_word_reminders(
             "\n\n".join(other_blocks), shown_others, words=combined_words,
-        ))
+        )
+        if len(combined_words) == 1 and not explicit_add:
+            response = await _append_single_char_query_split(response, combined_words[0], platform, user_id)
+        return ServerBackedQueryReply(response)
     for scope in scopes:
         if scope["reviewedState"]["recommendedCode"] or (
             scope["candidates"] and all(
@@ -3786,6 +3790,26 @@ async def _prepare_multi_word_query(
     return ServerBackedQueryReply("\n\n".join([*other_blocks, rendered]))
 
 
+async def _append_single_char_query_split(response: str, word: str, platform: str, user_id: str) -> str:
+    """Append the rule encoder's split without changing query or candidate facts."""
+    if not re.fullmatch(r"[\u3400-\u9fff]", word):
+        return response
+    try:
+        encoding = json.loads(await call_tool_function("keytao_encode", {"word": word}, platform, user_id))
+        if not isinstance(encoding, dict) or not encoding.get("success"):
+            return response
+        chars = encoding.get("chars")
+        if not isinstance(chars, list):
+            return response
+        chars = [item for item in chars if isinstance(item, dict) and item.get("char") == word
+                 and any(str(item.get(key) or "").strip() for key in ("c1", "c2"))]
+        lines = tuple(dict.fromkeys(line.removeprefix("• ") for line in _format_encode_char_split(chars)))
+    except Exception:
+        return response
+    additions = ["拆分：" + line for line in lines if line not in response]
+    return response + "\n" + "\n".join(additions) if additions else response
+
+
 async def _try_handle_simple_single_word_query(
     message_text: str,
     platform: str,
@@ -3806,6 +3830,7 @@ async def _try_handle_simple_single_word_query(
     query_only: bool = False,
     _missing_words: Optional[List[str]] = None,
     _literal_word: bool = False,
+    _include_char_split: bool = True,
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     from ..utils.reading_request import parse_parenthesised_readings
@@ -3866,6 +3891,7 @@ async def _try_handle_simple_single_word_query(
     set_turn_flow("word-query" if query_only else "word-discovery")
 
     word = words[0]
+    include_char_split = _include_char_split and _prepared_scopes is None and not explicit_add_word
     if _prepared_data is not None:
         lookup_data, pending_data = _prepared_data
     else:
@@ -3999,7 +4025,11 @@ async def _try_handle_simple_single_word_query(
                 advertise_controls=can_recode,
             )
             if query_only:
-                return ServerBackedQueryReply(existing_reply.splitlines()[0])
+                existing_reply = existing_reply.splitlines()[0]
+            if include_char_split:
+                existing_reply = await _append_single_char_query_split(existing_reply, word, platform, user_id)
+            if query_only:
+                return ServerBackedQueryReply(existing_reply)
             response = ("类型：单字\n" + existing_reply) if len(word) == 1 else existing_reply
             if (
                 live_record is not None
@@ -4138,11 +4168,14 @@ async def _try_handle_simple_single_word_query(
                 })
                 return ""
             if preserve_pending:
-                return ServerBackedQueryReply(_render_pending_preserving_lookup(
+                response = _render_pending_preserving_lookup(
                     pending.word, pending.recommended_code, pending.server_candidates,
                     pending.server_occupied_words,
                     pending.server_ordering_assessments,
-                ))
+                )
+                if include_char_split:
+                    response = await _append_single_char_query_split(response, word, platform, user_id)
+                return ServerBackedQueryReply(response)
             target_key = conv_key or (
                 current_memory_context.get().conversation_address
                 if current_memory_context.get() is not None
@@ -4181,6 +4214,8 @@ async def _try_handle_simple_single_word_query(
             return reviewed_prompt
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
         rendered_reply = append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
+        if include_char_split:
+            rendered_reply = await _append_single_char_query_split(rendered_reply, word, platform, user_id)
         return (
             ServerBackedQueryReply(rendered_reply)
             if isinstance(reviewed_prompt, ServerBackedQueryReply)
