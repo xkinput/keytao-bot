@@ -4901,13 +4901,18 @@ def _recent_completed_write_summary(ctx: TurnContext) -> str:
 
 async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: bool = False) -> bool:
     """A closed answer without an actor-owned ticket never reaches a model."""
-    cancel = parse_pending_assent_phrase(ctx.normalized_message_text).cancel_requested
+    assent = parse_pending_assent_phrase(ctx.normalized_message_text)
+    cancel = assent.cancel_requested
     source = _strip_command_message_prefixes(ctx.normalized_message_text).strip()
     rest_action = _authorization_grammar.parse_reviewed_rest_command(source)
     confirm = understood_confirm or rest_action is not None or re.fullmatch(
         r"(?:(?:请)?(?:确认|执行)(?:吧)?|好的?\s*[,，]?\s*执行(?:吧)?)"
         r"(?:[,，]\s*不要复读我的话)?[。.!！]?", source,
     ) is not None
+    bare_assent = bool(
+        (assent.matched or _chat_routing.normalize_affirmative_reply(ctx.normalized_message_text))
+        and not (cancel or assent.add_requested or assent.submit_after)
+    )
     if confirm and _is_explicit_draft_submit_request(source):
         return False
     if not (cancel or confirm or _chat_routing.normalize_affirmative_reply(ctx.normalized_message_text)) or ctx.conv_key is None:
@@ -4936,6 +4941,35 @@ async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: 
             pass
     if not addressed:
         return False
+    if bare_assent and not confirm:
+        history = get_history(ctx.conv_key)
+        if ctx.reply_reference.is_reply and ctx.reply_reference.is_to_bot and (
+            _referenced_owner_key_from_reply_reference(ctx.reply_reference, ctx.platform)
+            not in {None, (ctx.platform, str(ctx.user_id))}
+            or not any(item.get("role") == "assistant" and ctx.reply_reference.text
+                       and _prompt_capability_digest(str(item.get("content") or ""))
+                       == _prompt_capability_digest(ctx.reply_reference.text) for item in history)
+        ):
+            return await _stage_claim_offered_answer(ctx, stale_affirmative=True)
+        previous = next((str(item.get("content") or "") for item in reversed(history)
+                         if item.get("role") == "assistant"), "")
+        offer = re.search(r"(?:想查|要查|查一下)\s*((?:「[^「」\n]+」[\s、，,和及与]*)+)吗[？?]?", previous)
+        words = tuple(dict.fromkeys(
+            word for quoted in re.findall(r"「([^「」]+)」", offer.group(1) if offer else "")
+            for word in (_chat_commands._bare_multi_word_query_words(quoted) or (quoted,))
+            if _chat_routing._is_bare_word_query_target(word)
+        ))
+        replies = [await _try_handle_simple_single_word_query(
+            word, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+            preserve_pending=True, query_only=True,
+        ) for word in words]
+        ctx.response = (ServerBackedQueryReply("\n\n".join(reply for reply in replies if reply))
+                        if words else _reply_copy.STALE_OPTION_EMPTY_COPY)
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+        await _finish_ai_chat_response(
+            ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+        )
+        return True
     if confirm and rest_action is None and not _chat_commands.SEMANTIC_ROUTE_OPS.intersection(
         token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
     ):
@@ -5326,6 +5360,11 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
         except Exception as error:
             logger.warning(f"[semantic_shadow] failed={type(error).__name__}")
             return False
+        if (validated.op == "chat" and validated.frame == "reported"
+                and ctx.memory_context is not None and ctx.memory_context.space_type == "group"
+                and not await to_me()(ctx.bot, ctx.event, {})):
+            ctx.response = None
+            return True
         pending_decision = raw
         if isinstance(raw, dict) and set(raw) - {"_model"} == {"answer"}:
             pending_decision = raw["answer"]
@@ -5549,7 +5588,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                         )
                     ctx.semantic_query_candidates_prepared = True
                 query_source = re.sub(
-                    r"^(?:查询|查看|查一下|查)(?:编码|代码)?\s*[:：]?\s*", "",
+                    r"^(?:查询词条|查词|查询|查看|查一下|查)(?:编码|代码)?\s*[:：]?\s*", "",
                     _strip_command_message_prefixes(message).strip(), count=1,
                 )
                 word_pattern = "(?:" + "|".join(re.escape(word) for word in validated.operands) + ")"

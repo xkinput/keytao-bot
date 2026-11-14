@@ -71,6 +71,29 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
             ensure_ascii=False,
         )
 
+    async def test_reported_keyword_chat_is_silent_unless_addressed_or_requested(self):
+        message = "你得   说 查词 或者文字里带 喵喵 才行   像 喵喵查词淅"
+        for addressed, op in ((False, "chat"), (True, "chat"), (False, "query")):
+            with self.subTest(addressed=addressed, op=op):
+                ctx = self.context(message)
+                ctx.message_text = message
+                ctx.response = None
+                self.set_model(op, operands=("淅",) if op == "query" else (), frame="reported")
+                self.finish.reset_mock()
+                with (
+                    patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "chat,query"}),
+                    patch.object(self.chat, "to_me", return_value=AsyncMock(return_value=addressed)),
+                    patch.object(self.chat, "_stage_generate_ai_response", AsyncMock()) as main,
+                    patch.object(self.chat, "_try_handle_simple_single_word_query", AsyncMock(return_value="已在词库：淅 xk")),
+                ):
+                    self.assertTrue(await self.chat._stage_understand_operation(ctx))
+                if not addressed and op == "chat":
+                    main.assert_not_awaited()
+                    self.finish.assert_not_awaited()
+                    self.assertIsNone(ctx.response)
+                else:
+                    self.finish.assert_awaited_once()
+
     @staticmethod
     def command_families():
         return (

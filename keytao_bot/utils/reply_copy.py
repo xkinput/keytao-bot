@@ -101,9 +101,9 @@ MEMORY_HIGH_MARKERS = (
     "偏好", "习惯", "记住", "以后", "称呼", "不要", "别再",
     "词库操作", "已处理加词草稿", "已提交当前用户草稿审核", "已确认添加到草稿",
 )
-STALE_OPTION_EMPTY_COPY = "当前没有待执行的操作；本次未写入。需要引用原提议确认后重新核对。"
-STALE_OPTION_MISSING_COPY = "当前没有可执行的确认记录；本次未写入。需要引用原提议确认后重新核对。"
-STALE_OPTION_EXPIRED_COPY = "当前没有可执行的确认记录；之前的确认已过期或记录已不存在；本次未写入。需要引用原提议确认后重新核对。"
+STALE_OPTION_EMPTY_COPY = "现在没有待确认的操作。"
+STALE_OPTION_MISSING_COPY = "当前没有可执行的确认记录；本次未写入。"
+STALE_OPTION_EXPIRED_COPY = "当前没有可执行的确认记录；之前的确认已过期或记录已不存在；本次未写入。"
 STALE_OPTION_PREFIXES = ("上一条提议是：", "上一条提议的选项是：")
 OPTION_PROPOSAL_RE = re.compile(r"计划|方案|将执行|将把|是否|建议|要不要")
 COLLISION_REPLAN_PREFIX = "已调整："

@@ -682,8 +682,8 @@ class B5ReplySafetyTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(self.chat, "AsyncOpenAI") as model:
                     self.assertTrue(await self.chat._stage_understand_operation_early(ctx))
                 model.assert_not_called()
-                self.assertIn("没有可执行的确认记录" if quoted == "bot" else "当前没有待执行的操作", ctx.response)
-                self.assertIn("引用原提议", ctx.response)
+                self.assertIn("没有可执行的确认记录" if quoted == "bot" else "现在没有待确认的操作", ctx.response)
+                self.assertNotIn("引用原提议", ctx.response)
                 self.assertEqual(len(ctx.response.splitlines()), 1)
                 self.assertNotIn("已提交", ctx.response)
                 self.tool.assert_not_awaited()
@@ -753,7 +753,7 @@ class B5ReplySafetyTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(self.chat, "AsyncOpenAI") as model:
                     self.assertTrue(await self.chat._stage_understand_operation_early(ctx))
                 model.assert_not_called()
-                self.assertEqual(ctx.response, "当前没有待执行的操作；本次未写入。需要引用原提议确认后重新核对。")
+                self.assertEqual(ctx.response, "现在没有待确认的操作。")
                 self.tool.assert_not_awaited()
                 self.assertIs(self.store.get_record(other), other_ticket)
 

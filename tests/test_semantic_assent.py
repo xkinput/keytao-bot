@@ -196,6 +196,48 @@ class SemanticAssentTests(unittest.IsolatedAsyncioTestCase):
         self.chat._semantic_shadow_tasks.clear()
         self.tool.assert_not_awaited()
 
+    async def test_bare_assent_recovers_only_latest_own_lookup_offer(self):
+        for assent in ("是的", "对", "好", "嗯"):
+            for offer in ("您想查「淅」吗？", "要查「淅」「浙」吗？", "查一下「淅、浙」吗？", "想查「淅」吗"):
+                with self.subTest(assent=assent, offer=offer):
+                    self.history = [{"role": "assistant", "content": offer}]
+                    ctx = self.context(assent, addressed=True)
+                    async def lookup_word(name, args, *unused_args, **unused_kwargs):
+                        self.assertEqual(name, "keytao_lookup_by_word")
+                        return json.dumps({"success": True, "phrases": [
+                            {"word": args["word"], "code": "fea", "type": "Single"},
+                        ]}, ensure_ascii=False)
+
+                    lookup = AsyncMock(side_effect=lookup_word)
+                    with (
+                        patch.object(self.chat, "call_tool_function", lookup),
+                        patch.object(self.chat, "get_ai_response_core", AsyncMock()) as main,
+                    ):
+                        self.assertTrue(await self.chat._stage_understand_operation_early(ctx))
+                    self.assertEqual([call.args[1]["word"] for call in lookup.await_args_list],
+                                     ["淅", "浙"] if "浙" in offer else ["淅"])
+                    self.assertIn("fea", ctx.response)
+                    main.assert_not_awaited()
+                    self.client.create.assert_not_awaited()
+                    self.add.assert_not_awaited()
+                    self.submit.assert_not_awaited()
+                    self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_bare_assent_without_latest_lookup_offer_uses_plain_empty_copy(self):
+        for history in (
+            [],
+            [{"role": "assistant", "content": "您想查「淅」吗？"},
+             {"role": "assistant", "content": "刚才聊到淅。"}],
+            [{"role": "assistant", "content": "要将「淅」加入草稿吗？"}],
+        ):
+            with self.subTest(history=history):
+                self.history = history
+                ctx = self.context("是的", addressed=True)
+                with patch.object(self.chat, "_try_handle_simple_single_word_query", AsyncMock()) as lookup:
+                    self.assertTrue(await self.chat._stage_understand_operation_early(ctx))
+                lookup.assert_not_awaited()
+                self.assertEqual(ctx.response, "现在没有待确认的操作。")
+
     def ticket(self, *, recommended="wj", legacy=False):
         self.add.reset_mock()
         self.submit.reset_mock()

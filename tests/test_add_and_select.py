@@ -3392,8 +3392,8 @@ class S57OptionBoundaryTests(unittest.TestCase):
                 raw = render_missing_option_ticket(history)
                 actual = s57_options_chat._prepare_user_facing_reply(raw, None)
                 self.assertEqual(raw, actual)
-                self.assertIn("引用原提议", actual)
-                self.assertIn("未写入", actual)
+                self.assertNotIn("引用原提议", actual)
+                self.assertEqual("未写入" in actual, bool(history))
                 if history:
                     self.assertIn("上一条提议", actual)
             finally:

@@ -18794,7 +18794,7 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
         check("bare confirm without a ticket bypasses intent model", bare["classifier_calls"] == 0)
         check("bare confirm without a ticket bypasses main model", bare["main_calls"] == 0)
         check("bare confirm without an invitation reaches no tool sink", bare["tool_calls"] == 0)
-        check("bare confirm without a ticket reports no operation in one line", "当前没有待执行的操作" in bare["response"] and len(bare["response"].splitlines()) == 1)
+        check("bare confirm without a ticket reports no operation in one line", bare["response"] == "现在没有待确认的操作。")
 
         invited = await run_case(
             "确认",
@@ -18814,8 +18814,8 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
             "没有可执行的确认记录" in invited["response"],
         )
         check(
-            "stale reply offers plain recovery guidance",
-            "引用原提议" in invited["response"] and len(invited["response"].splitlines()) == 1,
+            "stale reply stays plain without recovery guidance",
+            "引用原提议" not in invited["response"] and len(invited["response"].splitlines()) == 1,
         )
         check(
             "stale reply never recommends confirming again",

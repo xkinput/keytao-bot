@@ -201,6 +201,31 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.tool.assert_awaited_once()
         self.assertIsNone(self.store.get_record(self.author))
 
+    async def test_single_character_lookup_renders_all_codes_without_main(self):
+        self.tool.side_effect = None
+        self.tool.return_value = json.dumps({
+            "success": True, "word": "浙", "phrases": [
+                {"word": "浙", "code": code, "type": "Single"}
+                for code in ("fea", "qea", "feaiuu", "fea")
+            ],
+        }, ensure_ascii=False)
+        for message, to_me in (("喵喵 查词 浙", False), ("浙", True)):
+            with self.subTest(message=message, to_me=to_me):
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.main.reset_mock()
+                self.set_model(operands=("浙",))
+                ctx = self.context(message)
+                ctx.event = MagicMock(to_me=to_me)
+                await self.assert_finished(ctx)
+                self.assertEqual(ctx.response, "「浙」已在词库（fea、qea、feaiuu）。")
+                self.tool.assert_awaited_once_with(
+                    "keytao_lookup_by_word", {"word": "浙"}, "qq", self.author.actor_id,
+                )
+                self.main.assert_not_awaited()
+                self.assertIsNone(self.store.get_record(self.author))
+
     async def test_missing_word_reuses_normal_single_word_candidates_and_ticket(self):
         ctx = self.context("云翻")
         self.set_model(operands=("云翻",))

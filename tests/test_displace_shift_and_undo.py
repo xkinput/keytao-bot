@@ -2599,8 +2599,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             ([{"role": "assistant", "content": proposal}], True, "奈飞"),
             ([{"role": "assistant", "content": "此前操作曾等待确认，现在是否继续？如需执行请回复「确认」。"}], True, "上一条提议"),
-            ([], False, "当前没有待执行的操作"),
-            ([{"role": "assistant", "content": render_missing_option_ticket([])}], False, "当前没有待执行的操作"),
+            ([], False, "现在没有待确认的操作"),
+            ([{"role": "assistant", "content": render_missing_option_ticket([])}], False, "现在没有待确认的操作"),
         )
         for history, stale, expected in cases:
             with self.subTest(stale=stale, history=history):
@@ -2625,7 +2625,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(ctx.response.splitlines()), 1)
                 self.assertIn(expected, ctx.response)
                 self.assertEqual("已过期或记录已不存在" in ctx.response, stale)
-                self.assertIn("未写入", ctx.response)
+                self.assertEqual("未写入" in ctx.response, bool(history) and history[-1]["content"] != "现在没有待确认的操作。")
                 self.assertIsNone(store.get_record(key))
                 self.assertEqual(render_missing_option_ticket([{"role": "assistant", "content": ctx.response}]), ctx.response)
 
