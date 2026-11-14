@@ -93,6 +93,7 @@ from ..utils.reply_copy import (
     CANDIDATE_CODE_LINE_RE,
     LEGACY_BATCH_PROMPT_MARKERS,
     OPERATION_COMPLETE_PREFIX,
+    UNKNOWN_OCCUPANT_LABEL,
     UNRESOLVED_REVIEW_WORD_RE,
     append_pending_challenge,
     candidate_diagnostic_header_copy,
@@ -12154,7 +12155,7 @@ async def _try_update_pending_pronunciation(
         status = status_map[code]
         label = str(status.get("label") or "").strip()
         if not label:
-            label = "已有占用" if status.get("occupied") else "空位"
+            label = UNKNOWN_OCCUPANT_LABEL if status.get("occupied") else "空位"
         marker = " ✅ 推荐" if code == recommended_code else ""
         lines.append(f"{index}. {code} — {label}{marker}")
     lines.extend((
