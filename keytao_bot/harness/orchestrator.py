@@ -648,6 +648,7 @@ class AgentRequestContext:
     advertised_snapshot_token: str = ""
     actor_is_bound: Optional[bool] = None
     conversation_only: bool = False
+    require_docs_for_tool_free_answer: bool = False
 
     @property
     def actor_key(self) -> tuple:
@@ -1026,6 +1027,7 @@ class AgentOrchestrator:
         current_max_tokens = self._initial_max_tokens(message)
         current_reasoning_effort = "high"
         tool_free_retry_started = False
+        docs_retry_started = False
         turn_metrics = current_turn_metrics()
         prior_model_calls = turn_metrics.model_calls if turn_metrics is not None else 0
         # Routing must never consume the only opportunity to answer the user.
@@ -1534,6 +1536,26 @@ class AgentOrchestrator:
                 f"Model response: finish_reason={finish_reason} "
                 f"tool_calls={tool_call_count} content_len={len(content)} elapsed={elapsed:.1f}s"
             )
+
+            if context.require_docs_for_tool_free_answer and tool_free_turn() and not response_tool_calls:
+                if docs_retry_started:
+                    if termination_state is not None:
+                        termination_state["model_authored_reply"] = False
+                    return "文档里没查到相关说明，请查阅 https://keytao-docs.vercel.app"
+                if finish_reason == "stop" and content.strip():
+                    docs_retry_started = tool_free_retry_started = True
+                    tool_free_model_budget += 1
+                    max_iterations += 1
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "[系统] 当前消息是键道方案概念或规则问题，但本轮尚未调用任何工具。"
+                            "必须先调用 keytao_fetch_docs 查阅相关说明，必要时可调用 keytao_encode，"
+                            "取得工具结果后才能回答。若文档未返回相关说明，必须明确说文档里没查到；"
+                            "不得猜测或补造规则。"
+                        ),
+                    })
+                    continue
 
             reasoning_exhausted = bool(
                 response is not None

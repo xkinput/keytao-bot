@@ -9,7 +9,11 @@ import unicodedata
 from urllib.parse import urlsplit
 
 from .candidate_inventory import protected_candidate_occupants
-from .commonness_copy import candidate_commonness_summary_copy, render_commonness_summary
+from .commonness_copy import (
+    candidate_commonness_comparisons_copy,
+    candidate_commonness_summary_copy,
+    render_commonness_summary,
+)
 from .reply_copy import (
     COMPACT_SINGLE_WORD_FOOTER_RE,
     COMPACT_SELECTION_SUFFIX_RE,
@@ -1621,13 +1625,14 @@ def render_server_backed_batch_candidates(
                 ).splitlines()
             )
         else:
-            comparisons = [candidate_commonness_summary_copy(assessment)
-                         for assessment in ordering_assessments_by_scope[word][:2]
-                         if assessment.get("newWord") == word
-                         and assessment.get("occupantWord") in occupied_words_by_scope[word].get(
-                             assessment.get("occupantCode"), ())]
-            if any(comparisons):
-                lines.append("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line))
+            comparisons = candidate_commonness_comparisons_copy(
+                assessment for assessment in ordering_assessments_by_scope[word][:2]
+                if assessment.get("newWord") == word
+                and assessment.get("occupantWord") in occupied_words_by_scope[word].get(
+                    assessment.get("occupantCode"), ())
+            )
+            if comparisons:
+                lines.append(comparisons)
 
     if include_controls:
         lines.append("回复「加入」或「加入并提交」用推荐码，或「取消」。")
@@ -1844,39 +1849,17 @@ def front_insert_recommendation_copy(
     *,
     include_controls: bool = True,
 ) -> str:
-    """Render one parser-checked recommendation plus its opt-out."""
+    """Render one front-insert recommendation and its free-code alternative."""
     word = str(recommendation.get("newWord") or "").strip()
     occupant = str(recommendation.get("occupantWord") or "").strip()
     occupant_code = str(recommendation.get("occupantCode") or "").strip().lower()
     free_code = str(recommendation.get("freeCode") or "").strip().lower()
     summary = candidate_commonness_summary_copy(recommendation)
-    if not include_controls:
-        lines = [f"推荐调序：「{word}」占 {occupant_code}，「{occupant}」顺延"]
-        if summary:
-            lines.append(summary)
-        if free_code:
-            lines.append(f"不调序备选编码：{free_code}")
-        return "\n".join(lines)
-    command = (
-        f"「{word}」占 {occupant_code}、「{occupant}」顺延"
-    )
-    recommendation_line = render_executable_suggestion(
-        command,
-        words=(word, occupant),
-    )
-    if not recommendation_line:
-        return ""
-    selector = str(fallback_selector or "").strip()
-    opt_out = (
-        f"换 {selector}（{free_code}）。"
-        if selector
-        else f"不调序备选编码：{free_code}。"
-    )
-    lines = ["推荐：", recommendation_line]
+    lines = [f"推荐调序：「{word}」占 {occupant_code}，「{occupant}」顺延"]
     if summary:
         lines.append(summary)
     if free_code:
-        lines.append(opt_out)
+        lines.append(f"不调序备选编码：{free_code}")
     return "\n".join(lines)
 
 
@@ -1950,12 +1933,13 @@ def candidate_commonness_guard_copy(
             and item.get("occupantWord") == occupant
             and item.get("occupantCode") == code
         ), {})
-        comparisons.append(candidate_commonness_summary_copy({
+        comparisons.append({
             **assessment, "newWord": normalized_word,
             "occupantWord": occupant, "freeCode": "",
-        }))
-    if any(comparisons):
-        lines.append("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line))
+        })
+    comparison_copy = candidate_commonness_comparisons_copy(comparisons)
+    if comparison_copy:
+        lines.append(comparison_copy)
     if include_controls:
         base_code = str(candidates[0][0]) if candidates else ""
         lines.append(f"当前候选没有空位；可指定形码后的完整编码，格式为：加入编码 {base_code}+形码（请替换形码部分）。")
@@ -2115,17 +2099,19 @@ def render_server_backed_single_word_candidates(
             )
         )
     elif recommended:
-        comparisons = [candidate_commonness_summary_copy({
-                         **assessment,
-                         "freeCode": recommended if dict(normalized_candidates)[recommended] is False else "",
-                     })
-                     for assessment in (ordering_assessments or [])[:2]
-                     if isinstance(assessment, dict)
-                     and assessment.get("newWord") == normalized_word
-                     and assessment.get("occupantWord") in occupied_words.get(
-                         assessment.get("occupantCode"), ())]
-        if any(comparisons):
-            lines.append("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line))
+        comparisons = candidate_commonness_comparisons_copy(
+            {
+                **assessment,
+                "freeCode": recommended if dict(normalized_candidates)[recommended] is False else "",
+            }
+            for assessment in (ordering_assessments or [])[:2]
+            if isinstance(assessment, dict)
+            and assessment.get("newWord") == normalized_word
+            and assessment.get("occupantWord") in occupied_words.get(
+                assessment.get("occupantCode"), ())
+        )
+        if comparisons:
+            lines.append(comparisons)
     else:
         lines.append(guard_copy)
     if include_controls and recommended:
@@ -2252,15 +2238,24 @@ def render_server_backed_single_word_lookup(
         if source.startswith(f"「{normalized_word}」未收录："):
             body = strip_legacy_occupied_guidance(COMPACT_SINGLE_WORD_FOOTER_RE.sub("", source)).rstrip()
         reorder_copy = re.search(
-            rf"(?m)^\s*推荐[：:]\s*\n"
-            rf"\s*[-•]\s*[“『]「{re.escape(normalized_word)}」\s*占\s*"
-            rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延[”』]"
-            rf"(?:\s*[（(][^）)\n]*[）)])?\s*\n"
-            rf"(?:\s*(?:依据|词频)[：:][^\n]*\n)?"
-            r"\s*(?:不重排选|换)\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
+            rf"(?m)^[ \t]*推荐调序[：:][ \t]*「{re.escape(normalized_word)}」\s*占\s*"
+            rf"{re.escape(recommended)}\s*[，,]\s*「[^」\n]+」顺延[ \t]*"
+            r"(?:\n[ \t]*词频[：:][^\n]*)?"
+            r"(?:\n[ \t]*不调序备选编码[：:][a-z]{1,12})?",
             source,
             re.IGNORECASE,
         )
+        if reorder_copy is None:
+            reorder_copy = re.search(
+                rf"(?m)^\s*推荐[：:]\s*\n"
+                rf"\s*[-•]\s*[“『]「{re.escape(normalized_word)}」\s*占\s*"
+                rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延[”』]"
+                rf"(?:\s*[（(][^）)\n]*[）)])?\s*\n"
+                rf"(?:\s*(?:依据|词频)[：:][^\n]*\n)?"
+                r"\s*(?:不重排选|换)\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
+                source,
+                re.IGNORECASE,
+            )
         if reorder_copy is None:
             reorder_copy = re.search(
                 rf"(?m)^\s*推荐[：:]\s*「{re.escape(normalized_word)}」\s*占\s*"
@@ -2270,20 +2265,25 @@ def render_server_backed_single_word_lookup(
                 re.IGNORECASE,
             )
         if reorder_copy is not None:
-            if include_controls:
-                body = source[:reorder_copy.end()].rstrip()
-            else:
-                recommendation = validated_front_insert_recommendation(
-                    normalized_word, candidates, occupied_words, ordering_assessments,
-                )
-                if recommendation is None:
-                    return ""
-                body = "\n".join((
-                    source[:reorder_copy.start()].rstrip(),
-                    front_insert_recommendation_copy(
-                        recommendation, include_controls=False,
-                    ),
-                ))
+            recommendation = validated_front_insert_recommendation(
+                normalized_word, candidates, occupied_words, ordering_assessments,
+            )
+            if recommendation is None:
+                return ""
+            recommendation_lines = front_insert_recommendation_copy(
+                recommendation, include_controls=include_controls,
+            ).splitlines()
+            source_frequency = next((
+                line.strip().split("；", 1)[0]
+                for line in source[reorder_copy.start():reorder_copy.end()].splitlines()
+                if line.strip().startswith("词频：")
+            ), "")
+            if source_frequency and not any(line.startswith("词频：") for line in recommendation_lines):
+                recommendation_lines.insert(1, source_frequency)
+            body = "\n".join((
+                source[:reorder_copy.start()].rstrip(),
+                *recommendation_lines,
+            ))
             has_reorder_copy = True
         else:
             confirmation = re.search(
@@ -2306,6 +2306,14 @@ def render_server_backed_single_word_lookup(
             body = re.sub(
                 r"（回复[「“『][^」”』]+[」”』]执行）",
                 "",
+                body,
+            )
+            frequency_copy = next((
+                line for line in actionable.splitlines() if line.startswith("词频：")
+            ), "")
+            body = re.sub(
+                r"(?m)^词频[：:][^\n]*$",
+                lambda match: frequency_copy or match[0].split("；", 1)[0],
                 body,
             )
     if not body:

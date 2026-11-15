@@ -7403,7 +7403,7 @@ class MutationAuthorizationTests(unittest.TestCase):
             _canonical_draft_management_command('他说「撤回」')
         )
 
-    def test_every_front_insert_recommendation_line_round_trips(self) -> None:
+    def test_front_insert_recommendation_is_clean_display_copy(self) -> None:
         rendered = front_insert_recommendation_copy({
             "newWord": "洞洞鞋",
             "occupantWord": "多段线",
@@ -7411,20 +7411,11 @@ class MutationAuthorizationTests(unittest.TestCase):
             "freeCode": "ddxu",
             "summary": "「洞洞鞋」更常用",
         }, 2)
-        recommendation_lines = [
-            line for line in rendered.splitlines()
-            if "占 ddx" in line or "顺延" in line
-        ]
-        self.assertEqual(len(recommendation_lines), 1)
-        for line in recommendation_lines:
-            with self.subTest(line=line):
-                self.assertTrue(message_authorizes_mutation(line))
-                parsed = parse_eviction_modified_add(line)
-                self.assertIsNotNone(parsed)
-                self.assertEqual(
-                    (parsed.word, parsed.code, parsed.named_occupant),
-                    ("洞洞鞋", "ddx", "多段线"),
-                )
+        self.assertEqual(rendered.splitlines(), [
+            "推荐调序：「洞洞鞋」占 ddx，「多段线」顺延",
+            "不调序备选编码：ddxu",
+        ])
+        self.assertEqual(advertised_command_suggestions(rendered), ())
 
     def test_positional_reorder_accepts_spacing_verbs_and_bound_eviction_tail(self) -> None:
         verbatim = "把 幂等 放到 米等 前面，米等顺延到下一个空位"

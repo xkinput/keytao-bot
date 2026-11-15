@@ -80,7 +80,7 @@ from ..harness.tools import (
 from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.draft_mutation_store import get_default_draft_mutation_claim_store
 from ..utils.candidate_inventory import select_candidate_inventory, protected_candidate_occupants
-from ..utils.commonness_copy import candidate_commonness_summary_copy, render_commonness_summary
+from ..utils.commonness_copy import candidate_commonness_comparisons_copy, render_commonness_summary
 from ..utils.explicit_code import (
     ExplicitEntryCodeRequest,
     parse_explicit_code_request,
@@ -432,8 +432,8 @@ def _parse_pending_add_word(
         if inventory is not None and list(inventory.candidates) == candidates and all(
             inventory.readings.get(code)
             and (not pronunciation_codes.get(code)
-                 or pronunciation_codes[code] == inventory.readings[code])
-            and (not displayed_pinyin or displayed_pinyin == inventory.readings[code])
+                 or pronunciation_codes[code].casefold() == inventory.readings[code].casefold())
+            and (not displayed_pinyin or displayed_pinyin.casefold() == inventory.readings[code].casefold())
             for code, _occupied in candidates
         ):
             structured_review = review
@@ -666,16 +666,16 @@ def _protected_eviction_response(
                                              for word in occupants)), "")
     base = next(iter(state.server_candidates), ("", False))[0]
     suggestions = "\n".join(f"- 「加入，顶替 {word}」" for word in occupants)
-    comparisons = [candidate_commonness_summary_copy(assessment)
-                   for assessment in state.server_ordering_assessments
-                   if assessment.get("newWord") == state.word
-                   and assessment.get("occupantWord") in occupants
-                   and assessment.get("occupantCode") == code]
+    comparisons = candidate_commonness_comparisons_copy(
+        assessment for assessment in state.server_ordering_assessments
+        if assessment.get("newWord") == state.word
+        and assessment.get("occupantWord") in occupants
+        and assessment.get("occupantCode") == code
+    )
     return (
         "、".join(f"「{word}」" for word in occupants)
         + f"不弱于「{state.word}」，{code} 保留原位，未写入。\n"
-        + ("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line) + "\n"
-           if any(comparisons) else "")
+        + (comparisons + "\n" if comparisons else "")
         + ("要顶替回复：\n" + suggestions + "\n" if suggestions else "")
         + f"或指定完整码，格式为：加入编码 {base}+形码，或「取消」。"
     )
@@ -953,7 +953,7 @@ def _batch_review_remark(
         review_text = (
             _structured_add_review_text(review, selected_code)
             if inventory is not None and selected_code in dict(inventory.candidates)
-            and (not displayed_pinyin or inventory.readings.get(selected_code) == displayed_pinyin)
+            and (not displayed_pinyin or inventory.readings.get(selected_code, "").casefold() == displayed_pinyin.casefold())
             else ""
         )
     else:

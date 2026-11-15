@@ -2,6 +2,7 @@
 
 import math
 from decimal import Decimal, ROUND_CEILING
+from typing import Iterable
 
 
 def render_commonness_summary(assessment: dict) -> str:
@@ -115,3 +116,19 @@ def render_commonness_comparison(assessment: dict) -> str:
 def candidate_commonness_summary_copy(assessment: dict) -> str:
     comparison = render_commonness_comparison(assessment)
     return f"词频：{comparison}" if comparison else ""
+
+
+def candidate_commonness_comparisons_copy(assessments: Iterable[dict]) -> str:
+    """Keep one decision metric and new-word value across joined comparisons."""
+    comparisons = []
+    first_snapshot = None
+    for assessment in assessments:
+        comparison = render_commonness_comparison(assessment)
+        reason = str(assessment.get("decisionReason") or "").removesuffix("_below_threshold")
+        snapshot = (reason, assessment.get("webFallback") is True,
+                    comparison_frequency_values(assessment)[0])
+        if not comparison or (comparisons and snapshot != first_snapshot):
+            continue
+        first_snapshot = snapshot
+        comparisons.append(comparison)
+    return "词频：" + "；".join(comparisons) if comparisons else ""

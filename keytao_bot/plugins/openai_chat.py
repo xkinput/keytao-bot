@@ -1602,6 +1602,29 @@ def _private_help_reply(message: str, space_type: str) -> Optional[str]:
     return None
 
 
+def _is_scheme_concept_question(message: str) -> bool:
+    """Keep the documentation correction on scheme questions, not word facts."""
+    source = unicodedata.normalize("NFKC", _strip_command_message_prefixes(message)).strip()
+    return bool(
+        re.search(r"有啥用|有什么用|是什么|什么意思|为什么|怎么(?:打|编|拆|用)|规则|[?？]", source)
+        and re.search(
+            r"键道|编码|拆分|二分|字根|音码|形码|简码|顶功|声母|韵母|候选|上屏|"
+            r"lua|单字模式|规则|(?:^|\s)[a-z](?=\s|的|是|有|怎)",
+            source, re.IGNORECASE,
+        )
+        and not _chat_routing.is_conversational_text(source)
+        and not re.match(r"^(?:查词|查询词条|查询|查一下|查(?:\s|[:：]))", source)
+        and not (
+            _chat_routing._is_explicit_code_question(source)
+            and not source.startswith(("怎么", "如何"))
+            and not re.search(r"键道|字根|音码|形码|简码|顶功|规则|单字|词组|二分", source)
+        )
+        and not message_authorizes_mutation(source)
+        and not _authorization_grammar.looks_like_mutation_grammar_gap(source)
+        and _structural_draft_management_intent(source) is None
+    )
+
+
 async def get_ai_response_core(
     message: str,
     platform: str,
@@ -1619,6 +1642,7 @@ async def get_ai_response_core(
     released_pending_turn: bool = False,
     preserve_pending: bool = False,
     conversation_only: bool = False,
+    docs_guard_allowed: bool = True,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
 
@@ -1712,7 +1736,16 @@ async def get_ai_response_core(
             if memory_context is not None
             else ConversationAddress.private(platform, user_id)
         )
-        live_record = None if preserve_pending else conversation_state_store.get_record(actor_address)
+        actor_record = conversation_state_store.get_record(actor_address)
+        live_record = None if preserve_pending else actor_record
+        require_docs = bool(
+            platform == "qq" and docs_guard_allowed and not visual_context
+            and actor_record is None
+            and draft_operation_coordinator.get(actor_address) is None
+            and not resolved_advertised_words
+            and (command_intent is None or command_intent.intent == "none")
+            and _is_scheme_concept_question(message)
+        )
         live_pending_authorizes_mutation = bool(
             live_record is not None
             and not live_record.execution_id
@@ -1748,7 +1781,8 @@ async def get_ai_response_core(
                 progress_reporter=progress_reporter,
                 resolved_advertised_words=resolved_advertised_words,
                 advertised_snapshot_token=advertised_snapshot_token,
-                conversation_only=conversation_only or _current_conversational_turn.get() is not None,
+                conversation_only=(conversation_only or _current_conversational_turn.get() is not None) and not require_docs,
+                require_docs_for_tool_free_answer=require_docs,
             ),
             max_iterations=max_iterations,
         )
@@ -7669,6 +7703,13 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
                 emit_metrics=False,
             )
 
+        docs_guard_allowed = bool(
+            ctx.platform == "qq" and _is_scheme_concept_question(ctx.normalized_message_text)
+            and not (ctx.current_pending_record or ctx.scoped_pending_state or ctx.referenced_pending)
+            and not (ctx.simple_word_query_words or ctx.resolved_advertised_words or ctx.message_is_prefixed_fresh_word_query)
+            and getattr(ctx.operation_request, "op", "chat") in {"chat", "help", "other"}
+            and await to_me()(ctx.bot, ctx.event, {})
+        )
         ctx.response = await get_ai_response_core(
             ctx.normalized_message_text,
             ctx.platform,
@@ -7681,6 +7722,7 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
             preserve_pending=getattr(ctx, "semantic_pending_released", False),
             resolved_advertised_words=ctx.resolved_advertised_words,
             advertised_snapshot_token=ctx.advertised_snapshot_token,
+            docs_guard_allowed=docs_guard_allowed,
             command_intent=(
                 ctx.generic_command_intent if _current_conversational_turn.get() is not None
                 else replace(ctx.generic_command_intent, has_operation_intent=None)

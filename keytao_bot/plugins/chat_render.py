@@ -21,7 +21,7 @@ from ..harness.state import (
 )
 from ..utils import review_flags
 from ..utils import http_client
-from ..utils.commonness_copy import candidate_commonness_summary_copy
+from ..utils.commonness_copy import candidate_commonness_comparisons_copy, candidate_commonness_summary_copy
 from ..utils.draft_receipts import compact_receipt_summary, merge_receipt_deltas, receipt_change_lines
 from ..utils.reply_copy import (
     AUTHORITATIVE_LINK_END_RE,
@@ -703,7 +703,7 @@ def _format_pending_candidate_review_details(state: PendingAddWord) -> str:
     for code, _occupied in state.server_candidates:
         reading = state.pronunciation_codes.get(code)
         if isinstance(reading, str) and reading.strip():
-            reading_codes.setdefault(reading.strip(), []).append(code)
+            reading_codes.setdefault(reading.strip().lower(), []).append(code)
     if state.needs_manual_review is None:
         return f"「{state.word}」未收录：{' / '.join(reading_codes) or '待确认'}，预审未完成"
     sources = []
@@ -1472,7 +1472,7 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
 
 
 def _compact_review_header(review: Dict, pronunciation: Dict, preview: Optional[str]) -> str:
-    pinyin = str(pronunciation.get("pinyin") or "待确认").strip()
+    pinyin = str(pronunciation.get("pinyin") or "待确认").strip().lower()
     if preview and "可自动通过" in preview:
         sources = [source for source in pronunciation.get("sources", []) if isinstance(source, dict)]
         sources.sort(key=lambda source: source.get("category") not in {"dictionary", "encyclopedia"})
@@ -1663,13 +1663,13 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             )
         )
     elif ordering_assessments and not guard_copy:
-        comparisons = [
-            candidate_commonness_summary_copy(assessment).removeprefix("词频：")
+        comparisons = candidate_commonness_comparisons_copy(
+            assessment
             for assessment in ordering_assessments
             if assessment.get("verdict") != "front_more_common"
-        ]
-        if any(comparisons):
-            lines.append("词频：" + "；".join(filter(None, comparisons)))
+        )
+        if comparisons:
+            lines.append(comparisons)
     if guard_copy:
         lines.append(guard_copy)
     if not guard_copy:

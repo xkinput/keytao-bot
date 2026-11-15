@@ -3716,7 +3716,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
             "word": "射覆",
             "recommendedCode": "eefju",
             "pronunciations": [{
-                "pinyin": "she fu",
+                "pinyin": "Shè Fù",
                 "recommendedCode": "eefju",
                 "sources": [{"source": "汉典"}],
                 "candidateStatuses": [
@@ -3751,6 +3751,8 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
                 "freeCode": "eefju",
                 "newCode": new_code,
                 "recommendedCode": new_code,
+                "frontFrequency": "382",
+                "behindFrequency": "141",
             }],
         }
 
@@ -3758,10 +3760,26 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     behind_prompt = _format_reviewed_add_prompt(review_for("behind_more_common")) or ""
     insufficient_prompt = _format_reviewed_add_prompt(review_for("not_enough_evidence")) or ""
     check(
-        "front branch has one coherent executable recommendation",
-        "- “「射覆」占 eefj、「慑服」顺延”（射覆、慑服）" in front_prompt
-        and "换 2（eefju）" in front_prompt
+        "front branch has one coherent reorder recommendation",
+        "推荐调序：「射覆」占 eefj，「慑服」顺延" in front_prompt
+        and "不调序备选编码：eefju" in front_prompt
+        and "推荐：" not in front_prompt
+        and "换 2（eefju）。" not in front_prompt
         and "回复「1 重新编码」执行" not in front_prompt,
+    )
+    check(
+        "candidate header lowercases pronunciation for display only",
+        "「射覆」未收录：shè fù，" in front_prompt
+        and review_for("front_more_common")["pronunciations"][0]["pinyin"] == "Shè Fù",
+    )
+    structured = _parse_pending_add_word(front_prompt, review_for("front_more_common"))
+    check(
+        "lowercase display preserves authoritative readings and review remarks",
+        structured is not None and structured.pronunciation_codes.get("eefj") == "Shè Fù"
+        and "来源 汉典" in structured.code_remarks.get("eefj", "")
+        and "来源 汉典" in chat_commands_module._batch_review_remark(
+            front_prompt, "射覆", review_for("front_more_common"), "eefj",
+        ),
     )
     check(
         "front branch keeps the free slot only as the opt-out",
@@ -3823,10 +3841,8 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
                 "qq",
                 "commonness-user",
                 [],
-                command_intent=MessageCommandIntent(
-                    intent="pending_add_and_submit",
-                    confidence=1.0,
-                    submit_after=True,
+                command_intent=chat_routing_module._structural_pending_add_word_intent(
+                    "加入并提交", parsed,
                 ),
             )
         check("bare add-submit stages the recommended reorder", result == "sealed reorder")
@@ -3853,15 +3869,33 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
                 "qq",
                 "commonness-user",
                 [],
-                command_intent=MessageCommandIntent(
-                    intent="pending_confirm",
-                    confidence=1.0,
+                command_intent=chat_routing_module._structural_pending_add_word_intent(
+                    "加入", parsed,
                 ),
             )
         check("bare add also stages the recommended reorder", bare_add_result == "sealed reorder only")
         check(
             "bare add does not implicitly submit",
             bare_add_shift.await_args.kwargs.get("submit_after") is False,
+        )
+
+        changed_add = AsyncMock(return_value="free code added")
+        with (
+            patch.object(chat_commands_module, "_execute_add_to_draft", changed_add),
+            patch.object(chat_commands_module, "_execute_shift_to_code", AsyncMock(
+                side_effect=AssertionError("shifted explicit opt-out"),
+            )),
+        ):
+            changed = await _handle_pending_add_word(
+                parsed, "换 2", "qq", "commonness-user", [],
+                command_intent=chat_routing_module._structural_pending_add_word_intent(
+                    "换 2", parsed,
+                ),
+            )
+        check(
+            "switch 2 binds the free code without reordering",
+            changed == "free code added" and changed_add.await_count == 1
+            and changed_add.await_args.args[:2] == ("射覆", "eefju"),
         )
 
         fallback_add = AsyncMock(return_value="fallback added")
@@ -3942,6 +3976,67 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         )
 
     asyncio.run(_assert_assent_defaults())
+
+    from keytao_bot.utils.pending_confirmation import render_server_backed_single_word_lookup
+
+    legacy_prompt = front_prompt.replace(
+        "推荐调序：「射覆」占 eefj，「慑服」顺延",
+        "推荐：\n- “「射覆」占 eefj、「慑服」顺延”（射覆、慑服）",
+    ).replace("不调序备选编码：eefju", "换 2（eefju）。")
+
+    async def _assert_live_reorder_guidance():
+        store = MemoryConversationStateStore()
+        conv_key = ("qq", "reorder-guidance-user")
+        store.set(conv_key, PendingAddWord(
+            word="射覆", recommended_code="eefj",
+            candidates=[("eefj", True), ("eefju", False)],
+            server_candidates=[("eefj", True), ("eefju", False)],
+            occupied_words={"eefj": ["慑服"]},
+        ))
+        with patch.object(openai_chat_module, "conversation_state_store", store):
+            for name, prompt in (("current", front_prompt), ("legacy", legacy_prompt)):
+                ctx = openai_chat_module.TurnContext(
+                    bot=None, event=None, platform="qq", user_id=conv_key[1],
+                    conv_key=conv_key, normalized_message_text="加词 射覆", response=prompt,
+                )
+                await openai_chat_module._stage_normalize_response(ctx)
+                check(
+                    f"{name} live reorder card omits conflicting occupied controls",
+                    openai_chat_module._reply_carries_live_candidate_state(
+                        prompt, store.get_record(conv_key),
+                    )
+                    and "直接回复“1”表示添加重码" not in ctx.response
+                    and "1 重新编码" not in ctx.response,
+                )
+
+    asyncio.run(_assert_live_reorder_guidance())
+
+    legacy_redraw = render_server_backed_single_word_lookup(
+        "射覆", "eefj", [("eefj", True), ("eefju", False)], {"eefj": ["慑服"]},
+        reviewed_prompt=legacy_prompt,
+        ordering_assessments=review_for("front_more_common")["candidateOrderingAssessments"],
+        actionable_controls=True,
+    )
+    check(
+        "legacy reorder redraw also uses clean copy",
+        "推荐调序：「射覆」占 eefj，「慑服」顺延" in legacy_redraw
+        and "不调序备选编码：eefju" in legacy_redraw
+        and "推荐：" not in legacy_redraw and "换 2（eefju）。" not in legacy_redraw,
+    )
+    rich_prompt = front_prompt.replace(
+        front_prompt.splitlines()[0], "词库暂无收录「射覆」：\n审词：读音 Shè Fù；来源 汉典；",
+    )
+    rich_redraw = render_server_backed_single_word_lookup(
+        "射覆", "eefj", [("eefj", True), ("eefju", False)], {"eefj": ["慑服"]},
+        reviewed_prompt=rich_prompt,
+        ordering_assessments=review_for("front_more_common")["candidateOrderingAssessments"],
+        actionable_controls=True,
+    )
+    check(
+        "clean reorder redraw preserves the review header and one footer",
+        "审词：读音 Shè Fù；来源 汉典；" in rich_redraw
+        and rich_redraw.count("回复「加入」或「加入并提交」") == 1,
+    )
 
     ordering_by_word = {}
     candidate_slots = {}
@@ -4031,8 +4126,11 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         check(
             "presentation returns the coherent ordering recommendation",
             response is not None
-            and "- “「射覆」占 eefj、「慑服」顺延”（射覆、慑服）" in response
-            and "换 2（eefju）" in response
+            and "推荐调序：「射覆」占 eefj，「慑服」顺延" in response
+            and "不调序备选编码：eefju" in response
+            and "词频：射覆 382 > 慑服 141" in response
+            and "推荐：" not in response
+            and "换 2（eefju）。" not in response
             and "推荐编码：" not in response
             and advertised_single_word_lookup_codes(response)
             == ("eefj", "eefju"),
@@ -4059,6 +4157,74 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         )
 
     asyncio.run(_run())
+
+
+def test_candidate_cards_keep_one_commonness_metric_snapshot():
+    """Do not mix dictionary counts and BCC rates for the same new word."""
+    print("\n🧪 candidate comparisons keep one new-word metric snapshot")
+    from keytao_bot.utils.pending_confirmation import (
+        render_server_backed_single_word_candidates,
+        render_server_backed_single_word_lookup,
+    )
+
+    assessments = [
+        {
+            "newWord": "海东青", "occupantWord": "很多钱", "occupantCode": "hdq",
+            "verdict": "behind_more_common", "decisionReason": "dictionary_presence_margin",
+            "front": {"reference": {"dictionaryPresenceCount": 6}}, "behind": {},
+        },
+        {
+            "newWord": "海东青", "occupantWord": "红灯区", "occupantCode": "hdqu",
+            "verdict": "behind_more_common", "decisionReason": "bcc_modern_margin",
+            "front": {"bcc": {"channels": [{"count": 6, "perMillion": 0.014859}]}},
+            "behind": {"bcc": {"channels": [{"count": 100, "perMillion": 0.28324}]}},
+        },
+    ]
+    candidates = [("hdq", True), ("hdqu", True), ("hdqiu", False)]
+    occupants = {"hdq": ["很多钱"], "hdqu": ["红灯区"]}
+    review = {
+        "success": True, "word": "海东青", "recommendedCode": "hdqiu",
+        "pronunciations": [{
+            "pinyin": "hǎi dōng qīng", "recommendedCode": "hdqiu",
+            "candidateStatuses": [
+                {"code": code, "occupied": occupied, "words": occupants.get(code, [])}
+                for code, occupied in candidates
+            ],
+        }],
+        "candidateOrderingAssessments": assessments,
+    }
+    for name, text in (
+        ("reviewed card", _format_reviewed_add_prompt(review)),
+        ("server-backed card", render_server_backed_single_word_candidates(
+            "海东青", "hdqiu", candidates, occupants, assessments,
+        )),
+    ):
+        frequency = next((line for line in (text or "").splitlines() if line.startswith("词频：")), "")
+        check(f"{name} keeps only the first metric", frequency == "词频：海东青 6 > 很多钱 无")
+    equal_value = copy.deepcopy(assessments)
+    equal_value[1]["front"]["bcc"]["channels"][0]["perMillion"] = 6
+    same_number_card = render_server_backed_single_word_candidates(
+        "海东青", "hdqiu", candidates, occupants, equal_value,
+    )
+    check(
+        "equal new-word numbers with different metrics are not joined",
+        next(line for line in same_number_card.splitlines() if line.startswith("词频："))
+        == "词频：海东青 6 > 很多钱 无",
+    )
+    legacy_prompt = (_format_reviewed_add_prompt(review) or "").replace(
+        "词频：海东青 6 > 很多钱 无",
+        "词频：海东青 6 > 很多钱 无；红灯区 0.28324 > 海东青 0.014859",
+    )
+    legacy_card = render_server_backed_single_word_lookup(
+        "海东青", "hdqiu", candidates, occupants,
+        reviewed_prompt=legacy_prompt, ordering_assessments=assessments,
+        actionable_controls=True,
+    )
+    check(
+        "legacy reviewed prompt does not restore mixed metrics",
+        next(line for line in legacy_card.splitlines() if line.startswith("词频："))
+        == "词频：海东青 6 > 很多钱 无",
+    )
 
 
 def test_recommended_reorder_submit_chains_after_one_plan_confirmation():
@@ -23449,6 +23615,7 @@ if __name__ == "__main__":
     test_plain_query_then_bare_add_and_submit_uses_first_render_record()
     test_s38_query_candidate_controls_all_use_record_first_recovery()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
+    test_candidate_cards_keep_one_commonness_metric_snapshot()
     test_recommended_reorder_submit_chains_after_one_plan_confirmation()
     test_explicit_add_word_query_uses_review_tool_before_ai()
     test_incomplete_shift_modified_add_preserves_compound_refusal()

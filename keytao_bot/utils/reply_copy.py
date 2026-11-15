@@ -503,8 +503,14 @@ def strip_legacy_occupied_guidance(text):
 
 def has_reorder_choice_copy(text):
     return bool(
-        re.search(r"(?m)^\s*推荐[：:](?:.+顺延(?:[；;].*)?|\s*\n[-•].+顺延.+)$", text)
-        and re.search(r"(?m)^\s*(?:不重排选|换)\s+\d+", text)
+        (
+            re.search(r"(?m)^\s*推荐[：:](?:.+顺延(?:[；;].*)?|\s*\n[-•].+顺延.+)$", text)
+            and re.search(r"(?m)^\s*(?:不重排选|换)\s+\d+", text)
+        )
+        or (
+            re.search(r"(?m)^\s*推荐调序[：:].+顺延[ \t]*$", text)
+            and re.search(r"(?m)^\s*不调序备选编码[：:]\s*[a-z]+", text)
+        )
     )
 
 
