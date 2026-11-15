@@ -5,7 +5,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -40,6 +40,22 @@ def submitted_data():
             "id": 1, "action": "Create", "word": "开团", "code": "khtt", "type": "Phrase",
         }],
     }
+
+
+@contextmanager
+def approval_http(status=200, payload=None, error=None):
+    payload = {"success": True, "voters": ["甲", "乙", "丙"]} if payload is None else payload
+    response = SimpleNamespace(status_code=status, is_success=200 <= status < 300, json=lambda: payload)
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.post.side_effect = error
+    client.post.return_value = response
+    with (
+        patch.object(harness._draft_tools.httpx, "AsyncClient", return_value=client, create=True),
+        patch.object(harness._draft_tools, "get_keytao_url", return_value="https://keytao.test"),
+        patch.object(harness._draft_tools, "get_bot_headers", return_value={"X-Test": "signed"}) as headers,
+    ):
+        yield client.post, headers
 
 
 class ReceiptTests(unittest.TestCase):
@@ -128,12 +144,14 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
         self.db_path = Path(self.tmp.name) / "community-votes.db"
         self.store = vote.CommunityVoteStore(self.db_path)
         self.assertTrue(self.store.bind_receipt(submitted_data(), "qq", "creator", "group", "receipt"))
-        users = {
+        self.users = {
             "creator": {"id": 100}, "creator-alt": {"id": 100},
             "one": {"id": 1}, "one-alt": {"id": 1},
             "two": {"id": 2}, "three": {"id": 3}, "four": {"id": 4},
+            "admin": {"id": 5, "roles": [{"value": "R:MANAGER", "name": "管理员"}]},
+            "admin-alt": {"id": 5, "roles": [{"value": "R:ROOT", "name": "超级管理员"}]},
         }
-        self.lookup = AsyncMock(side_effect=lambda _platform, user_id: users.get(user_id))
+        self.lookup = AsyncMock(side_effect=lambda _platform, user_id: self.users.get(user_id))
         self.approve = AsyncMock(return_value={"success": True, "voters": ["甲", "乙", "丙"]})
 
     async def cast(self, user_id, name=None, **kwargs):
@@ -170,6 +188,146 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.cast("one-alt"), "你已经投过了（1/3）")
         self.assertEqual(len(self.store.get(BATCH_ID)["voters"]), 1)
         self.approve.assert_not_awaited()
+
+    async def test_admin_single_vote_approves_with_admin_copy(self):
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        for version, role in enumerate(("R:ROOT", "R:MANAGER"), 8):
+            with self.subTest(role=role):
+                self.users["admin"]["roles"][0]["value"] = role
+                self.store.bind_receipt({**submitted_data(), "contentVersion": version},
+                                        "qq", "creator", "group", role)
+                with approval_http(payload={"success": True, "approvedBy": "admin", "voters": ["甲"]}) as (post, _):
+                    self.assertEqual(await self.cast("admin", "甲", message_id=role),
+                                     f"管理员 甲 同意，批次已加入词库，投票结束。\n草稿地址：{BATCH_URL}")
+                post.assert_awaited_once()
+                body = json.loads(post.await_args.kwargs["content"])
+                self.assertEqual(body["voters"], [{"platform": "qq", "platformId": "admin"}])
+                self.assertEqual(body["expectedContentVersion"], version)
+                self.assertEqual(self.store.get(BATCH_ID)["status"], "approved")
+                self.assertEqual(self.store.get(BATCH_ID)["attempts"], 1)
+                self.assertEqual(await self.cast("admin", message_id=role), "投票已结束。")
+
+    async def test_admin_keeps_prior_non_admin_vote(self):
+        await self.cast("one", "甲")
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        with approval_http(payload={"success": True, "approvedBy": "admin", "voters": ["甲", "乙"]}) as (post, _):
+            self.assertEqual(await self.cast("admin", "乙"),
+                             f"管理员 乙 同意，批次已加入词库，投票结束。\n草稿地址：{BATCH_URL}")
+        self.assertEqual(json.loads(post.await_args.kwargs["content"])["voters"], [
+            {"platform": "qq", "platformId": "one"}, {"platform": "qq", "platformId": "admin"},
+        ])
+
+    async def test_non_admin_role_still_requires_three_votes(self):
+        self.users["one"]["roles"] = [{"value": "R:USER", "name": "管理员"}]
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        with approval_http() as (post, _):
+            self.assertEqual(await self.cast("one", "甲"),
+                             f"@甲 已记录同意。\n草稿地址：{BATCH_URL}\n当前投票：1/3\n同意：甲")
+        post.assert_not_awaited()
+
+    async def test_admin_creator_and_bound_alias_are_rejected(self):
+        for user_id in ("creator", "creator-alt"):
+            self.users[user_id]["roles"] = [{"value": "R:ROOT", "name": "管理员"}]
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        with approval_http() as (post, _):
+            for user_id in ("creator", "creator-alt"):
+                self.assertEqual(await self.cast(user_id), "提交人不能为自己投票")
+        post.assert_not_awaited()
+        self.assertEqual(self.store.get(BATCH_ID)["voters"], [])
+        self.assertEqual(self.store.get(BATCH_ID)["attempts"], 0)
+
+    async def test_admin_retryable_failure_keeps_open_and_retry_deduplicates_voters(self):
+        await self.cast("one")
+        data = self.store.get(BATCH_ID)
+        data["voters"].append({**data["voters"][0], "platformId": "one-alt"})
+        self.store.save(data)
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        with approval_http(503, {"success": False}) as (post, _):
+            pending = await self.cast("admin", "甲")
+        self.assertIn("请再次回复同意重试", pending)
+        self.assertNotIn("3/3", pending)
+        self.assertEqual(self.store.get(BATCH_ID)["status"], "open")
+        self.assertEqual(self.store.get(BATCH_ID)["attempts"], 1)
+        self.assertEqual(len(self.store.get(BATCH_ID)["voters"]), 2)
+        post.assert_awaited_once()
+        with approval_http(payload={"success": True, "approvedBy": "admin", "voters": ["one", "甲"]}) as (post, _):
+            self.assertEqual(await self.cast("admin-alt", "甲"),
+                             f"管理员 甲 同意，批次已加入词库，投票结束。\n草稿地址：{BATCH_URL}")
+        self.assertEqual(json.loads(post.await_args.kwargs["content"])["voters"], [
+            {"platform": "qq", "platformId": "one-alt"}, {"platform": "qq", "platformId": "admin-alt"},
+        ])
+        self.assertEqual(self.store.get(BATCH_ID)["attempts"], 2)
+
+    async def test_admin_transport_failure_retries_only_once_after_restart(self):
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        with approval_http(error=TimeoutError("uncertain write")) as (post, _):
+            self.assertIn("请再次回复同意重试", await self.cast("admin"))
+            self.assertIn("请等待管理员处理", await self.cast("admin"))
+            self.store = vote.CommunityVoteStore(self.db_path)
+            await self.cast("admin")
+            self.assertEqual(post.await_count, 2)
+        data = self.store.get(BATCH_ID)
+        self.assertEqual((data["status"], data["attempts"], len(data["voters"])), ("open", 2, 1))
+
+    async def test_concurrent_admin_reply_cannot_retry_in_progress_approval(self):
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        for status in (200, 503):
+            with self.subTest(status=status):
+                self.store = vote.CommunityVoteStore(Path(self.tmp.name) / f"admin-race-{status}.db")
+                self.store.bind_receipt(submitted_data(), "qq", "creator", "group", "receipt")
+                entered, release = asyncio.Event(), asyncio.Event()
+                with approval_http(status, {"success": status == 200, "approvedBy": "admin"}) as (post, _):
+                    async def delayed_post(*_args, **_kwargs):
+                        entered.set()
+                        await release.wait()
+                        return post.return_value
+
+                    post.side_effect = delayed_post
+                    first = asyncio.create_task(self.cast("admin"))
+                    await asyncio.wait_for(entered.wait(), 2)
+                    second = asyncio.create_task(self.cast("admin-alt"))
+                    await asyncio.sleep(0)
+                    self.assertFalse(second.done())
+                    release.set()
+                    replies = await asyncio.wait_for(asyncio.gather(first, second), 2)
+                post.assert_awaited_once()
+                self.assertEqual(self.store.get(BATCH_ID)["attempts"], 1)
+                if status == 200:
+                    self.assertEqual(replies[1], "投票已结束。")
+                else:
+                    self.assertTrue(all("请再次回复同意重试" in reply for reply in replies))
+
+    async def test_admin_server_refusal_ends_vote_with_server_message(self):
+        self.approve = harness._draft_tools._community_approve_submitted_batch
+        with approval_http(409, {"success": False, "message": "批次内容已变更"}) as (post, _):
+            self.assertEqual(await self.cast("admin"), "投票已结束：批次内容已变更")
+            self.assertEqual(await self.cast("admin"), "投票已结束。")
+        post.assert_awaited_once()
+        self.assertEqual(self.store.get(BATCH_ID)["status"], "ended")
+
+    async def test_admin_stage_preserves_dictionary_approval_receipt(self):
+        chat = harness.openai_chat_module
+        ctx = self.context()
+        ctx.user_id, ctx.owner_label = "admin", "甲"
+        token = chat.current_draft_delivery_claims.set([])
+        self.addCleanup(chat.current_draft_delivery_claims.reset, token)
+        with (
+            patch.object(vote, "get_store", return_value=self.store),
+            patch.object(vote, "find_user_by_platform", self.lookup),
+            patch.object(chat, "extract_onebot_reply_id", return_value="receipt"),
+            patch.object(chat, "_finish_ai_chat_response", AsyncMock()) as finish,
+            patch.object(chat.skills_manager, "get_tool_function",
+                         return_value=harness._draft_tools._community_approve_submitted_batch),
+            approval_http(payload={"success": True, "approvedBy": "admin", "voters": ["甲"]}) as (post, _),
+        ):
+            self.assertTrue(await chat._stage_community_vote(ctx))
+        self.assertEqual(ctx.response, f"管理员 甲 同意，批次已加入词库，投票结束。\n草稿地址：{BATCH_URL}")
+        self.assertEqual(chat.current_draft_delivery_claims.get(), [{
+            "platform": "qq", "platformId": "admin", "operationKind": "dictionary_approval",
+            "batchId": BATCH_ID, "contentVersion": 7, "toolName": "_community_approve_submitted_batch",
+        }])
+        finish.assert_awaited_once()
+        post.assert_awaited_once()
 
     async def test_concurrent_third_and_fourth_only_send_one_approval(self):
         await self.cast("one")
@@ -625,38 +783,27 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def call_endpoint(self, status=200, payload=None, error=None):
-        payload = {"success": True, "voters": ["甲", "乙", "丙"]} if payload is None else payload
-
-        class FakeResponse:
-            status_code = status
-            is_success = 200 <= status < 300
-
-            def json(self):
-                return payload
-
-        post = AsyncMock(side_effect=error, return_value=FakeResponse())
-
-        class FakeClient:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return False
-
-            async def post(self, *args, **kwargs):
-                return await post(*args, **kwargs)
-
-        with (
-            patch.object(harness._draft_tools.httpx, "AsyncClient", return_value=FakeClient(), create=True),
-            patch.object(harness._draft_tools, "get_keytao_url", return_value="https://keytao.test"),
-            patch.object(harness._draft_tools, "get_bot_headers", return_value={"X-Test": "signed"}) as headers,
-        ):
+    async def call_endpoint(self, status=200, payload=None, error=None, voter_ids=("one", "two", "three")):
+        with approval_http(status, payload, error) as (post, headers):
             result = await harness._draft_tools._community_approve_submitted_batch(
                 "qq", "creator", BATCH_ID,
-                [{"platform": "qq", "platformId": user_id} for user_id in ("one", "two", "three")], 7,
+                [{"platform": "qq", "platformId": user_id} for user_id in voter_ids], 7,
             )
         return result, post, headers
+
+    async def test_one_voter_is_sent_to_server_but_empty_voters_are_rejected(self):
+        result, post, _ = await self.call_endpoint(
+            payload={"success": True, "approvedBy": "admin", "voters": ["甲"]}, voter_ids=("admin",),
+        )
+        self.assertEqual(result["approvedBy"], "admin")
+        post.assert_awaited_once()
+        self.assertEqual(json.loads(post.await_args.kwargs["content"])["voters"], [
+            {"platform": "qq", "platformId": "admin"},
+        ])
+        result, post, _ = await self.call_endpoint(voter_ids=())
+        self.assertFalse(result["success"])
+        self.assertFalse(result["retryable"])
+        post.assert_not_awaited()
 
     async def test_signed_request_contains_frozen_endpoint_contract(self):
         result, post, headers = await self.call_endpoint()

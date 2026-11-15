@@ -2405,7 +2405,7 @@ async def _community_approve_submitted_batch(
             for value in creator
         )
         or not isinstance(voters, list)
-        or len(voters) < 3
+        or len(voters) < 1
     ):
         return {"success": False, "retryable": False, "message": "投票批准参数不完整或非法"}
     request_voters = []

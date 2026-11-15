@@ -249,9 +249,10 @@ def _escape_name(name):
     return str(name).replace("&", "&amp;").replace("[", "&#91;").replace("]", "&#93;")
 
 
-def _pending_approval_reply(data, names):
+def _pending_approval_reply(data, names, *, admin=False):
     instruction = "请等待管理员处理" if data["attempts"] >= 2 else "请再次回复同意重试"
-    return (f"投票已达 3/3，批准待确认，{instruction}。\n"
+    heading = "管理员批准待确认" if admin else "投票已达 3/3，批准待确认"
+    return (f"{heading}，{instruction}。\n"
             f"草稿地址：{data['batch_url']}\n同意：{names}")
 
 
@@ -275,7 +276,8 @@ async def record_vote(store, platform, group_id, message_id, user_id, name, *, l
             return "投票已结束。"
         if (platform, str(user_id)) == (data["creator_platform"], data["creator_id"]):
             return store.notify_once(data, platform, user_id, "提交人不能为自己投票")
-        account_id = _account_id(await lookup(platform, str(user_id)))
+        user = await lookup(platform, str(user_id))
+        account_id = _account_id(user)
         if store.get(*round_key)["status"] != "open":
             return "投票已结束。"
         if account_id is None:
@@ -289,19 +291,29 @@ async def record_vote(store, platform, group_id, message_id, user_id, name, *, l
         data["creator_user_id"] = creator_id
         if account_id == creator_id:
             return store.notify_once(data, platform, user_id, "提交人不能为自己投票")
+        roles = user.get("roles")
+        is_admin = isinstance(roles, list) and any(
+            isinstance(role, dict) and role.get("value") in {"R:ROOT", "R:MANAGER"}
+            for role in roles
+        )
+        if is_admin:
+            data["voters"] = list({
+                voter["userId"]: voter for voter in data["voters"]
+                if voter["userId"] != account_id
+            }.values())
         count = len(data["voters"])
-        if count < 3:
-            if any(voter["userId"] == account_id for voter in data["voters"]):
+        if is_admin or count < 3:
+            if not is_admin and any(voter["userId"] == account_id for voter in data["voters"]):
                 return store.notify_once(data, platform, user_id, f"你已经投过了（{count}/3）")
             data["voters"].append({"platform": platform, "platformId": str(user_id),
                                    "userId": account_id, "name": name or str(user_id)})
             if not store.save(data):
                 return "投票已结束。"
         names = "、".join(_escape_name(voter["name"]) for voter in data["voters"])
-        if len(data["voters"]) < 3:
+        if not is_admin and len(data["voters"]) < 3:
             return (f"@{_escape_name(name or user_id)} 已记录同意。\n草稿地址：{data['batch_url']}\n"
                     f"当前投票：{len(data['voters'])}/3\n同意：{names}")
-        pending = _pending_approval_reply(data, names)
+        pending = _pending_approval_reply(data, names, admin=is_admin)
         if data["attempts"] >= 2:
             return store.notify_once(data, platform, user_id, pending)
         # A concurrent arrival cannot retry an attempt that was still in progress when it arrived.
@@ -311,7 +323,7 @@ async def record_vote(store, platform, group_id, message_id, user_id, name, *, l
         if not store.save(data):
             return "投票已结束。"
         if data["attempts"] == 2:
-            pending = _pending_approval_reply(data, names)
+            pending = _pending_approval_reply(data, names, admin=is_admin)
         try:
             result = await approve(data["creator_platform"], data["creator_id"], batch_id,
                                    [{"platform": voter["platform"], "platformId": voter["platformId"]}
@@ -324,6 +336,9 @@ async def record_vote(store, platform, group_id, message_id, user_id, name, *, l
             data["status"] = "approved"
             if not store.save(data):
                 return "投票已结束。"
+            if is_admin:
+                return (f"管理员 {_escape_name(name or user_id)} 同意，批次已加入词库，投票结束。\n"
+                        f"草稿地址：{data['batch_url']}")
             server_names = result.get("voters")
             if isinstance(server_names, list) and len(server_names) == 3 and all(isinstance(value, str) and value for value in server_names):
                 names = "、".join(_escape_name(value) for value in server_names)
