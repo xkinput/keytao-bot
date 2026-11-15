@@ -4324,7 +4324,8 @@ def _guard_draft_mutation(
         or current_draft_operation_id.get() == operation.operation_id
     ):
         try:
-            claim = get_default_draft_mutation_claim_store().get(
+            store = get_default_draft_mutation_claim_store()
+            claim = store.get(
                 context.platform,
                 context.user_id,
             )
@@ -4355,6 +4356,34 @@ def _guard_draft_mutation(
             and str(arguments.get("batch_id") or "") == claimed_batch_id
         ):
             return None
+        if str(claim.get("status") or "") == "resolved":
+            result = claim.get("result") or {}
+            if (
+                operation_kind == "recall"
+                and result.get("success") is True
+                and str(result.get("batchId") or "") == claimed_batch_id
+                and str(arguments.get("batch_id") or "") == claimed_batch_id
+                and tool_name in {
+                    "keytao_remove_draft_item",
+                    "keytao_batch_remove_draft_items",
+                }
+            ):
+                return None
+            try:
+                store.acknowledge(
+                    context.platform,
+                    context.user_id,
+                    operation_kind,
+                    str(claim.get("fingerprint") or ""),
+                )
+            except Exception as error:
+                logger.error(
+                    "Failed to release resolved draft mutation fence: %s: %s",
+                    type(error).__name__,
+                    error,
+                )
+            else:
+                return None
         allowed_resolution_tools = {
             "recall": frozenset({"keytao_recall_batch"}),
             "delete": frozenset({
@@ -4362,7 +4391,10 @@ def _guard_draft_mutation(
                 "keytao_batch_remove_draft_items",
             }),
         }
-        if tool_name in allowed_resolution_tools.get(operation_kind, frozenset()):
+        if (
+            str(claim.get("status") or "") != "resolved"
+            and tool_name in allowed_resolution_tools.get(operation_kind, frozenset())
+        ):
             return None
         batch_id = claimed_batch_id
         return {

@@ -13294,6 +13294,66 @@ def test_draft_tool_guard_blocks_out_of_band_mutations():
     asyncio.run(_run())
 
 
+def test_draft_mutation_guard_releases_stale_resolved_recall():
+    """Final recall receipts cannot lock later mutations on another batch."""
+    print("\n🧪 draft mutation guard releases stale resolved recall")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = DraftMutationClaimStore(os.path.join(temp_dir, "claims.db"))
+        context = ToolContext("qq", "stale-recall-user")
+        mutations = (
+            ("keytao_submit_batch", {}),
+            ("keytao_batch_remove_draft_items", {"batch_id": "batch-b", "ids": [1]}),
+        )
+        with patch.object(
+            openai_chat_module,
+            "get_default_draft_mutation_claim_store",
+            return_value=store,
+        ):
+            for tool_name, arguments in mutations:
+                fingerprint = store.begin(
+                    context.platform, context.user_id, "recall", {"batchId": "batch-a"},
+                )
+                assert fingerprint and store.resolve(
+                    context.platform, context.user_id, "recall", fingerprint,
+                    {"success": False, "message": "Current draft already has items", "batchId": "batch-a"},
+                )
+                result = openai_chat_module._guard_draft_mutation(context, tool_name, arguments)
+                check(f"failed resolved recall allows {tool_name}", result is None)
+                check(
+                    f"failed resolved recall receipt is removed before {tool_name}",
+                    store.get(context.platform, context.user_id) is None,
+                )
+                store.discard_actor(context.platform, context.user_id)
+
+            fingerprint = store.begin(
+                context.platform, context.user_id, "recall", {"batchId": "batch-a"},
+            )
+            for tool_name, arguments in mutations:
+                result = openai_chat_module._guard_draft_mutation(context, tool_name, arguments)
+                check(
+                    f"inflight recall still blocks {tool_name}",
+                    result is not None and result.get("policyBlocked") is True,
+                )
+                check(
+                    f"inflight recall fence survives {tool_name}",
+                    store.get(context.platform, context.user_id)["status"] == "inflight",
+                )
+
+            assert store.resolve(
+                context.platform, context.user_id, "recall", fingerprint,
+                {"success": False, "batchId": "batch-a"},
+            )
+            with (
+                patch.object(store, "acknowledge", side_effect=RuntimeError("storage unavailable")),
+                patch.object(chat_commands_module.logger, "error") as log_error,
+            ):
+                result = openai_chat_module._guard_draft_mutation(context, "keytao_submit_batch", {})
+            check("receipt release failure keeps mutations blocked", result is not None and result.get("policyBlocked") is True)
+            check("receipt release failure retains the fence", store.get(context.platform, context.user_id) is not None)
+            check("receipt release failure is logged", log_error.call_count == 1)
+
+
 def test_durable_draft_mutation_claim_lifecycle():
     """A resolved destructive result is replayed until a reply is delivered."""
     print("\n🧪 durable draft mutation claim lifecycle")
@@ -13343,18 +13403,13 @@ def test_durable_draft_mutation_claim_lifecycle():
                 "get_default_draft_mutation_claim_store",
                 return_value=restarted,
             ):
-                blocked = openai_chat_module._guard_draft_mutation(
+                allowed_continuation = openai_chat_module._guard_draft_mutation(
                     ToolContext("qq", "claim-user"),
-                    "keytao_create_phrase",
-                    {"word": "新词", "code": "abcd"},
+                    "keytao_batch_remove_draft_items",
+                    {"batch_id": "batch-a", "ids": [1]},
                 )
-                allowed_replay = openai_chat_module._guard_draft_mutation(
-                    ToolContext("qq", "claim-user"),
-                    "keytao_recall_batch",
-                    {},
-                )
-                check("resolved claim blocks a different mutation", blocked is not None and blocked.get("policyBlocked") is True)
-                check("resolved claim allows only its replay tool", allowed_replay is None)
+                check("resolved recall allows same-batch delete continuation", allowed_continuation is None)
+                check("same-batch delete continuation retains the resolved fence", restarted.get("qq", "claim-user") == resolved)
 
                 delivery_token = openai_chat_module.current_draft_delivery_claims.set([])
                 try:
@@ -23520,6 +23575,7 @@ if __name__ == "__main__":
     test_draft_tool_guard_blocks_out_of_band_mutations()
     test_fetch_encode_candidates_retries_timeout_then_succeeds()
     test_durable_draft_mutation_claim_lifecycle()
+    test_draft_mutation_guard_releases_stale_resolved_recall()
     test_recall_uncertain_claim_never_switches_batches()
     test_delete_uncertain_claim_never_deletes_new_targets()
     test_active_add_confirmation_continues_to_submit()
