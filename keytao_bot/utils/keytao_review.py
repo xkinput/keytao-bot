@@ -88,7 +88,7 @@ COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS = {
     "dictionary": 0.20,
     "encyclopedia": 0.10,
 }
-COMMONNESS_FREQUENCY_RATIO_THRESHOLD = 2.0
+COMMONNESS_FREQUENCY_RATIO_THRESHOLD = 1.0
 COMMONNESS_CORPUS_SCORE_SATURATION = 1_000
 COMMONNESS_BCC_SCORE_SATURATION_PER_MILLION = 20
 COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT = 10
@@ -6051,19 +6051,19 @@ def _compare_reference_commonness(
     bcc_signal = comparison_signal(front_bcc, behind_bcc)
     if bcc_signal is not None:
         left, right, reason = bcc_signal
-        if left >= right * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+        if left > right * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
             verdict = "front_more_common"
-        elif right >= left * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+        elif right > left * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
             verdict = "behind_more_common"
         else:
             verdict = "close"
         if verdict == "close":
             reason += "_below_threshold"
     elif isinstance(front_frequency, int) and isinstance(behind_frequency, int):
-        if front_frequency >= behind_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+        if front_frequency > behind_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
             verdict = "front_more_common"
             reason = "frequency_ratio"
-        elif behind_frequency >= front_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+        elif behind_frequency > front_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
             verdict = "behind_more_common"
             reason = "frequency_ratio"
         else:
@@ -6109,9 +6109,9 @@ def _compare_reference_commonness(
         historical_signal = historical_comparison_signal(front_bcc, behind_bcc)
         if historical_signal is not None:
             left, right, historical_reason = historical_signal
-            if left >= right * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+            if left > right * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
                 verdict, reason = 'front_more_common', historical_reason
-            elif right >= left * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+            elif right > left * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
                 verdict, reason = 'behind_more_common', historical_reason
 
     front = _reference_commonness_result(front_word, front_reference)
@@ -6664,7 +6664,7 @@ async def assess_candidate_chain_commonness(
                 ):
                     modern_signal = (front["corpusFrequency"], behind["corpusFrequency"], "frequency_ratio")
                 if (modern_signal is None
-                        or modern_signal[0] < modern_signal[1] * COMMONNESS_FREQUENCY_RATIO_THRESHOLD):
+                        or modern_signal[0] <= modern_signal[1] * COMMONNESS_FREQUENCY_RATIO_THRESHOLD):
                     comparison = {
                         **comparison,
                         "verdict": "not_enough_evidence",

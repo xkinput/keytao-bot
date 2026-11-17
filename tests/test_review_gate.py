@@ -2931,14 +2931,14 @@ def test_offline_commonness_verdict_rules_and_copy():
                 estimate = await review_module.estimate_word_commonness("诉讼法")
 
             check(
-                "frequency ratio above 2.0 yields a definite verdict",
+                "a higher frequency yields a definite verdict",
                 high_ratio.get("verdict") == "front_more_common"
                 and high_ratio.get("decisionReason") == "frequency_ratio",
             )
             check(
-                "frequency ratio below 2.0 is close rather than flapping",
-                low_ratio.get("verdict") == "close"
-                and low_ratio.get("decisionReason") == "frequency_ratio_below_threshold",
+                "any frequency difference yields a definite verdict",
+                low_ratio.get("verdict") in {"front_more_common", "behind_more_common"}
+                and low_ratio.get("decisionReason") == "frequency_ratio",
             )
             check(
                 "corpus and dictionary attestation beats a fully absent word",
