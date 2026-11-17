@@ -3464,6 +3464,25 @@ class F3RecodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.http.writes, [])
 
 
+    async def test_recode_english_entry_previews_typed_delete_and_create(self):
+        from tests.helpers import B18RealToolTests_setUp, TOOLS
+
+        B18RealToolTests_setUp(self)
+        self.http.entries = [{"word": "Google", "code": "gllgle", "type": "English", "weight": 100}]
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
+        with patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get):
+            await self.replay.turn({"message": "修改英文词条 Google 编码为 glle", "to_me": True}, raw_operation(
+                op="recode", operands=["Google"], codes=["glle"],
+            ))
+        self.assertNotIn("还没有核对出", self.replay.last_response)
+        self.assertIn("Google", self.replay.last_response)
+        self.assertIn("glle", self.replay.last_response)
+        items = [item for _path, body in self.http.writes for item in body.get("items", [])]
+        self.assertEqual([(item["action"], item["word"], item["code"], item["type"]) for item in items], [
+            ("Delete", "Google", "gllgle", "English"), ("Create", "Google", "glle", "English"),
+        ])
+
+
 def load_tests(loader, standard_tests, pattern):
     return _stage_t_unittest.TestSuite(
         loader.loadTestsFromTestCase(case) for case in (

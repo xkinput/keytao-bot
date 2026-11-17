@@ -1038,12 +1038,16 @@ _DICTIONARY_DELETE_PATTERNS = (
     ),
 )
 
+# Recode also covers English entries (e.g. Google); delete/create words must match.
+_DICTIONARY_RECODE_WORD_PATTERN = (
+    rf"(?:{_DICTIONARY_DELETE_WORD_PATTERN}|[A-Za-z][A-Za-z0-9'.-]{{0,29}})"
+)
 _DICTIONARY_RECODE_WHOLE_RE = re.compile(
     rf"^{_COMMAND_PREFIX_PATTERN}(?:删除|删掉|移除)\s*"
-    rf"(?P<delete_word>{_DICTIONARY_DELETE_WORD_PATTERN})\s+"
+    rf"(?P<delete_word>{_DICTIONARY_RECODE_WORD_PATTERN})\s+"
     rf"(?P<old_code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*[；;]\s*"
     rf"(?:添加|新增|加入)\s*"
-    rf"(?P<create_word>{_DICTIONARY_DELETE_WORD_PATTERN})\s+"
+    rf"(?P<create_word>{_DICTIONARY_RECODE_WORD_PATTERN})\s+"
     rf"(?P<new_code>{_POSITIONAL_REORDER_CODE_PATTERN})"
     r"(?:吧|啦|了)?$",
     re.IGNORECASE,
