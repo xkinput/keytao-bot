@@ -13020,7 +13020,9 @@ async def _resolve_target_recodes(request, message, original_operands, platform,
     if same_word and same_word["old_word"].strip('「」“”"') == same_word["new_word"].strip('「」“”"'):
         clauses = [[(same_word["new_word"].strip('「」“”"'), same_word["new_code"])]]
     else:
-        source, prefixed = re.subn(r"^(?:修改编码|改码)\s*[:：]?\s*", "", source, count=1)
+        source, prefixed = re.subn(
+            r"^(?:修改编码|改码|(?:修改|改)(?:英文|中文|单字)?(?:词条|条目))\s*[:：]?\s*", "", source, count=1,
+        )
         for clause in re.split(r"[,，;；\n]+", source.rstrip("。.!！")):
             matches = []
             for word in candidates:

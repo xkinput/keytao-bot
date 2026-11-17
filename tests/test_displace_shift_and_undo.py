@@ -3436,6 +3436,33 @@ class F3RecodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.http.writes, [])
         self.assertEqual(self.http.errors, [])
 
+    async def test_recode_header_with_entry_kind_binds_target(self):
+        from keytao_bot.harness.operation_request import OperationRequest
+        from tests.helpers import B18RealToolTests_setUp, TOOLS
+
+        B18RealToolTests_setUp(self)
+        self.http.entries = [
+            {"word": "Google", "code": "gugo", "type": "English", "weight": 100},
+            {"word": "大全", "code": "dsqa", "type": "Phrase", "weight": 100},
+        ]
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
+        with patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get):
+            for word, code, message, binds, old in (
+                ("Google", "glle", "修改英文词条 Google 编码为 glle", True, "gugo"),
+                ("大全", "dsqt", "修改词条 大全 编码为 dsqt", True, "dsqa"),
+                ("大全", "dsqt", "顺便说下 大全 编码为 dsqt", False, ""),
+            ):
+                with self.subTest(message=message):
+                    request = OperationRequest(op="recode", operands=(word,), codes=(code,))
+                    _resolved, _notes, error = await self.replay.commands._resolve_target_recodes(
+                        request, message, (), "qq", self.replay.author.actor_id,
+                    )
+                    self.assertEqual("逐项对应" in error, not binds, error)
+                    if binds:
+                        self.assertEqual(error, "")
+                        self.assertEqual(_resolved.codes, (old, code))
+        self.assertEqual(self.http.writes, [])
+
 
 def load_tests(loader, standard_tests, pattern):
     return _stage_t_unittest.TestSuite(
