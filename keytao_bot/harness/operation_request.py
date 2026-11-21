@@ -85,6 +85,13 @@ def understand_message(
         return matched("parse_draft_view_command", "draft_view")
     command = routing._structural_draft_management_intent(message)
     if command is not None and command.intent in {"draft_recall", "draft_clear"}:
+        if (
+            command.intent == "draft_recall"
+            and pending_state is not None
+            and routing._pending_assent_phrase_for_state(pending_state, message).cancel_requested
+        ):
+            # A bare 撤销 under a live 回复「确认」执行，或「取消」 prompt answers that prompt.
+            return matched("_pending_assent_phrase_for_state", "cancel", pending=True)
         return matched("_structural_draft_management_intent", command.intent)
     if routing._is_explicit_draft_submit_request(message):
         return matched("_is_explicit_draft_submit_request", "draft_submit")

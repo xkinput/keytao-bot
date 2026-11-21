@@ -503,6 +503,22 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
                     if live_ticket:
                         self.assert_preserved(self.author, record, original)
 
+    async def test_c5_chat_sentence_is_not_recovered_as_a_whole_word_lookup(self):
+        # Prod 2026-11-20: 键道根本就不需要那么多的候选 was reviewed as one new word.
+        for message in ("根本就不需要那么多的候选", "用小词库还好", "输入法是不是被下架了", "我是不想折腾了"):
+            with self.subTest(message=message):
+                self.finish.reset_mock()
+                self.main.reset_mock()
+                self.remember.reset_mock()
+                self.set_model("chat", ())
+                ctx = self.context(message)
+                await self.assert_finished(ctx)
+                self.assert_main(message)
+                self.tool.assert_not_awaited()
+        for word in ("绷不住", "懂个锤子", "不好笑", "东一榔头西一棒子", "一不做二不休", "不好意思"):
+            with self.subTest(word=word):
+                self.assertTrue(self.chat._chat_routing._is_chat_word_query_target(word))
+
     async def test_c6_explicit_query_list_drops_leading_verb(self):
         self.entries.update({"查报": "wsbz", "茶包": "wsbz"})
         for message in ("查词 查报 茶包", "查询：查报、茶包", "查:查报，茶包"):

@@ -36,6 +36,18 @@ OP_ENUM = frozenset({
     "draft_keep_only", "operation_recall", "clear_history", "other",
 })
 FRAME_ENUM = frozenset({"direct", "question", "negated", "reported", "none"})
+_KEYTAO_CODE_SHAPE_RE = re.compile(r"[bcdefghjklmnpqrstwxyz]{1,4}[aiouv]{0,4}")
+_PHONETIC_KEYS_RE = re.compile(r"[bcdefghjklmnpqrstwxyz]+")
+
+
+def _looks_like_glued_keytao_code(word: str, code: str) -> bool:
+    code = code.lower()
+    phonetic_length = {1: 2, 3: 3}.get(len(word), 4)
+    # A full phonetic prefix can still carry an unknown shape for manual review.
+    return bool(_KEYTAO_CODE_SHAPE_RE.fullmatch(code) or (
+        phonetic_length <= len(code) <= 6
+        and _PHONETIC_KEYS_RE.fullmatch(code[:phonetic_length])
+    ))
 
 # Frozen LABEL_SPEC semantics, without row identifiers or request-specific data.
 SYSTEM_PROMPT = """You interpret messages to 喵喵, the KeyTao Chinese dictionary bot.
@@ -373,6 +385,9 @@ def validate_operation(
         suffix = re.fullmatch(r"(.+?)\s+([a-zA-Z]{3,12})", operand, re.DOTALL)
         if suffix is None and operand in text:
             suffix = re.fullmatch(r"([^a-zA-Z]+)([a-zA-Z]{3,12})", operand)
+            if (suffix is not None and op in {"add", "query"}
+                    and not _looks_like_glued_keytao_code(*suffix.groups())):
+                suffix = None
         if suffix and suffix[1].strip() and re.search(
             re.escape(suffix[1].strip()) + r"\s*(?<![a-zA-Z])" + re.escape(suffix[2].lower()) + r"(?![a-zA-Z])", text,
         ):
@@ -410,6 +425,26 @@ def validate_operation(
             codes.append(code)
         else:
             violations.append(f"code_not_in_message:{code}")
+    for code in list(codes) if op in {"add", "query"} else ():
+        for index, operand in enumerate(operands):
+            if re.search(r"[a-zA-Z]$", operand):
+                continue
+            glued = re.search(
+                re.escape(operand) + r"(" + re.escape(code) + r")(?![a-zA-Z])", text, re.IGNORECASE,
+            )
+            if glued is None:
+                continue
+            quoted = re.search(
+                r"[「『“\"]\s*" + re.escape(operand) + re.escape(code) + r"\s*[」』”\"]", text, re.IGNORECASE,
+            )
+            if _looks_like_glued_keytao_code(operand, code) and quoted is None:
+                break
+            logger.info(
+                f"[semantic_validate] normalization=glued_literal operand={operand!r} code={code!r}"
+            )
+            operands[index] = operand + glued[1]
+            codes.remove(code)
+            break
 
     if op == "swap" and (len(operands) != 2 or len(set(operands)) != 2):
         op = "none"

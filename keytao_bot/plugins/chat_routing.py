@@ -3263,11 +3263,26 @@ def _coordinated_word_query_words(message_text: str, *, known_words: Tuple[str, 
     return ()
 
 
+_CHAT_SENTENCE_SHAPE_RE = re.compile(
+    r"(.)[不没]\1"  # A-not-A questions: 是不是/有没有/要不要
+    r"|(?:就|都|也|还|并|根本|完全|真的?)(?:不|没)"
+    r"|不(?:需要|用|想|会|能|必)(?![\u3400-\u9fff]?$)"
+    r"|[了吗呢吧啊呀嘛啦]$"
+    r"|(?:还好|挺好|不错|还行|就行|就好|而已)$"
+)
+
+
+def _looks_like_chat_sentence(word: str) -> bool:
+    """A long clause with sentence function words is prose, not a new entry."""
+    return len(word) >= 5 and _CHAT_SENTENCE_SHAPE_RE.search(word) is not None
+
+
 def _is_chat_word_query_target(word: str) -> bool:
     """Require a lexical target before recovering a model-declined chat turn."""
     return bool(
         _is_bare_word_query_target(word)
         and not is_conversational_text(word)
+        and not _looks_like_chat_sentence(word)
         and not re.fullmatch(
             rf"(?:{_NEGATIVE_MODAL_RE.pattern})(?:行|好|可以|同意|接受|愿意)[啊呀吧]?", word,
         )

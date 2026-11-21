@@ -306,6 +306,22 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.args["_query_words"], ["燃面", "晕碳"])
         self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, self.store.get_record(self.author)))
 
+    async def test_mixed_script_word_is_reviewed_as_one_literal_without_writing(self):
+        for message, word, tail in (
+            ("加词 牛逼plus", "牛逼plus", "plus"),
+            ("加词「苹果pro」", "苹果pro", "pro"),
+        ):
+            with self.subTest(message=message):
+                self.store.delete(self.author)
+                self.calls.clear()
+                self.codes[word] = "nb"
+                self.readings[word] = "offline reading"
+                self.set_model((word.removesuffix(tail),), (tail,))
+                handled, ctx = await self.stage(message)
+                self.assertTrue(handled, ctx.response)
+                self.assertIn(("keytao_prepare_reviewed_add", {"word": word}), self.calls)
+                self.assertEqual(self.writes, [])
+
     async def test_scoped_add_ordinal_selects_only_that_words_advertised_candidate(self):
         self.codes["晕碳"] = "ywtf"
         self.set_model(("燃面", "晕碳"), ())

@@ -30,6 +30,7 @@ from ..harness.authorization_grammar import (
     _POSITIONAL_REPORTED_CONTEXT_RE,
     _QUESTION_RE,
     _parse_code_word_changes,
+    _parse_complete_add_clause,
     dictionary_recode_items_match,
     explicit_same_code_requested,
     explicit_complete_add_item,
@@ -12848,6 +12849,11 @@ def resolve_model_add(request, message):
                 for match in re.finditer(r"\S+", source)]
 
     message = _strip_command_message_prefixes(message)
+    if len(words) == 1 and not codes and re.search(r"[A-Za-z]", words[0]):
+        # Bind the whole mixed-script operand before interpreting Latin runs as codes.
+        clause = _parse_complete_add_clause(message)
+        if clause is not None and clause.word == words[0] and not clause.code:
+            return replace(request, codes=("",), submit_after=False)
     word_matches = literal_words(message)
     for prefix in _MODEL_ADD_COMMAND_PREFIXES:
         if message.startswith(prefix):
@@ -13341,7 +13347,7 @@ def render_understood_command(request) -> str:
         return "\n".join(commands) if all(commands) else ""
     command = ""
     if op == "add":
-        from ..harness.authorization_grammar import _multi_add_authorization_contract, _parse_complete_add_clause
+        from ..harness.authorization_grammar import _multi_add_authorization_contract
 
         if not words or len(words) != len(codes) or len(set(filter(None, codes))) != len(tuple(filter(None, codes))):
             return ""

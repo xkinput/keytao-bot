@@ -41,7 +41,7 @@ def fake_response(finish="stop", content="", *, reasoning=None, tool_calls=()):
 
 
 class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
-    async def run_fake(self, responses, *, fallback=None, schema=None):
+    async def run_fake(self, responses, *, fallback=None, schema=None, conversation_only=False):
         bodies = []
         answers = iter(responses)
 
@@ -72,7 +72,7 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
         termination = {}
         reply = await orchestrator._run_loop(
             "Explain the fixture.",
-            AgentRequestContext(platform="qq", user_id="fixture", history=[
+            AgentRequestContext(platform="qq", user_id="fixture", conversation_only=conversation_only, history=[
                 {"role": "user", "content": "old context"},
                 {"role": "assistant", "content": "old answer"},
             ]),
@@ -195,6 +195,28 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
                             "extra_body": {"thinking": {"type": "enabled"}},
                             "reasoning_effort": "low",
                         })
+                finally:
+                    end_turn_metrics(token)
+
+    async def test_compacted_conversation_answers_without_write_status_guidance(self):
+        for prior_calls in (0, 1):
+            with self.subTest(prior_calls=prior_calls):
+                token = begin_turn_metrics("qq", "group")
+                try:
+                    current_turn_metrics().model_calls = prior_calls
+                    answer = fake_response(content="Fixture answer.")
+                    reply, bodies, dispatch, _ = await self.run_fake(
+                        [answer] if prior_calls else [fake_response(), answer],
+                        conversation_only=True,
+                    )
+                    self.assertEqual(len(bodies), 2 - prior_calls)
+                    prompt = bodies[-1]["messages"][0]["content"]
+                    self.assertNotIn("简短说明没有写入", prompt)
+                    self.assertIn("喵喵", prompt)
+                    self.assertIn("不要编造事实", prompt)
+                    self.assertNotIn("tools", bodies[-1])
+                    self.assertEqual(reply, "Fixture answer.")
+                    dispatch.assert_not_awaited()
                 finally:
                     end_turn_metrics(token)
 

@@ -349,6 +349,17 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.replay.store.get_record(self.replay.author))
         self.general.assert_not_awaited()
 
+    async def test_bare_revoke_cancels_the_live_confirmation_like_cancel(self):
+        # Prod 2026-11-21: 撤销 under a 回复「确认」执行，或「取消」 prompt re-sent the prompt.
+        self.replay.entries.append({"word": b11_shift_WORD, "code": "xlblu", "type": "Phrase", "weight": 100})
+        await self.turn(f"顺延“{b11_shift_WORD}”")
+        self.assertIsNotNone(self.replay.store.get_record(self.replay.author))
+        await self.turn("撤销", "cancel", refers_to_pending=True)
+        self.assertEqual(self.replay.last_response, "已取消。")
+        self.assertIsNone(self.replay.store.get_record(self.replay.author))
+        self.assertEqual(self.replay.writes, [])
+        self.general.assert_not_awaited()
+
     async def test_number_without_ticket_asks_for_literal_code(self):
         await self.turn(f"顺延“{b11_shift_WORD}”到1号", "move", ("1",))
         self.assertIn("编码", self.replay.last_response)

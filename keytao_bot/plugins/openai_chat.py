@@ -4717,6 +4717,10 @@ def _bound_pending_reply_prompt(record: PendingStateRecord) -> str:
     )
 
 
+# 撤销 answers a live 回复「确认」执行，或「取消」 prompt exactly like 取消.
+_BARE_CANCEL_CONTROLS = ("取消", "撤销")
+
+
 async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     """Resolve the author's closed ticket answers before model routing."""
     message = ctx.normalized_message_text
@@ -4764,7 +4768,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     contract = advertised_reply_contract(reply_prompt if ctx.reply_reference.is_reply else latest)
     assent = _pending_tool_assent_intent(state, message)
     if not affirmative:
-        if message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms, "取消") and assent is not None:
+        if message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms, *_BARE_CANCEL_CONTROLS) and assent is not None:
             canonical = message
         if isinstance(state, PendingAddWord):
             _selected, _intent, selection_error = _resolve_multi_word_pending_candidate_selection(state, message)
@@ -4799,9 +4803,11 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
                     message = control
                 if word_code_answer:
                     canonical = message
-                if control in {"确认", "取消"} or (numbered and control.isascii() and control.isdigit() and 1 <= int(control) <= len(options)):
+                if control in {"确认", *_BARE_CANCEL_CONTROLS} or (numbered and control.isascii() and control.isdigit() and 1 <= int(control) <= len(options)):
                     canonical = message
     cancel_control = bool(canonical and assent is not None and assent.intent == "pending_cancel")
+    if cancel_control and canonical.strip() in _BARE_CANCEL_CONTROLS:
+        canonical = "取消"
 
     def unbound_answer() -> bool:
         if (canonical and (record.origin_prompt_digest or record.origin_message_id)

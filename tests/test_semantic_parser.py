@@ -385,7 +385,7 @@ class SemanticValidatorTests(unittest.TestCase):
                 self.assertEqual((request.op, request.operands, request.codes), (op, (operand,), ()))
                 self.assertEqual(violations, [])
         for operand, message in (
-            ("燃面abc", "添加燃面abc"),
+            ("燃面rfm", "添加燃面rfm"),
             ("燃面 abc", "添加燃面 abc"),
             ("燃面 ABC", "添加燃面 abc"),
         ):
@@ -393,7 +393,38 @@ class SemanticValidatorTests(unittest.TestCase):
                 request, violations = validate_operation(
                     raw_operation(operands=[operand], codes=[]), message, None,
                 )
-                self.assertEqual((request.operands, request.codes), (("燃面",), ("abc",)))
+                expected_code = operand[-3:].lower()
+                self.assertEqual((request.operands, request.codes), (("燃面",), (expected_code,)))
+                self.assertEqual(violations, [])
+
+    def test_glued_latin_tail_that_cannot_be_a_keytao_code_stays_part_of_the_word(self):
+        # Prod 2026-11-21: 加词 牛逼plus was split into 牛逼 + code plus and rejected.
+        for op, operands, codes, message in (
+            ("add", ["牛逼"], ["plus"], "加词 牛逼plus"),
+            ("add", ["牛逼"], ["plus"], "加词 “牛逼plus”"),
+            ("add", ["牛逼plus"], [], "加词 牛逼plus"),
+            ("query", ["牛逼"], ["plus"], "牛逼plus"),
+            ("add", ["燃面"], ["abc"], "添加燃面abc"),
+            ("add", ["苹果"], ["pro"], "加词「苹果pro」"),
+            ("add", ["苹果pro"], [], "加词 “苹果pro”"),
+        ):
+            with self.subTest(message=message, operands=operands, codes=codes):
+                request, violations = validate_operation(
+                    raw_operation(op=op, operands=operands, codes=codes), message, None,
+                )
+                expected = message.split()[-1] if " " in message else message
+                expected = expected.removeprefix("添加").removeprefix("加词").strip("“”「」")
+                self.assertEqual((request.operands, request.codes), ((expected,), ()))
+                self.assertEqual(violations, [])
+        for operands, codes, message in (
+            (["肏屄"], ["czbku"], "加词 肏屄czbku"),
+            (["肏屄czbku"], [], "加词 肏屄czbku"),
+        ):
+            with self.subTest(message=message, operands=operands):
+                request, violations = validate_operation(
+                    raw_operation(operands=operands, codes=codes), message, None,
+                )
+                self.assertEqual((request.operands, request.codes), (("肏屄",), ("czbku",)))
                 self.assertEqual(violations, [])
 
     def test_absent_trailing_code_is_not_split_and_literal_check_drops_operand(self):
