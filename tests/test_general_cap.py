@@ -41,7 +41,8 @@ def fake_response(finish="stop", content="", *, reasoning=None, tool_calls=()):
 
 
 class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
-    async def run_fake(self, responses, *, fallback=None, schema=None, conversation_only=False):
+    async def run_fake(self, responses, *, fallback=None, schema=None, conversation_only=False,
+                       message="Explain the fixture.", extra_schemas=()):
         bodies = []
         answers = iter(responses)
 
@@ -56,8 +57,8 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
         dispatch = AsyncMock(return_value={"success": True, "message": "Fixture result."})
         manager = SimpleNamespace(
             get_skill_instructions=lambda: "",
-            has_tools=lambda: bool(schema),
-            get_tools=lambda: [schema] if schema else [],
+            has_tools=lambda: bool(schema or extra_schemas),
+            get_tools=lambda: [*([schema] if schema else []), *extra_schemas],
         )
         orchestrator = AgentOrchestrator(
             client_factory=lambda: client,
@@ -71,7 +72,7 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
         )
         termination = {}
         reply = await orchestrator._run_loop(
-            "Explain the fixture.",
+            message,
             AgentRequestContext(platform="qq", user_id="fixture", conversation_only=conversation_only, history=[
                 {"role": "user", "content": "old context"},
                 {"role": "assistant", "content": "old answer"},
@@ -125,6 +126,34 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
         self.assert_retry_shape(bodies)
         self.assertEqual(reply, "Fixture answer.")
         dispatch.assert_not_awaited()
+
+    async def test_orthography_question_uses_search_and_keeps_guidance_after_compaction(self):
+        schema = {"type": "function", "function": {
+            "name": "web_search", "description": "Search for sources.",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                           "required": ["query"]},
+        }}
+        call = SimpleNamespace(id="fixture-search", type="function", function=SimpleNamespace(
+            name="web_search", arguments='{"query":"砂糖橘 沙糖桔 规范写法"}',
+        ))
+        token = begin_turn_metrics("qq", "group")
+        try:
+            current_turn_metrics().model_calls = 1
+            answer = "通用写法是砂糖橘，协会名称保留沙糖桔。"
+            reply, bodies, dispatch, _ = await self.run_fake([
+                fake_response("tool_calls", tool_calls=[call]), fake_response(content=answer),
+            ], schema=schema, extra_schemas=({"type": "function", "function": {
+                "name": "keytao_lookup_by_word",
+            }},), message="喵喵 出来 说说 砂糖橘 和 四会市沙糖桔协会 中的  沙糖桔 那个是正字？")
+            self.assertEqual(reply, answer)
+            dispatch.assert_awaited_once_with(query="砂糖橘 沙糖桔 规范写法")
+            for body in bodies:
+                self.assertEqual(body["tools"], [schema])
+                system_text = "\n".join(row["content"] for row in body["messages"] if row["role"] == "system")
+                self.assertIn("规范写法", system_text)
+                self.assertIn("专名", system_text)
+        finally:
+            end_turn_metrics(token)
 
     async def test_failure_uses_existing_deterministic_fallback(self):
         fallback = AsyncMock(return_value="Fixture fallback.")
@@ -309,6 +338,14 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuidanceTests(unittest.TestCase):
+    def test_orthography_fallback_does_not_ask_to_repeat_supplied_text(self):
+        reply = AgentOrchestrator._finalize_reply(
+            "砂糖橘和沙糖桔那个是正字",
+            "词库暂无收录「砂糖橘」。\n回复「加入」可加入草稿。",
+            {},
+        )
+        self.assertEqual(reply, "暂时未能核实这些写法各自适用的场合。")
+
     def test_read_only_guidance_uses_plain_chinese_for_command_policy(self):
         for token in ("suggestedCommand", "blockReason", "boundTarget",
                       "policyBlocked", "requiresTextFollowUp"):

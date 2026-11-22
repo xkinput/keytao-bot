@@ -3592,6 +3592,7 @@ def _set_conversational_turn(message, history, intent, *, other_intents=(), quer
         and intent.intent == "none"
         and not any(item.intent != "none" or item.has_operation_intent is True for item in other_intents)
         and not query_words
+        and not _authorization_grammar.is_orthography_question(message)
         and _chat_routing.is_conversational_text(_strip_command_message_prefixes(message))
         and not message_authorizes_mutation(message)
         and not _authorization_grammar.looks_like_mutation_grammar_gap(message)
@@ -5196,6 +5197,13 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     """Await enabled routing before command stages; retain the legacy shadow slot."""
     if ctx.operation_understood_early:
         return False
+    if _authorization_grammar.is_orthography_question(ctx.normalized_message_text):
+        ctx.operation_understood_early = True
+        ctx.released_pending_turn = ctx.semantic_pending_released = True
+        for stage in RESPONSE_STAGES:
+            if await stage(ctx):
+                return True
+        return True
     rejection = _chat_routing.explicit_add_sentence_rejection(ctx.normalized_message_text)
     if rejection:
         ctx.response = rejection

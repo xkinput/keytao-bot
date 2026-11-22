@@ -673,6 +673,18 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.tool.assert_not_awaited()
         self.assert_preserved(self.author, record, original)
 
+    async def test_spelling_question_reaches_main_with_search_and_preserves_ticket(self):
+        record, original, _prompt = self.ticket(self.author)
+        ctx = self.context("喵喵 出来 说说 砂糖橘 和 四会市沙糖桔协会 中的  沙糖桔 那个是正字？")
+        self.set_model("chat", ())
+        await self.assert_finished(ctx)
+        self.client.create.assert_not_awaited()
+        self.main.assert_awaited_once()
+        self.assertFalse(self.main.await_args.kwargs.get("conversation_only"))
+        self.assertTrue(self.main.await_args.kwargs["preserve_pending"])
+        self.tool.assert_not_awaited()
+        self.assert_preserved(self.author, record, original)
+
     async def test_help_quoting_other_ticket_reaches_main_without_claiming_it(self):
         record, original, prompt = self.ticket(self.other)
         ctx = self.context("应该怎么问你")

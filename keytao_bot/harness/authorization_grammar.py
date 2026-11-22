@@ -365,11 +365,15 @@ _COMMAND_PREFIX_RE = re.compile(rf"^{_COMMAND_PREFIX_PATTERN}")
 _MULTI_ADD_VERB_RE = re.compile(ADD_OPERATION_VERB_PATTERN)
 _MULTI_ADD_ADDRESS_CLAUSES = frozenset({"喵喵"})
 
+_ORTHOGRAPHY_QUESTION_RE = re.compile(
+    r"[哪那]一?[个种]\s*(?:(?:才)?(?:是|算)\s*(?:正字|规范(?:字形|用字|写法|字))|"
+    r"写法\s*(?:才|更)?(?:正确|规范))[？?。.!！~～]*\s*$"
+)
 _INTERROGATIVE_MESSAGE_RE = re.compile(
     r"(?:[?？]|是什么(?:字|词|意思)?|怎么写|如何写|什么意思|啥意思|什么含义|"
     r"^(?:什么时候|何时|多久)(?:才|会|能|在|被|开始|收录|加入|入库|进入).+|"
     r"读什么|读啥|念什么|念啥|是不是.{0,24}(?:吗|嘛|么)|"
-    r"(?:吗|嘛|么|呢)[。.!！~～]?$)"
+    rf"(?:吗|嘛|么|呢)[。.!！~～]?$|{_ORTHOGRAPHY_QUESTION_RE.pattern})"
 )
 _ACTIONABLE_INSTRUCTION_CLAUSE_RE = re.compile(
     r"(?:^|[，,；;。！？!?\n])\s*"
@@ -432,6 +436,11 @@ def is_character_composition_question(message: str) -> bool:
         and is_interrogative_message(source)
         and _CHARACTER_COMPOSITION_QUESTION_RE.search(source)
     )
+
+
+def is_orthography_question(message: str) -> bool:
+    """Recognize an explicit question about standard written forms."""
+    return bool(_ORTHOGRAPHY_QUESTION_RE.search(message) and is_interrogative_message(message))
 
 
 def looks_like_explicit_lexical_review_target(value: str) -> bool:
