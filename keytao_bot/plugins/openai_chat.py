@@ -1625,6 +1625,12 @@ def _is_scheme_concept_question(message: str) -> bool:
     )
 
 
+def _ambiguous_draft_cancel_reply(message: str) -> Optional[str]:
+    if _compact_command_text(message) == "撤销草稿":
+        return "请明确要执行的操作。「撤回提交」把待审核的批次退回草稿，「清空草稿」删除当前草稿的全部条目。"
+    return None
+
+
 async def get_ai_response_core(
     message: str,
     platform: str,
@@ -1648,6 +1654,9 @@ async def get_ai_response_core(
 
     Platform-agnostic: works for QQ, Telegram, and web API calls.
     """
+    clarification = _ambiguous_draft_cancel_reply(message)
+    if clarification is not None:
+        return clarification
     help_reply = _private_help_reply(
         message, memory_context.space_type if memory_context else "private",
     )
@@ -2018,7 +2027,13 @@ def _advertised_reply_matches_live_record(
         and record.state.confirmation_source == "local_preview"
     ):
         rendered = _render_live_batch_record(record)
-        if not rendered or not _reply_copy.candidate_cards_match(response, rendered):
+        # Public reminder links can change hosts before the sent card is bound.
+        if not rendered or not (
+            _reply_copy.candidate_cards_match(response, rendered)
+            or _reply_copy.candidate_cards_match(
+                response, render_platform_public_links(rendered, record.owner_key.platform),
+            )
+        ):
             return bool(
                 _candidate_render_lines(response) == _candidate_render_lines(
                     _chat_routing._format_live_ticket_precedence_message(record.state)
@@ -5204,11 +5219,13 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
             if await stage(ctx):
                 return True
         return True
-    rejection = _chat_routing.explicit_add_sentence_rejection(ctx.normalized_message_text)
-    if rejection:
-        ctx.response = rejection
-        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, rejection)
-        await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, rejection, ctx.QQMessageSegment)
+    direct_reply = _ambiguous_draft_cancel_reply(ctx.normalized_message_text) or (
+        _chat_routing.explicit_add_sentence_rejection(ctx.normalized_message_text)
+    )
+    if direct_reply:
+        ctx.response = direct_reply
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, direct_reply)
+        await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, direct_reply, ctx.QQMessageSegment)
         return True
     record = conversation_state_store.get_record(ctx.conv_key) if ctx.conv_key is not None else None
     if (
@@ -5242,10 +5259,19 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
         isinstance(pending_state, PendingToolConfirm) and bool(pending_state.args.get("_candidate_scopes"))
     )
     alternative_words = _alternative_query_words(ctx.normalized_message_text, pending_state)
-    bare_words = (
-        _chat_commands._bare_multi_word_query_words(ctx.normalized_message_text)
-        if not candidate_ticket else ()
-    )
+    bare_words = _chat_commands._bare_multi_word_query_words(ctx.normalized_message_text)
+    # A standalone list of words from a local preview requests a fresh card.
+    if bare_words and candidate_ticket and not (
+        record is not None and not record.execution_id
+        and isinstance(pending_state, PendingToolConfirm)
+        and pending_state.args.get("_reviewed_multi_word") is True
+        and pending_state.confirmation_source == "local_preview"
+        and not ctx.reply_reference.is_reply
+        and len(_extract_pure_chinese_words(entry_source)) > 1
+        and set(bare_words).issubset(pending_state.args.get("_query_words", ()))
+        and draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is None
+    ):
+        bare_words = ()
     if alternative_words or bare_words:
         from ..harness.operation_request import OperationRequest
 

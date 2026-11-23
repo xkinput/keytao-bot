@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests import test_state_machine as harness
@@ -32,6 +33,7 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.other = ConversationAddress.group("qq", "semantic-query-group", "other-user")
         self.client = FakeClient()
         self.finish = AsyncMock()
+        self.real_finish = self.chat._finish_ai_chat_response
         self.real_main = self.chat.get_ai_response_core
         self.main = AsyncMock(return_value="这是离线解释。")
         self.remember = MagicMock()
@@ -505,7 +507,11 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_c5_chat_sentence_is_not_recovered_as_a_whole_word_lookup(self):
         # Prod 2026-11-20: 键道根本就不需要那么多的候选 was reviewed as one new word.
-        for message in ("根本就不需要那么多的候选", "用小词库还好", "输入法是不是被下架了", "我是不想折腾了"):
+        reported_block = "我这个卡住的就是你提交的那个删除"
+        self.candidate_codes[reported_block] = "wzgk"
+        for message in (
+            "根本就不需要那么多的候选", "用小词库还好", "输入法是不是被下架了", "我是不想折腾了", reported_block,
+        ):
             with self.subTest(message=message):
                 self.finish.reset_mock()
                 self.main.reset_mock()
@@ -515,7 +521,7 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
                 await self.assert_finished(ctx)
                 self.assert_main(message)
                 self.tool.assert_not_awaited()
-        for word in ("绷不住", "懂个锤子", "不好笑", "东一榔头西一棒子", "一不做二不休", "不好意思"):
+        for word in ("绷不住", "懂个锤子", "不好笑", "东一榔头西一棒子", "一不做二不休", "不好意思", "我就是我"):
             with self.subTest(word=word):
                 self.assertTrue(self.chat._chat_routing._is_chat_word_query_target(word))
 
@@ -587,6 +593,81 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         execute.assert_awaited_once()
         self.assertEqual([row["word"] for row in execute.await_args.args[0].args["items"]], ["发薪", "发薪日"])
         self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_qq_batch_card_with_rewritten_reminder_binds_the_sent_message(self):
+        self.pending_items = [{
+            "source": "others_submitted", "batchId": "offline-other-batch", "batchStatus": "Submitted",
+            "batchUrl": "https://keytao.vercel.app/batch/offline-other-batch", "itemStatus": "Pending",
+            "word": "发薪", "code": "fsxb", "type": "Phrase", "action": "Create",
+        }]
+        ctx = self.context("发薪 发薪日")
+        send = AsyncMock(return_value={"message_id": 12345})
+        ctx.bot = SimpleNamespace(send=send)
+        self.finish.side_effect = self.real_finish
+        with patch.object(self.chat._chat_render, "public_base_for_platform", return_value="https://qq.invalid"):
+            await self.assert_finished(ctx)
+
+            delivered = send.await_args.kwargs["message"]
+            self.assertIn("https://qq.invalid/batch/offline-other-batch", delivered)
+            record = self.store.get_record(self.author)
+            self.assertEqual(record.origin_message_ids, ("12345",))
+            reply = self.context("加入并提交")
+            reply.reply_reference = harness.ReplyReferenceInfo(
+                is_reply=True, is_to_bot=True, message_id="12345", text=delivered,
+            )
+            self.finish.side_effect = None
+            pending = AsyncMock(return_value="Offline batch submitted")
+            with patch.object(self.chat, "handle_pending_message_core", pending):
+                self.assertTrue(await self.chat._try_bound_pending_reply(reply))
+            self.assertEqual(pending.await_args.args[:4], ("加入并提交", "qq", self.author.actor_id, self.author))
+
+    async def test_fresh_bare_multi_word_query_replaces_old_preview(self):
+        self.candidate_codes.update({"指节": "fkjd", "狼王": "lpwp", "电箱": "dmxx"})
+        initial = self.context("指节 狼王 电箱")
+        await self.assert_finished(initial)
+        old_record = self.store.get_record(self.author)
+        self.history.append({"role": "assistant", "content": initial.response})
+        self.finish.reset_mock()
+        self.remember.reset_mock()
+        self.tool.reset_mock()
+
+        fresh = self.context("指节 电箱")
+        self.set_model(operands=("指节", "电箱"))
+        with patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "query,chat,pending_release,pending_answer"}):
+            stages = self.chat.STAGES
+            start = stages.index(self.chat._stage_understand_operation_early)
+            for stage in stages[start:]:
+                if await stage(fresh):
+                    break
+        response = fresh.response or fresh.scoped_pending_response or ""
+        self.assertIn("2 个词的候选", response)
+        self.assertNotIn("狼王", response)
+        self.assertEqual(self.prepared_words(), ["指节", "电箱"])
+        record = self.store.get_record(self.author)
+        self.assertIsNot(record, old_record)
+        self.assertEqual(record.state.args["_query_words"], ["指节", "电箱"])
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(response, record))
+        self.client.create.assert_not_awaited()
+
+    async def test_ambiguous_draft_cancel_asks_for_the_operation_before_tools(self):
+        ctx = self.context("撤销草稿")
+        raw = raw_operation(op="draft_clear", operands=[], codes=[])
+        classify = AsyncMock(return_value=raw)
+        clear = AsyncMock(return_value=self.chat.DraftActionResult("当前草稿已经是空的。"))
+        with (
+            patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "draft_clear,draft_recall,direct_exec"}),
+            patch("keytao_bot.harness.semantic_parser.parse_operation", classify),
+            patch.object(self.commands, "_perform_clear_current_draft", clear),
+        ):
+            await self.assert_finished(ctx)
+        self.assertIn("「撤回提交」", ctx.response)
+        self.assertIn("「清空草稿」", ctx.response)
+        clear.assert_not_awaited()
+        classify.assert_not_awaited()
+        self.tool.assert_not_awaited()
+        self.assertEqual(self.chat._prepare_user_facing_reply(ctx.response, self.memory), ctx.response)
+        self.assertEqual(await self.real_main("撤销草稿", "web-anon", "offline-owner"), ctx.response)
+        self.assertIsNone(self.chat._ambiguous_draft_cancel_reply("撤销草稿 https://keytao.vercel.app/batch/offline-batch"))
 
     async def test_mixed_present_and_missing_operands_keep_code_and_normal_selection(self):
         ctx = self.context("积极 发薪")
