@@ -1819,6 +1819,38 @@ def parse_existing_entry_move(message: str) -> Optional[ExistingEntryMove]:
     return _parse_existing_entry_move_clause(source)
 
 
+_ENTRY_DISPLACEMENT_RE = re.compile(
+    rf"(?:(?:请帮我|帮我|请|用|把|将)(?:[ \t]+|(?=[「“‘『\"']))){{0,2}}"
+    rf"(?P<word>{_REPLACE_AT_CODE_ENTRY_PATTERN})[ \t]*挤掉[ \t]*"
+    rf"(?P<occupant>{_REPLACE_AT_CODE_ENTRY_PATTERN})"
+)
+
+
+def parse_entry_displacement(message: str) -> Optional[Tuple[str, str]]:
+    """Parse a standalone request to move one existing word into another's slot."""
+    source = trusted_mutation_source(message).strip().rstrip("。.!！").strip()
+    if "挤掉" not in source or source.startswith(("请问", "我说", "转发")):
+        return None
+    match = _ENTRY_DISPLACEMENT_RE.fullmatch(source)
+    if match is None:
+        return None
+    operands = tuple(
+        (_replace_at_code_word(raw), raw) for raw in match.groups()
+    )
+    if any(
+        not word or (word == raw and (
+            not _unquoted_shift_word_is_literal(word)
+            or _TEXT_TRANSFORM_RE.search(word)
+            or "挤掉" in word
+            or word.endswith(("不要", "不能", "先别"))
+        ))
+        for word, raw in operands
+    ):
+        return None
+    word, occupant = (word for word, _ in operands)
+    return (word, occupant) if word != occupant else None
+
+
 def parse_code_only_recode(message: str) -> Optional[Tuple[str, str]]:
     """Bind an old-code lookup only to a complete literal recode clause."""
     source = trusted_mutation_source(message).strip().rstrip("。.!！").strip()
@@ -3121,6 +3153,8 @@ def message_authorizes_mutation(message: str) -> bool:
     if parse_explicit_entry_code_request(message) is not None:
         return True
     if parse_existing_entry_move(message) is not None:
+        return True
+    if parse_entry_displacement(message) is not None:
         return True
     if parse_code_only_recode(message) is not None:
         return True
@@ -5414,6 +5448,12 @@ def _validate_current_message_binding(
     """Bind model-generated mutation targets to entities in current raw text."""
     from .tools import ToolExecutor
 
+    if parse_entry_displacement(context.current_message or "") is not None:
+        return policy_block(
+            BLOCK_REASON_BINDING_INCOMPLETE,
+            "这条挤掉指令需要先核对现有码位和完整顺延方案。",
+            missing=["exactDisplacementPlan"],
+        )
     message = _mutation_authorization_view(context.current_message or "")
     code_word_changes = _parse_code_word_changes(context.current_message or "")
     multi_add = _multi_add_authorization_contract(

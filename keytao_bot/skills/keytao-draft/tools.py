@@ -546,6 +546,13 @@ def _ordered_code_occupants(phrases: List[Dict], ignored_words: Optional[set[str
     return sorted(candidates, key=lambda item: (item.get("weight", 0), item.get("word", "")))
 
 
+def _shift_continuations(codes: List[str], current: str, require_prefix: bool) -> List[str]:
+    following = codes[codes.index(current) + 1:]
+    if require_prefix:
+        return [code for code in following if len(code) > len(current) and code.startswith(current)]
+    return following
+
+
 def _build_code_shift_plan(
     word: str,
     target_code: str,
@@ -557,6 +564,7 @@ def _build_code_shift_plan(
     target_remark: str = "",
     target_needs_manual_review: Optional[bool] = None,
     ordered_assignments: Optional[List[Dict]] = None,
+    require_longer_continuations: bool = False,
 ) -> Dict:
     if ordered_assignments is not None:
         assignments = [
@@ -862,15 +870,14 @@ def _build_code_shift_plan(
                 "message": f"无法顺延「{occupant_word}」：当前编码 {probe_code} 不在它自己的候选编码中",
             }
 
-        code_index = occupant_codes.index(probe_code)
         next_code: Optional[str] = None
-        for candidate_code in occupant_codes[code_index + 1:]:
+        for candidate_code in _shift_continuations(occupant_codes, probe_code, require_longer_continuations):
             if candidate_code in reserved_codes:
                 continue
             next_code = candidate_code
             break
         if not next_code:
-            if len(probe_code) == 6:
+            if len(probe_code) == 6 and not require_longer_continuations:
                 continue
             return {
                 "success": False,
@@ -6161,6 +6168,7 @@ async def keytao_shift_phrase_code(
     _reviewed_candidate_codes: Optional[List[str]] = None,
     _expected_occupants_by_code: Optional[Dict[str, List[str]]] = None,
     _source_code: str = "",
+    _expected_displaced_word: str = "",
 ) -> Dict:
     """Preview, bind, then CAS-write a complete code-shift plan."""
     word = word.strip()
@@ -6174,6 +6182,11 @@ async def keytao_shift_phrase_code(
         or ordered_words is not None or additional_items or additional_shift_items
     ):
         return {"success": False, "message": "顺延来源编码或类型不完整，本次未写入。"}
+    if _expected_displaced_word and (
+        not _source_code or len(_source_code) <= len(target_code)
+        or _expected_displaced_word == word
+    ):
+        return {"success": False, "message": "只有长码词能挤掉短码词，本次未写入。"}
 
     trusted_reviewed_codes = _clean_code_list(_reviewed_candidate_codes)
     trusted_reviewed_code_set = set(trusted_reviewed_codes)
@@ -6675,6 +6688,7 @@ async def keytao_shift_phrase_code(
     source_phrase: Optional[Dict] = None
     source_draft_item: Optional[Dict] = None
     source_original_phrase: Optional[Dict] = None
+    draft_affected_codes: set[str] = set()
     if _source_code:
         source_type = str(target_type or "Phrase")
         source_draft = await keytao_list_draft_items(platform, platform_id, batch_id=batch_id)
@@ -6686,6 +6700,11 @@ async def keytao_shift_phrase_code(
         if projection is None:
             return {"success": False, "message": "当前草稿无法形成可验证的顺延来源，本次未写入。"}
         projected, removed = projection
+        if _expected_displaced_word:
+            draft_affected_codes = {entry["code"] for entry in projected}
+            draft_affected_codes.update(code for _, code, _ in removed)
+            if _source_code in draft_affected_codes:
+                return {"success": False, "message": f"草稿已改动原码 {_source_code}，请先核对草稿。"}
         live_sources = [
             phrase for phrase in word_results[word].get("phrases", [])
             if isinstance(phrase, dict) and phrase.get("word") == word
@@ -6767,14 +6786,28 @@ async def keytao_shift_phrase_code(
     ignored_words = set(target_words)
     code_phrase_map: Dict[str, List[Dict]] = {}
     pending_occupants_by_code: Dict[str, List[Dict]] = {}
+    require_longer_continuations = bool(_expected_displaced_word)
 
     async def ensure_code_lookup(code: str) -> Dict:
+        if code in draft_affected_codes:
+            return {"success": False, "message": f"草稿已改动编码 {code}，请先核对草稿。"}
         if code in code_phrase_map:
             return {"success": True}
         code_lookup = await _lookup_codes_raw([code])
         if not code_lookup.get("success"):
             return code_lookup
-        for item in code_lookup.get("results", []):
+        results = code_lookup.get("results", [])
+        if require_longer_continuations and (
+            not isinstance(results, list) or len(results) != 1
+            or not isinstance(results[0], dict) or results[0].get("code") != code
+            or not isinstance(results[0].get("phrases"), list)
+            or any(
+                not isinstance(row, dict) or not row.get("word") or row.get("code") != code
+                for row in results[0]["phrases"]
+            )
+        ):
+            return {"success": False, "message": f"无法核验编码 {code} 的完整占用记录。"}
+        for item in results:
             item_code = item.get("code", "")
             occupants = _ordered_code_occupants(item.get("phrases", []), ignored_words)
             if source_original_phrase:
@@ -6796,6 +6829,16 @@ async def keytao_shift_phrase_code(
         if not lookup_result.get("success"):
             return lookup_result
 
+    if _expected_displaced_word:
+        occupants = pending_occupants_by_code[target_code]
+        if len(occupants) != 1 or (
+            occupants[0].get("word"), occupants[0].get("code"), occupants[0].get("type")
+        ) != (_expected_displaced_word, target_code, target_type):
+            return {
+                "success": False, "staleConfirmation": True,
+                "message": f"{target_code} 的唯一占位词不是「{_expected_displaced_word}」，请重新核对词条。",
+            }
+
     reserved_codes = set(target_codes)
     queue: List[Dict] = [
         occupant
@@ -6811,7 +6854,10 @@ async def keytao_shift_phrase_code(
         probe_code = occupant.get("code", "")
         occupant_codes = word_candidate_code_map.get(occupant_word)
         if not occupant_codes:
-            occupant_encode = await _fetch_encode_candidates(occupant_word)
+            if require_longer_continuations:
+                occupant_encode = await _fetch_encode_candidates(occupant_word, probe_code)
+            else:
+                occupant_encode = await _fetch_encode_candidates(occupant_word)
             if not occupant_encode.get("success"):
                 return occupant_encode
             occupant_codes = occupant_encode.get("candidateCodes", [])
@@ -6823,10 +6869,8 @@ async def keytao_shift_phrase_code(
                 "word": occupant_word,
                 "candidateCodes": occupant_codes,
             }
-        code_index = occupant_codes.index(probe_code)
-
         found_next = False
-        for candidate_code in occupant_codes[code_index + 1:]:
+        for candidate_code in _shift_continuations(occupant_codes, probe_code, require_longer_continuations):
             if candidate_code in reserved_codes:
                 continue
             lookup_result = await ensure_code_lookup(candidate_code)
@@ -6841,7 +6885,7 @@ async def keytao_shift_phrase_code(
             break
 
         if not found_next:
-            if len(probe_code) == 6:
+            if len(probe_code) == 6 and not require_longer_continuations:
                 continue
             return {
                 "success": False,
@@ -6891,6 +6935,7 @@ async def keytao_shift_phrase_code(
             target_type=target_type,
             target_remark=target_remark,
             target_needs_manual_review=target_needs_manual_review,
+            require_longer_continuations=require_longer_continuations,
         )
     if not plan.get("success"):
         return plan
@@ -7125,7 +7170,10 @@ async def keytao_shift_phrase_code(
             "staleConfirmation": True,
             "message": render_remediation_reply(
                 "顺延计划或草稿内容已变化，旧确认已失效",
-                command=f"顺延「{word}」到 {target_code}",
+                command=(
+                    f"「{word}」挤掉「{_expected_displaced_word}」"
+                    if _expected_displaced_word else f"顺延「{word}」到 {target_code}"
+                ),
                 words=(word,),
             ),
             "batchId": current_batch_id,

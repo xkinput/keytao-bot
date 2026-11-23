@@ -5669,6 +5669,7 @@ async def _execute_shift_to_code(
     expected_occupants_by_code: Optional[Dict[str, List[str]]] = None,
     receipt_requested_words: Optional[List[str]] = None,
     source_code: str = "",
+    expected_displaced_word: str = "",
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     receipt_requested_words = receipt_requested_words or listed_words or ordered_words
@@ -5690,6 +5691,7 @@ async def _execute_shift_to_code(
                 "word": word,
                 "target_code": target_code,
                 **({"_source_code": source_code} if source_code else {}),
+                **({"_expected_displaced_word": expected_displaced_word} if expected_displaced_word else {}),
                 **(
                     {
                         "target_type": str(target_item.get("type") or "Phrase"),
@@ -10772,8 +10774,32 @@ async def try_handle_move_to_code_command(
     space_key: Optional[Tuple[str, str]] = None, owner_label: str = "",
 ) -> Optional[str]:
     """Resolve a literal existing-item move before model routing and preview it."""
-    from ..harness.authorization_grammar import parse_compound_entry_command, parse_existing_entry_move
+    from ..harness.authorization_grammar import (
+        parse_compound_entry_command, parse_entry_displacement, parse_existing_entry_move,
+    )
 
+    displacement = parse_entry_displacement(message_text)
+    if displacement is not None:
+        set_turn_flow("draft-op")
+        active = draft_operation_coordinator.find_for_actor((platform, user_id))
+        if active is not None:
+            return _active_operation_message_for_request(active, platform, user_id)
+        word, occupant = displacement
+        resolved = await _load_merged_word_entries(displacement, platform, user_id)
+        if resolved is None:
+            return f"无法锁定「{word}」和「{occupant}」各自唯一的现有编码，本次未写入。"
+        source, destination = resolved[word], resolved[occupant]
+        old_code, short_code = source["code"], destination["code"]
+        if len(old_code) <= len(short_code):
+            return f"只有长码词能挤掉短码词。「{word}」在 {old_code}，「{occupant}」在 {short_code}，本次未写入。"
+        if source["type"] != destination["type"]:
+            return f"「{word}」和「{occupant}」属于不同词库类型，本次未写入。"
+        return await _execute_shift_to_code(
+            word, short_code, platform, user_id, space_key, owner_label,
+            target_item={"type": source["type"]}, source_code=old_code,
+            expected_displaced_word=occupant,
+            receipt_requested_words=[word, occupant],
+        )
     compound = parse_compound_entry_command(message_text)
     if compound is not None:
         return await _try_handle_compound_entry_command(

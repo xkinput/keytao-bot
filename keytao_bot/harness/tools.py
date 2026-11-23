@@ -1255,6 +1255,7 @@ class ToolExecutor:
                 parameters.update({
                     "_reviewed_pinyin", "_reviewed_candidate_codes", "_pending_submitted_confirmed",
                     "_allow_same_code", "_expected_occupants_by_code", "_source_code",
+                    "_expected_displaced_word",
                 })
         call_args = {key: value for key, value in arguments.items()
                      if not key.startswith("_") or key in parameters}
@@ -1857,6 +1858,7 @@ class ToolExecutor:
         call_args.pop("_reviewed_candidate_codes", None)
         if context.current_message:
             call_args.pop("_source_code", None)
+            call_args.pop("_expected_displaced_word", None)
         internal_same_code = call_args.pop("_allow_same_code", None) is True
 
         def inject_reviewed_validation(

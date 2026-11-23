@@ -136,6 +136,31 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
         await self.turn(f"顺延“{b11_shift_WORD}”到xbluv", "move", ("xbluv",))
         self.assert_shift("xbluv")
 
+    async def test_bare_displacement_routes_to_named_shift_preview(self):
+        self.replay.entries[:] = [
+            {"word": "女优", "code": "nlydai", "type": "Phrase", "weight": 100},
+            {"word": "女忧", "code": "nlyda", "type": "Phrase", "weight": 100},
+        ]
+        self.replay.shifted = [{"word": "女忧", "fromCode": "nlyda", "toCode": "nlydao"}]
+        await self.turn("女忧挤掉女优")
+        self.assertIn("只有长码词能挤掉短码词", self.replay.last_response)
+        self.assertFalse(any(name == "keytao_shift_phrase_code" for name, _ in self.replay.calls))
+
+        await self.turn("女优挤掉女忧")
+        args, = [args for name, args in self.replay.calls if name == "keytao_shift_phrase_code"]
+        self.assertEqual(
+            (args["word"], args["_source_code"], args["target_code"], args["_expected_displaced_word"]),
+            ("女优", "nlydai", "nlyda", "女忧"),
+        )
+        self.assertIn("nlydao", self.replay.last_response)
+        self.assertEqual(self.replay.writes, [])
+
+        await self.turn("确认")
+        (_, confirmed), = self.replay.writes
+        self.assertEqual(confirmed["_expected_displaced_word"], "女忧")
+        self.assertEqual(confirmed["confirmed_plan_digest"], "b" * 64)
+        self.general.assert_not_awaited()
+
     async def test_unbound_conversational_shifts_never_write_or_override_cancel(self):
         self.replay.entries[:] = [
             {"word": word, "code": code, "type": "Phrase", "weight": 100}
@@ -701,6 +726,62 @@ class B11SourceShiftTests(unittest.IsolatedAsyncioTestCase):
     preview = B11SourceShiftTests_preview
 
     confirm = B11SourceShiftTests_confirm
+
+    async def test_named_displacement_rechecks_occupant_and_commits_the_whole_chain(self):
+        self.snapshot["items"] = []
+        self.live = [
+            {"word": word, "code": code, "type": "Phrase", "weight": 100}
+            for word, code in ((b11_shift_WORD, "xlbluv"), ("现有词", "xlbl"), ("后续词", "xlblu"))
+        ]
+        candidates = {
+            b11_shift_WORD: ["xlbl", "xlblu", "xlbluv"],
+            "现有词": ["xlbl", "zzzza", "xlblu"],
+            "后续词": ["xlblu", "zzzzau", "xlbluv"],
+        }
+        with patch.object(b11_shift_draft_tools, "_fetch_encode_candidates", AsyncMock(
+            side_effect=lambda word, code=None: {"success": True, "candidateCodes": candidates[word]},
+        )):
+            preview = await self.preview("xlbluv", "xlbl", _expected_displaced_word="现有词")
+            self.assertTrue(preview.get("requiresConfirmation"), preview)
+            self.assertEqual(
+                [(item["word"], item["fromCode"], item["toCode"]) for item in preview["shiftPlan"]["shifted"]],
+                [("现有词", "xlbl", "xlblu"), ("后续词", "xlblu", "xlbluv")],
+            )
+            confirmed = {
+                "_expected_displaced_word": "现有词", "confirmed_plan_digest": preview["planDigest"],
+                "batch_id": preview["batchId"], "expected_content_version": preview["contentVersion"],
+                "expected_warning_digest": preview["warningDigest"],
+            }
+            self.live[1]["word"] = "其他词"
+            stale = await self.preview("xlbluv", "xlbl", **confirmed)
+            self.assertTrue(stale.get("staleConfirmation"), stale)
+            self.assertEqual(self.append.await_count, 1)
+            self.assertEqual(self.snapshot["items"], [])
+
+            self.live[1]["word"] = "现有词"
+            self.snapshot["items"] = [{
+                "id": 42, "action": "Create", "word": "草稿词", "code": "xlblu",
+                "type": "Phrase", "weight": 100,
+            }]
+            conflict = await self.preview("xlbluv", "xlbl", **confirmed)
+            self.assertIn("草稿已改动编码", conflict["message"])
+            self.assertEqual(self.append.await_count, 1)
+            self.snapshot["items"] = []
+
+            candidates["后续词"].remove("xlbluv")
+            failed = await self.preview("xlbluv", "xlbl", **confirmed)
+            self.assertFalse(failed.get("success"), failed)
+            self.assertEqual(self.append.await_count, 1)
+            candidates["后续词"].append("xlbluv")
+
+            result = await self.preview("xlbluv", "xlbl", **confirmed)
+            self.assertTrue(result.get("success"), result)
+        self.assertEqual(
+            [(item["word"], item["code"]) for item in self.snapshot["items"] if item["action"] == "Create"],
+            [(b11_shift_WORD, "xlbl"), ("现有词", "xlblu"), ("后续词", "xlbluv")],
+        )
+        self.assertEqual(self.append.await_count, 2)
+        self.remove.assert_not_awaited()
 
     async def test_draft_only_moves_after_append_with_exact_cleanup(self):
         preview = await self.preview()
@@ -3171,6 +3252,23 @@ class GenericProposalBridgeTests(unittest.IsolatedAsyncioTestCase):
 
 # Source: test_s58_grammar.py
 class MoveToCodeGrammarTests(unittest.TestCase):
+    def test_displacement_consumes_two_literal_words_and_no_other_actions(self):
+        for message, words in (
+            ("喵喵 女优挤掉女忧", ("女优", "女忧")),
+            ("用「女优」挤掉「女忧」。", ("女优", "女忧")),
+            ("用户挤掉用户组", ("用户", "用户组")),
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(grammar.parse_entry_displacement(message), words)
+                self.assertTrue(grammar.message_authorizes_mutation(message))
+        for message in (
+            "他说女优挤掉女忧", "请问女优挤掉女忧", "如果女优挤掉女忧",
+            "女优挤掉女忧吗", "不要把女优挤掉女忧", "女优挤掉女忧，删除别的词",
+            "女优挤掉女优",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(grammar.parse_entry_displacement(message))
+
     context = MoveToCodeGrammarTests_context
 
     assert_bound_move = MoveToCodeGrammarTests_assert_bound_move

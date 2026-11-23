@@ -5229,10 +5229,12 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
         )
         ctx.operation_understood_early = True
         return False
-    from ..harness.authorization_grammar import parse_compound_entry_command, parse_existing_entry_move
-
-    if (parse_compound_entry_command(_strip_command_message_prefixes(ctx.normalized_message_text)) is not None
-            or parse_existing_entry_move(_strip_command_message_prefixes(ctx.normalized_message_text)) is not None):
+    entry_source = _strip_command_message_prefixes(ctx.normalized_message_text)
+    if (
+        _authorization_grammar.parse_entry_displacement(ctx.normalized_message_text) is not None
+        or _authorization_grammar.parse_compound_entry_command(entry_source) is not None
+        or _authorization_grammar.parse_existing_entry_move(entry_source) is not None
+    ):
         if await _stage_handle_explicit_entry_operation(ctx):
             return True
     pending_state = record.state if record is not None else None

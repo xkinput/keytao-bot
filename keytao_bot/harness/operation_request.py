@@ -59,6 +59,9 @@ def understand_message(
     command = grammar.parse_entry_move_plan(message)
     if command is not None:
         return matched("parse_entry_move_plan", "move", tuple(move.word for move in command.moves), tuple(move.target_code for move in command.moves))
+    displacement = grammar.parse_entry_displacement(message)
+    if displacement is not None:
+        return matched("parse_entry_displacement", "move", displacement)
     command = grammar.parse_existing_entry_move(message)
     if command is not None:
         return matched("parse_existing_entry_move", "move", (command.word, command.named_occupant), (command.target_code,))
