@@ -8,6 +8,7 @@ Also runs a periodic heartbeat check to catch cases where NapCat keeps the
 WebSocket alive but the QQ account is actually kicked/invalid.
 """
 import asyncio
+import os
 import httpx
 from datetime import datetime
 
@@ -21,9 +22,9 @@ config = driver.config
 TELEGRAM_TOKEN = None
 NOTIFY_CHAT_ID = getattr(config, "notify_tg_chat_id", None)
 RECONNECT_GRACE = 90   # seconds to wait before treating no-reconnect as real offline
-LOGIN_VERIFY_DELAY = 5  # seconds after reconnect before verifying login
-HEARTBEAT_INTERVAL = 60  # seconds between periodic login checks
-LOGIN_INFO_TIMEOUT = 10  # seconds before a wedged bot is treated as unhealthy
+LOGIN_VERIFY_DELAY = 5  # seconds after connect before checking status
+HEARTBEAT_INTERVAL = 60  # seconds between status checks and failed alert retries
+STATUS_TIMEOUT = 10
 
 _tg_bots = getattr(config, "telegram_bots", None)
 if _tg_bots:
@@ -37,10 +38,9 @@ if _tg_bots:
 
 # pending tasks: bot_id -> asyncio.Task
 _pending: dict[str, asyncio.Task] = {}
-# track bots that have already been reported offline to avoid duplicate alerts
-_reported_offline: set[str] = set()
-# heartbeat task
-_heartbeat_task: asyncio.Task | None = None
+# Delivery is tracked per alert type until the account is confirmed online.
+_reported: dict[str, set[str]] = {}
+_checking: set[str] = set()
 # strong references to fire-and-forget tasks, so the event loop cannot collect
 # them mid-flight (asyncio only keeps weak references to running tasks)
 _background_tasks: set[asyncio.Task] = set()
@@ -54,55 +54,86 @@ def _spawn_task(coro) -> asyncio.Task:
     return task
 
 
-async def _get_login_info(bot: QQBot) -> dict:
-    """Fetch login info, treating a wedged bot as a failure instead of hanging."""
-    return await asyncio.wait_for(bot.get_login_info(), timeout=LOGIN_INFO_TIMEOUT)
-
-
-async def _send_tg(text: str):
+async def _send_tg(text: str) -> bool:
     if not TELEGRAM_TOKEN or not NOTIFY_CHAT_ID:
         logger.warning("[watchdog] TG token or chat_id not configured, cannot send notification")
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json={"chat_id": NOTIFY_CHAT_ID, "text": text})
-            if resp.status_code != 200:
-                logger.warning(f"[watchdog] TG send failed: {resp.text}")
+            if resp.status_code == 200 and resp.json().get("ok") is True:
+                return True
+            logger.warning(f"[watchdog] TG send failed: HTTP {resp.status_code}")
     except Exception as e:
-        logger.error(f"[watchdog] TG send error: {e}")
+        logger.error(f"[watchdog] TG send error: {type(e).__name__}")
+    return False
+
+
+async def _notify_once(bot_id: str, kind: str, title: str, detail: str, ts: str) -> bool:
+    reported = _reported.setdefault(bot_id, set())
+    if kind in reported:
+        return True
+    if not await _send_tg(f"⚠️ {title}\n账号：{bot_id}\n时间：{ts}\n\n{detail}"):
+        return False
+    reported.add(kind)
+    logger.info(f"[watchdog] TG alert accepted for QQ bot {bot_id}: {kind}")
+    return True
 
 
 async def _delayed_notify(bot_id: str, ts: str):
-    await asyncio.sleep(RECONNECT_GRACE)
-    # still offline after grace period — napcat never came back
-    if bot_id not in _reported_offline:
-        _reported_offline.add(bot_id)
-        msg = f"⚠️ QQ bot 掉线了！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 可能需要重新登录。"
-        logger.warning(f"[watchdog] QQ bot {bot_id} still offline after {RECONNECT_GRACE}s, notifying")
-        await _send_tg(msg)
-    _pending.pop(bot_id, None)
+    try:
+        await asyncio.sleep(RECONNECT_GRACE)
+        logger.warning(f"[watchdog] QQ bot {bot_id} still disconnected after {RECONNECT_GRACE}s, notifying")
+        while not await _notify_once(
+            bot_id, "transport_disconnected", "QQ Bot 与 NapCat 连接中断",
+            f"连接超过 {RECONNECT_GRACE} 秒未恢复，暂时无法确认 QQ 账号在线状态。", ts,
+        ):
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+    finally:
+        if _pending.get(bot_id) is asyncio.current_task():
+            _pending.pop(bot_id, None)
 
 
 async def _verify_login_after_reconnect(bot: QQBot, bot_id: str):
-    """
-    Napcat may reconnect the WebSocket while the QQ account is still kicked/invalid.
-    Verify the account is actually logged in before cancelling the alert.
-    """
     await asyncio.sleep(LOGIN_VERIFY_DELAY)
+    await _check_qq_status(bot, bot_id)
+
+
+async def _check_qq_status(bot: QQBot, bot_id: str):
+    if bot_id in _checking or bot_id in _pending or get_bots().get(bot_id) is not bot:
+        return
+    _checking.add(bot_id)
     try:
-        info = await _get_login_info(bot)
-        if not info.get("user_id"):
-            raise ValueError("empty user_id in login info")
-        logger.info(f"[watchdog] QQ bot {bot_id} login verified after reconnect (uid={info['user_id']})")
-        _reported_offline.discard(bot_id)
-    except Exception as e:
-        logger.warning(f"[watchdog] QQ bot {bot_id} reconnected but login check failed: {e}")
-        if bot_id not in _reported_offline:
-            _reported_offline.add(bot_id)
-            ts = datetime.now().strftime("%H:%M:%S")
-            msg = f"⚠️ QQ bot 掉线了！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 已重启但账号仍未登录；需要人工扫码，没有可由 bot 执行的命令。"
-            await _send_tg(msg)
+        try:
+            status = await asyncio.wait_for(bot.get_status(), timeout=STATUS_TIMEOUT)
+            online = status.get("online") if isinstance(status, dict) else None
+            if not isinstance(online, bool):
+                raise ValueError("invalid online status")
+        except Exception as error:
+            logger.warning(f"[watchdog] QQ status check failed for {bot_id}: {type(error).__name__}")
+            online = None
+
+        if bot_id in _pending or get_bots().get(bot_id) is not bot:
+            return
+        if online is True:
+            if _reported.pop(bot_id, None):
+                logger.info(f"[watchdog] QQ bot {bot_id} recovered (heartbeat)")
+            return
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        if online is False:
+            await _notify_once(
+                bot_id, "account_offline", "QQ 账号已掉线",
+                "NapCat 已确认账号离线，请在 NapCat WebUI 重新登录。", ts,
+            )
+        else:
+            await _notify_once(
+                bot_id, "status_unknown", "QQ 在线状态暂不可确认",
+                "NapCat 未返回可用的在线状态，请检查账号和连接。", ts,
+            )
+    finally:
+        _checking.discard(bot_id)
 
 
 async def _heartbeat_loop():
@@ -114,55 +145,32 @@ async def _heartbeat_loop():
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         bots = get_bots()
         for bot_id, bot in list(bots.items()):
-            if not isinstance(bot, QQBot):
-                continue
-            # skip bots already in grace period (disconnect was already detected)
-            if bot_id in _pending:
-                continue
-            try:
-                # One wedged bot must not stall the heartbeat for the others.
-                info = await _get_login_info(bot)
-                if not info.get("user_id"):
-                    raise ValueError("empty user_id")
-                if bot_id in _reported_offline:
-                    logger.info(f"[watchdog] QQ bot {bot_id} recovered (heartbeat)")
-                    _reported_offline.discard(bot_id)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[watchdog] heartbeat check for {bot_id} timed out after "
-                    f"{LOGIN_INFO_TIMEOUT}s, treating as unhealthy"
-                )
-                if bot_id not in _reported_offline:
-                    _reported_offline.add(bot_id)
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    msg = f"⚠️ QQ bot 账号无响应！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 心跳检查超时；需要人工检查账号状态，没有可由 bot 执行的命令。"
-                    await _send_tg(msg)
-            except Exception as e:
-                logger.warning(f"[watchdog] heartbeat check failed for {bot_id}: {e}")
-                if bot_id not in _reported_offline:
-                    _reported_offline.add(bot_id)
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    msg = f"⚠️ QQ bot 账号失效！\n账号：{bot_id}\n时间：{ts}\n\nNapCat WebSocket 在线但账号已离线；需要人工登录，没有可由 bot 执行的命令。"
-                    await _send_tg(msg)
+            if isinstance(bot, QQBot):
+                await _check_qq_status(bot, bot_id)
 
 
 @driver.on_startup
 async def start_heartbeat():
-    global _heartbeat_task
-    _heartbeat_task = _spawn_task(_heartbeat_loop())
+    _spawn_task(_heartbeat_loop())
     logger.info(f"[watchdog] heartbeat started, interval={HEARTBEAT_INTERVAL}s")
+    account = os.getenv("ACCOUNT", "").strip()
+    if account.isascii() and account.isdecimal() and not isinstance(get_bots().get(account), QQBot):
+        _pending[account] = _spawn_task(_delayed_notify(account, datetime.now().strftime("%H:%M:%S")))
 
 
 @driver.on_shutdown
 async def stop_heartbeat():
-    global _heartbeat_task
-    if _heartbeat_task:
-        _heartbeat_task.cancel()
-        _heartbeat_task = None
+    tasks = tuple(_background_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _pending.clear()
 
 
 @driver.on_bot_disconnect
 async def on_qq_disconnect(bot: QQBot):
+    if not isinstance(bot, QQBot):
+        return
     bot_id = bot.self_id
     ts = datetime.now().strftime("%H:%M:%S")
     logger.warning(f"[watchdog] QQ bot {bot_id} disconnected, waiting {RECONNECT_GRACE}s before notify")
@@ -177,9 +185,11 @@ async def on_qq_disconnect(bot: QQBot):
 
 @driver.on_bot_connect
 async def on_qq_connect(bot: QQBot):
+    if not isinstance(bot, QQBot):
+        return
     bot_id = bot.self_id
     task = _pending.pop(bot_id, None)
     if task:
         task.cancel()
         logger.info(f"[watchdog] QQ bot {bot_id} reconnected within grace period, verifying login...")
-        _spawn_task(_verify_login_after_reconnect(bot, bot_id))
+    _spawn_task(_verify_login_after_reconnect(bot, bot_id))
