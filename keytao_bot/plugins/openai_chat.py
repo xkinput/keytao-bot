@@ -1662,12 +1662,21 @@ async def get_ai_response_core(
     )
     if help_reply is not None:
         return help_reply
-    if not OPENAI_API_KEY or not AsyncOpenAI:
-        return "❌ AI 服务未配置，请联系管理员"
 
     try:
         _current_turn_message.set(message)
-        if command_intent is None and platform in {"web", "web-anon"} and not visual_context:
+        web_text_turn = platform in {"web", "web-anon"} and not visual_context
+        if web_text_turn:
+            from ..utils.commonness_query import commonness_query_reply
+
+            owner = memory_context.conversation_address if memory_context else ConversationAddress.private(platform, user_id)
+            commonness_reply = await commonness_query_reply(message, platform, user_id, owner)
+            if commonness_reply is not None:
+                set_turn_flow("word-commonness")
+                return commonness_reply
+        if not OPENAI_API_KEY or not AsyncOpenAI:
+            return "❌ AI 服务未配置，请联系管理员"
+        if command_intent is None and web_text_turn:
             command_intent = await _classify_message_command_intent(message)
         _set_conversational_turn(message, history, command_intent)
         memory_block = ""
@@ -2530,8 +2539,9 @@ def _strip_unbacked_commonness_copy(
     evidence_lines: Tuple[str, ...],
 ) -> str:
     """Remove comparison lines that lack exact same-turn comparator evidence."""
+    source = str(text or "")
     kept: List[str] = []
-    for line in str(text or "").splitlines():
+    for line in source.splitlines():
         if (
             _COMMONNESS_COMPARISON_COPY_RE.search(line)
             and not _commonness_line_is_backed(line, evidence_lines)
@@ -2543,6 +2553,8 @@ def _strip_unbacked_commonness_copy(
         kept.append(line)
     while kept and not kept[-1].strip():
         kept.pop()
+    if not kept and source.strip():
+        return "这次缺少可核验的词频依据，暂时无法比较。"
     return "\n".join(kept)
 
 
@@ -7935,10 +7947,10 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_visual_probe_timeout,
     _stage_initialize_conversation,
     _stage_handle_discovery_reply,
+    _stage_handle_commonness_query,
     _stage_understand_operation_early,
     _stage_handle_understood_command_control,
     _stage_handle_explicit_draft_conversation_reset,
-    _stage_handle_commonness_query,
     _stage_handle_completed_draft_undo,
     _stage_claim_offered_answer,
     _stage_resolve_current_pending_scope,

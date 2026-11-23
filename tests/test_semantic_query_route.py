@@ -193,6 +193,62 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("jjuu", ctx.response)
         self.assertIsNone(self.store.get_record(self.author))
 
+    async def test_natural_frequency_comparison_reads_local_evidence_before_model(self):
+        from keytao_bot.utils.commonness_query import parse_commonness_query
+
+        message = "枉顾 罔顾，哪个用得更多"
+        words = ("枉顾", "罔顾")
+        counts = {"枉顾": 100, "罔顾": 400}
+        self.entries.update({"枉顾": "wpgj", "罔顾": "wpgji"})
+        self.set_model(operands=words)
+        self.main.return_value = "罔顾比枉顾更常用。"
+
+        def reference(word):
+            return {"available": True, "attested": True, "corpusFrequency": counts[word],
+                    "dictionaryPresenceCount": 3}
+
+        ctx = self.context(message)
+        token = self.chat._current_turn_message.set(message)
+        try:
+            with patch.object(self.chat.keytao_review, "_query_commonness_reference", side_effect=reference):
+                stages = self.chat.STAGES
+                start = stages.index(self.chat._stage_handle_discovery_reply) + 1
+                for stage in stages[start:]:
+                    if await stage(ctx):
+                        break
+                delivered = self.chat._prepare_user_facing_reply(self.finish.await_args.args[4], self.memory)
+                self.assertIn("常用度排序（本地语料与词典）", delivered)
+                self.assertIn("1 | 罔顾 | jieba 参考 400", delivered)
+                self.assertIn("2 | 枉顾 | jieba 参考 100", delivered)
+                self.tool.assert_awaited_once_with("keytao_lookup_by_words_batch", {"words": list(words)},
+                                                   "qq", self.author.actor_id)
+                self.tool.side_effect = None
+                self.tool.return_value = '{"success": false}'
+                web_memory = harness.ChatMemoryContext(platform="web-anon", user_id="offline-web")
+                web_reply = await self.real_main(message, "web-anon", "offline-web", memory_context=web_memory)
+                self.assertEqual(self.chat._prepare_user_facing_reply(web_reply, web_memory), delivered)
+        finally:
+            self.chat._current_turn_message.reset(token)
+        self.main.assert_not_awaited()
+        self.client.create.assert_not_awaited()
+        self.assertEqual(parse_commonness_query("枉顾和罔顾，哪一个用得多？"), words)
+        self.assertIsNone(parse_commonness_query("不要比较枉顾 罔顾，哪个用得更多"))
+        self.assertIsNone(parse_commonness_query("枉顾 罔顾 罔然，哪个用得更多"))
+
+    async def test_fully_filtered_frequency_reply_still_delivers_qq_text(self):
+        ctx = self.context("枉顾和罔顾的实际用法")
+        ctx.response = "罔顾比枉顾更常用。"
+        send = AsyncMock(return_value={"message_id": 12345})
+        ctx.bot = type("Bot", (), {"send": send})()
+        ctx.event = SimpleNamespace(message_id=12344)
+        ctx.QQMessageSegment = SimpleNamespace(reply=lambda _: "[reply]", at=lambda _: "[at]")
+        self.finish.side_effect = self.real_finish
+        self.assertFalse(await self.chat._stage_reject_empty_response(ctx))
+        self.assertFalse(await self.chat._stage_enforce_advertised_reply_contract(ctx))
+        self.assertTrue(await self.chat._stage_finish_platform_response(ctx))
+        self.assertEqual(send.await_args.kwargs["message"],
+                         "[reply][at] 这次缺少可核验的词频依据，暂时无法比较。")
+
     async def test_exact_word_returns_existing_code_without_main_or_ticket(self):
         ctx = self.context("积极")
         self.set_model(operands=("积极",))
