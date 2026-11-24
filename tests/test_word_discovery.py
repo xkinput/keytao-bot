@@ -677,10 +677,14 @@ def test_auto_ingest_chain_and_degradation():
             "contentVersion": 3,
             "warningDigest": "d" * 64,
         }
+        written = [
+            {"id": 71, "word": "绝绝子", "code": "aaaa", "action": "Create", "type": "Phrase"},
+            {"id": 72, "word": "破防", "code": "bbbb", "action": "Create", "type": "Phrase"},
+        ]
         happy = [
             {"batchId": "batch-1"},
             dict(draft_preview),
-            {"successCount": 2, "contentVersion": 4},
+            {"successCount": 2, "contentVersion": 4, "draftItems": written},
             {
                 "success": False,
                 "requiresConfirmation": True,
@@ -689,7 +693,11 @@ def test_auto_ingest_chain_and_degradation():
                 "warningDigest": "e" * 64,
                 "snapshotDigest": "f" * 64,
             },
-            {"success": True, "batch": {"id": "batch-1", "status": "Submitted", "contentVersion": 5}},
+            {
+                "success": True,
+                "batch": {"id": "batch-1", "status": "Submitted", "contentVersion": 5},
+                "approvedItemIds": [71, 72],
+            },
             {"success": True, "batch": {"id": "batch-1", "status": "Approved"}},
         ]
 
@@ -748,6 +756,7 @@ def test_auto_ingest_chain_and_degradation():
                 "confirmed": False,
                 "previewOnly": True,
                 "expectedContentVersion": 4,
+                "approvedItemIds": [71, 72],
             },
         )
         check(
@@ -759,6 +768,7 @@ def test_auto_ingest_chain_and_degradation():
                 "expectedContentVersion": 4,
                 "expectedWarningDigest": "e" * 64,
                 "expectedSnapshotDigest": "f" * 64,
+                "approvedItemIds": [71, 72],
             },
         )
         approve_body = recorded[5][2]["json_body"]
@@ -828,7 +838,7 @@ def test_auto_ingest_chain_and_degradation():
                 [
                     {"batchId": "b"},
                     dict(confirm_needed),
-                    {"successCount": 1, "contentVersion": 2},
+                    {"successCount": 2, "contentVersion": 2, "draftItems": written},
                     {"success": False, "message": "no"},
                 ],
                 "submit",
@@ -838,9 +848,13 @@ def test_auto_ingest_chain_and_degradation():
                 [
                     {"batchId": "b"},
                     dict(confirm_needed),
-                    {"successCount": 1, "contentVersion": 2},
+                    {"successCount": 2, "contentVersion": 2, "draftItems": written},
                     dict(submit_preview),
-                    {"success": True, "batch": {"id": "b", "status": "Submitted", "contentVersion": 3}},
+                    {
+                        "success": True,
+                        "batch": {"id": "b", "status": "Submitted", "contentVersion": 3},
+                        "approvedItemIds": [71, 72],
+                    },
                     KeytaoApiError("no"),
                 ],
                 "auto-approve",
@@ -855,7 +869,7 @@ def test_auto_ingest_chain_and_degradation():
         missing_submit_version = [
             {"batchId": "b"},
             dict(confirm_needed),
-            {"successCount": 2, "contentVersion": 2},
+            {"successCount": 2, "contentVersion": 2, "draftItems": written},
             dict(submit_preview),
             {"success": True, "batch": {}},
         ]
@@ -864,11 +878,19 @@ def test_auto_ingest_chain_and_degradation():
                 patch.object(http_client, "keytao_json", side_effect=make_stub(missing_submit_version)):
             result = await wd.submit_discovered_words(items, "2026-07-26")
         check("a missing post-submit version fails closed", result.get("success") is False)
-        check("the missing field is named in the failure", "batch.contentVersion" in result.get("message", ""))
+        check("the missing version is named in the failure", "版本" in result.get("message", ""))
         check(
             "no auto-approve is attempted without the post-submit version",
             all(not path.endswith("/auto-approve") for _method, path, _kwargs in recorded),
         )
+
+        missing_review_receipt = [*happy[:-2], {**happy[-2], "approvedItemIds": [71]}]
+        recorded.clear()
+        with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                patch.object(http_client, "keytao_json", side_effect=make_stub(missing_review_receipt)):
+            result = await wd.submit_discovered_words(items, "2026-07-26")
+        check("a missing item approval receipt stops finalization", result.get("success") is False
+              and result.get("pendingRecovery") and len(recorded) == 5)
 
         preview_timeout = [
             {"batchId": "b"},
@@ -890,7 +912,7 @@ def test_auto_ingest_chain_and_degradation():
         submit_confirm_timeout = [
             {"batchId": "b"},
             dict(confirm_needed),
-            {"successCount": 2, "contentVersion": 2},
+            {"successCount": 2, "contentVersion": 2, "draftItems": written},
             dict(submit_preview),
             KeytaoApiError("ReadTimeout；提交可能已生效"),
         ]
@@ -1146,7 +1168,11 @@ def test_partial_ingest_is_attributed_per_word():
             },
             {"success": False, "requiresConfirmation": True, "batchId": "b1",
              "contentVersion": 3, "warningDigest": "a" * 64, "snapshotDigest": "b" * 64},
-            {"success": True, "batch": {"id": "b1", "status": "Submitted", "contentVersion": 4}},
+            {
+                "success": True,
+                "batch": {"id": "b1", "status": "Submitted", "contentVersion": 4},
+                "approvedItemIds": [21],
+            },
             {"success": True, "batch": {"id": "b1", "status": "Approved"}},
         ]
         recorded.clear()
@@ -1278,7 +1304,11 @@ def test_partial_ingest_is_attributed_per_word():
             ]},
             {"success": False, "requiresConfirmation": True, "batchId": "b1",
              "contentVersion": 3, "warningDigest": "a" * 64, "snapshotDigest": "b" * 64},
-            {"success": True, "batch": {"id": "b1", "status": "Submitted", "contentVersion": 4}},
+            {
+                "success": True,
+                "batch": {"id": "b1", "status": "Submitted", "contentVersion": 4},
+                "approvedItemIds": [41, 42],
+            },
             {"success": False, "message": "审核服务不可用"},
             {"success": True, "batchId": "b1", "contentVersion": 5, "status": "Draft"},  # recall
             {"success": True, "batchId": "b1", "contentVersion": 5, "items": [
@@ -1345,7 +1375,11 @@ def test_partial_ingest_is_attributed_per_word():
                 ]},
                 {"success": False, "requiresConfirmation": True, "batchId": "b9",
                  "contentVersion": 3, "warningDigest": "a" * 64, "snapshotDigest": "b" * 64},
-                {"success": True, "batch": {"id": "b9", "status": "Submitted", "contentVersion": 4}},
+                {
+                    "success": True,
+                    "batch": {"id": "b9", "status": "Submitted", "contentVersion": 4},
+                    "approvedItemIds": [51, 52],
+                },
                 {"success": False, "message": "审核服务不可用"},
                 KeytaoApiError("recall 挂了"),
             ]

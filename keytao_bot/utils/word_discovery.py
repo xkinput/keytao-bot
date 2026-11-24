@@ -55,6 +55,7 @@ from .keytao_review import (
 )
 from .review_flags import (
     apply_manual_review_flag,
+    approved_item_ids_match,
     manual_review_reason,
     read_manual_review_flag,
 )
@@ -1922,6 +1923,16 @@ async def submit_discovered_words(
         return failure(message, batch_id=batch_id, rejected=rejected or None, pending=pending)
 
     accepted_words = [item.word for item in accepted]
+    approved_item_ids = sorted({item_id for item_id, _ in cleanup_targets})
+    if len(approved_item_ids) != len(accepted):
+        message = "草稿写入响应缺少逐项编号，已停止提交"
+        pending = leave_pending(RECOVERY_STAGE_DRAFT, batch_id, accepted_words, message)
+        return failure(
+            message,
+            batch_id=batch_id,
+            rejected=[(item, message) for item in accepted] + rejected,
+            pending=pending,
+        )
 
     draft_content_version = added.get("contentVersion")
     if (
@@ -1959,6 +1970,7 @@ async def submit_discovered_words(
                 "confirmed": False,
                 "previewOnly": True,
                 "expectedContentVersion": draft_content_version,
+                "approvedItemIds": approved_item_ids,
             },
             timeout=60.0,
             allow_status={400},
@@ -1994,6 +2006,7 @@ async def submit_discovered_words(
                     "expectedContentVersion": submit_preview_version,
                     "expectedWarningDigest": submit_warning_digest,
                     "expectedSnapshotDigest": submit_snapshot_digest,
+                    "approvedItemIds": approved_item_ids,
                 },
                 timeout=60.0,
                 **call_kwargs,
@@ -2086,11 +2099,12 @@ async def submit_discovered_words(
         or submitted_batch.get("status") != "Submitted"
         or not isinstance(submitted_content_version, int)
         or isinstance(submitted_content_version, bool)
-        or submitted_content_version < 0
+        or submitted_content_version != draft_content_version + 1
+        or not approved_item_ids_match(submitted.get("approvedItemIds"), approved_item_ids)
     ):
-        message = "批次已提交，但响应缺少有效的 batch.contentVersion，已停止自动批准"
+        message = "批次已提交，但无法核实批次版本和逐项审核结果，已停止自动批准"
         logger.error(
-            "[word_discovery] submit response missing valid batch.contentVersion; "
+            "[word_discovery] submit response missing valid version or item approval receipt; "
             "refusing auto-approve"
         )
         pending = leave_pending(
@@ -2099,6 +2113,19 @@ async def submit_discovered_words(
             accepted_words,
             message,
         )
+        return failure(
+            message,
+            batch_id=batch_id,
+            rejected=[(item, message) for item in accepted] + rejected,
+            pending=pending,
+        )
+
+    draft_item_ids = [
+        entry.get("id") for entry in added["draftItems"] if isinstance(entry, dict)
+    ]
+    if not approved_item_ids_match(draft_item_ids, approved_item_ids):
+        message = "本轮词条已提交，批次中其余词条仍需审核"
+        pending = leave_pending(RECOVERY_STAGE_SUBMITTED, batch_id, accepted_words, message)
         return failure(
             message,
             batch_id=batch_id,

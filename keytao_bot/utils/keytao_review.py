@@ -39,7 +39,6 @@ from .keytao_encoding import (
     normalize_contextual_phrase_encoding,
     pinyin_to_phonetic_code,
 )
-from .keytao_candidate_preference import apply_zhe_fe_chain_preference
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 from .observability import current_turn_id, observe_model_call, record_encode_call
 from .pending_confirmation import render_remediation_reply
@@ -3527,6 +3526,7 @@ async def _prepare_reviewed_single_character(
     requested_meaning: str = "",
 ) -> Dict:
     """Keep character encoding, table occupancy, and approval in one Single lane."""
+    from .keytao_encoding import scheme_phonetic_bases
     from .keytao_single_char import single_character_encoding
 
     encoding = await fetch_keytao_encode(config, word)
@@ -3554,6 +3554,9 @@ async def _prepare_reviewed_single_character(
         for code in codes
     })
     pronunciation = result["pronunciations"][0]
+    fly_key_bases = tuple(scheme_phonetic_bases(pronunciation["normalized"])[1:])
+    for status in statuses:
+        status["flyKey"] = status["code"].startswith(fly_key_bases)
     pronunciation["candidateStatuses"] = statuses
     pronunciation["characterReadings"] = _character_reading_evidence(
         word, pronunciation["normalized"], encoding,
@@ -3651,12 +3654,6 @@ async def prepare_reviewed_word(
         evidence = {"success": False, "groups": [], "sources": []}
     if isinstance(encode_data, BaseException):
         encode_data = {"success": False, "message": str(encode_data)}
-    else:
-        encode_data = apply_zhe_fe_chain_preference(
-            word,
-            encode_data,
-            include_alternative_in_codes=True,
-        )
 
     collector_source_outcomes = [
         outcome
@@ -8081,10 +8078,17 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         for task in review_tasks.values():
             if not task.done():
                 task.cancel()
-    for outcome in outcomes:
+    approved_item_ids: List[int] = []
+    for item, outcome in zip(items, outcomes):
         issues.extend(outcome.issues)
         sealed_issues.extend(outcome.sealed_issues)
         approved_items.extend(outcome.approved_items)
+        item_id = item.get("id")
+        if (
+            type(item_id) is int and item_id > 0
+            and outcome.approved_items and not (outcome.issues or outcome.sealed_issues or outcome.skipped_items)
+        ):
+            approved_item_ids.append(item_id)
         skipped_items.extend(outcome.skipped_items)
         common_known_items.extend(outcome.common_known_items)
         semantic_context_items.extend(outcome.semantic_context_items)
@@ -8155,6 +8159,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         # Subset of ``issues`` that code has sealed: no LLM pass may reopen them.
         "structuredManualReviewIssues": sealed_issues,
         "approvedItems": approved_items,
+        "approvedItemIds": approved_item_ids,
         "skippedItems": skipped_items,
         "commonKnownItems": common_known_items,
         "semanticContextAutoPassItems": semantic_context_items,

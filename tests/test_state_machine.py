@@ -6941,11 +6941,12 @@ def test_submit_confirmation_reuses_preview_audit_snapshot():
             "summary": "首次审计结论",
             "issues": [],
             "approvedItems": [{"word": "阻抑", "code": "zjyka"}],
+            "approvedItemIds": [51],
             "batchId": "draft-audit",
             "contentVersion": 7,
             "snapshotDigest": "1" * 64,
             "snapshotItems": [
-                {"action": "Create", "word": "阻抑", "code": "zjyka"},
+                {"id": 51, "action": "Create", "word": "阻抑", "code": "zjyka"},
             ],
         }
         changed_wording = {
@@ -6964,7 +6965,8 @@ def test_submit_confirmation_reuses_preview_audit_snapshot():
             }),
             (200, {
                 "success": True,
-                "contentVersion": 8,
+                "batch": {"id": "draft-audit", "status": "Submitted", "contentVersion": 8},
+                "approvedItemIds": [51],
             }),
         ]
         auto_approve = AsyncMock(return_value={"success": True})
@@ -7062,6 +7064,10 @@ def test_submit_confirmation_reuses_preview_audit_snapshot():
         check("audit ticket is actor-bound", wrong_actor.get("staleConfirmation") is True)
         check("confirmation reuses one audit", len(audit_calls) == 1)
         check("confirmation reaches server", len(http_calls) == 2)
+        check("preview and confirm bind the same approved row", all(
+            json.loads(kwargs["content"])["approvedItemIds"] == [51]
+            for _, kwargs in http_calls
+        ))
         check("confirmation succeeds despite wording drift", confirmed.get("success") is True)
         check(
             "auto-approve uses the post-submit content version",
@@ -7086,12 +7092,14 @@ def test_submit_confirmation_reuses_needs_admin_audit_snapshot():
             "autoApprove": False,
             "summary": "需要管理员审核",
             "issues": ["缺少权威来源"],
-            "approvedItems": [],
+            "approvedItems": ["Create：生产线@ejxu"],
+            "approvedItemIds": [21],
             "batchId": "draft-needs-admin",
             "contentVersion": 7,
             "snapshotDigest": "4" * 64,
             "snapshotItems": [
-                {"action": "Create", "word": "阻抑", "code": "zjyka"},
+                {"id": 20, "action": "Create", "word": "阻抑", "code": "zjyka"},
+                {"id": 21, "action": "Create", "word": "生产线", "code": "ejxu"},
             ],
         }
         response_payloads = [
@@ -7106,7 +7114,8 @@ def test_submit_confirmation_reuses_needs_admin_audit_snapshot():
             }),
             (200, {
                 "success": True,
-                "contentVersion": 8,
+                "batch": {"id": "draft-needs-admin", "status": "Submitted", "contentVersion": 8},
+                "approvedItemIds": [21],
             }),
         ]
         auto_approve = AsyncMock(return_value={"success": True})
@@ -7184,6 +7193,10 @@ def test_submit_confirmation_reuses_needs_admin_audit_snapshot():
         check("needs-admin confirmation reuses one audit", len(audit_calls) == 1)
         check("needs-admin confirmation reaches server", len(http_calls) == 2)
         check("needs-admin confirmation succeeds", confirmed.get("success") is True)
+        check("only the audited row is sent for approval", all(
+            json.loads(kwargs["content"])["approvedItemIds"] == [21]
+            for _, kwargs in http_calls
+        ))
         check("needs-admin verdict never auto-approves", auto_approve.await_count == 0)
 
     asyncio.run(_run())
@@ -15507,13 +15520,16 @@ def test_review_audit_mixed_batch_uses_strictest_item():
         })
         items = [
             {
+                "id": 11,
                 "action": "Create",
                 "word": "追速",
                 "code": "fbsjuv",
                 "type": "Phrase",
+                "needsManualReview": True,
                 "remark": "喵喵审词：读音 zhui su；自动审核：该词需管理员审核（常用词信号不足）",
             },
             {
+                "id": 12,
                 "action": "Create",
                 "word": "摆件",
                 "code": "bhjmi",
@@ -15522,14 +15538,20 @@ def test_review_audit_mixed_batch_uses_strictest_item():
             },
         ]
 
-        with patch.object(keytao_review_module, "prepare_reviewed_word", prepare_mock):
-            with patch.object(keytao_review_module, "_review_code_chain_priority", priority_mock):
-                result = await audit_draft_items(ReviewHttpConfig("https://fake", "token"), items)
+        with (
+            patch.object(keytao_review_module, "prepare_reviewed_word", prepare_mock),
+            patch.object(keytao_review_module, "_review_code_chain_priority", priority_mock),
+            patch.object(_draft_tools, "keytao_list_draft_items", AsyncMock(return_value={
+                "success": True, "batchId": "mixed-review", "contentVersion": 1, "items": items,
+            })),
+        ):
+            result = await _draft_tools._audit_current_draft_for_auto_approval("qq", "fake-user", "mixed-review")
 
         check("mixed batch cannot auto approve", result.get("autoApprove") is False)
         check("mixed batch verdict needs admin", result.get("verdict") == "needs_admin")
         check("manual word is the blocking issue", any("追速" in issue and "需管理员审核" in issue for issue in result.get("issues", [])))
         check("passing word remains reviewed", any("摆件@bhjmi" in item for item in result.get("approvedItems", [])))
+        check("passing row is identified while the manual row remains unmarked", result.get("approvedItemIds") == [12])
         check("manual marker avoids redundant source lookup", prepare_mock.await_count == 1)
 
     asyncio.run(_run())
@@ -15577,10 +15599,11 @@ def test_review_audit_blocks_bare_delete_and_allows_code_move():
             bare_delete = await audit_draft_items(config, [
                 {"action": "Delete", "word": "测试", "code": "ceek"},
             ])
-            code_move = await audit_draft_items(config, [
-                {"action": "Delete", "word": "测试", "code": "ceek"},
-                {"action": "Create", "word": "测试", "code": "ceeko"},
-            ])
+            move_items = [
+                {"id": 1, "action": "Delete", "word": "测试", "code": "ceek"},
+                {"id": 2, "action": "Create", "word": "测试", "code": "ceeko"},
+            ]
+            code_move = await audit_draft_items(config, move_items)
             with patch.object(keytao_review_module, "compare_word_commonness", side_effect=fake_commonness_pass):
                 priority_move = await audit_draft_items(config, [
                     {"action": "Delete", "word": "常用词", "code": "cya"},
@@ -15599,6 +15622,10 @@ def test_review_audit_blocks_bare_delete_and_allows_code_move():
         check("bare delete needs admin", bare_delete["autoApprove"] is False)
         check("bare delete issue explains policy", "纯删除" in bare_delete["issues"][0])
         check("code move auto approves", code_move["autoApprove"] is True)
+        check("both sides of a reviewed move can pass", _draft_tools._bind_approved_item_ids(move_items, code_move) == [1, 2])
+        check("move deletion cannot pass without the replacement", _draft_tools._bind_approved_item_ids(
+            move_items, {**code_move, "approvedItemIds": [1]},
+        ) == [])
         check("code move records original delete", any("调码删除原位" in item for item in code_move["approvedItems"]))
         check("priority move auto approves with commonness evidence", priority_move["autoApprove"] is True)
         check("priority move records commonness comparison", bool(priority_move.get("commonnessComparisons")))
@@ -20551,7 +20578,7 @@ def test_keytao_encode_exposes_only_one_pass_reading_groups():
 
 
 def test_zhe_fe_chain_is_bot_presentation_default():
-    """The bot overrides the currently reversed service chain for 哲(zhe)."""
+    """Prefer the fly-key chain for zhe and use the first available candidate."""
     result = _normalize_encode_response(
         "哲思",
         {
@@ -20568,7 +20595,8 @@ def test_zhe_fe_chain_is_bot_presentation_default():
     )
 
     check("fe chain leads candidates", result.get("candidateCodes")[:2] == ["fesk", "fesko"])
-    check("qe chain remains available", result.get("altCodes")[:2] == ["qesk", "qesko"])
+    check("qe chain remains available", result.get("candidateCodes")[2:4] == ["qesk", "qesko"])
+    check("standard codes remain separate", result.get("codes") == ["qesk", "qesko"])
     check("recommended code follows fe default", result.get("recommendedCode") == "fesk")
 
     occupied = _apply_candidate_occupancy(
@@ -20584,8 +20612,8 @@ def test_zhe_fe_chain_is_bot_presentation_default():
         },
     )
     check(
-        "occupied fe default is not demoted behind a free qe alternative",
-        occupied.get("recommendedCode") == "fesk",
+        "use a free qe alternative when all fe codes are occupied",
+        occupied.get("recommendedCode") == "qesk",
     )
 
 

@@ -2004,6 +2004,32 @@ def _draft_audit_timeout() -> float:
         return 90.0
 
 
+def _bind_approved_item_ids(items: List[Dict], review: Dict) -> List[int]:
+    if review.get("success") is not True or review.get("encodeOnly"):
+        return []
+    proof_ids = {
+        item_id for item_id in (review.get("approvedItemIds") or [])
+        if type(item_id) is int and item_id > 0
+    }
+    approved = [
+        item for item in items
+        if isinstance(item, dict) and type(item.get("id")) is int
+        and item["id"] in proof_ids and not review_flags.item_requires_manual_review(item)
+    ]
+    create_codes: Dict[Tuple[str, str], set[str]] = {}
+    for item in approved:
+        if item.get("action") == "Create" and item.get("code"):
+            key = (item.get("word"), item.get("type") or "Phrase")
+            create_codes.setdefault(key, set()).add(item["code"].strip().lower())
+    return sorted({
+        item["id"] for item in approved
+        if item.get("action") != "Delete" or (
+            create_codes.get((item.get("word"), item.get("type") or "Phrase"), set())
+            - {str(item.get("code") or "").strip().lower()}
+        )
+    })
+
+
 async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> Dict:
     approved_items: List[str] = []
     issues: List[str] = []
@@ -2125,6 +2151,8 @@ async def _audit_current_draft_for_auto_approval(
                 "issues": ["草稿批次或内容版本不匹配"],
             }
 
+        items = list_result.get("items", [])
+
         def bind_snapshot(review: Dict) -> Dict:
             snapshot_items = [
                 {
@@ -2134,9 +2162,10 @@ async def _audit_current_draft_for_auto_approval(
                         "weight", "remark", "needsManualReview",
                     )
                 }
-                for item in list_result.get("items", [])
+                for item in items
                 if isinstance(item, dict)
             ]
+            approved_item_ids = _bind_approved_item_ids(snapshot_items, review)
             snapshot_digest = hashlib.sha256(json.dumps(
                 {
                     "batchId": batch_id,
@@ -2153,29 +2182,18 @@ async def _audit_current_draft_for_auto_approval(
                 "contentVersion": content_version,
                 "snapshotItems": snapshot_items,
                 "snapshotDigest": snapshot_digest,
+                "approvedItemIds": approved_item_ids,
+                "autoApprove": (
+                    review.get("autoApprove") is True
+                    and bool(approved_item_ids)
+                    and len(approved_item_ids) == len(snapshot_items)
+                ),
             }
 
-        items = list_result.get("items", [])
         locked_items = [
             item for item in items
             if isinstance(item, dict) and item.get("needsManualReview") is True
         ]
-        if locked_items:
-            labels = [
-                str(item.get("word") or "未命名草稿条目")
-                for item in locked_items[:10]
-            ]
-            return bind_snapshot({
-                "success": True,
-                "verdict": "needs_admin",
-                "autoApprove": False,
-                "summary": "加词预审已锁定整批管理员审核",
-                "issues": [
-                    "结构化预审锁：" + "、".join(labels)
-                ],
-                "approvedItems": [],
-                "manualReviewLocked": True,
-            })
         audit_timeout = _draft_audit_timeout()
         try:
             deterministic_audit = await asyncio.wait_for(
@@ -2186,7 +2204,10 @@ async def _audit_current_draft_for_auto_approval(
             reason = f"确定性来源审查超过 {audit_timeout:.0f} 秒"
             logger.warning(f"[auto_review] deterministic audit timed out: {reason}")
             deterministic_audit = await _fallback_draft_audit_with_encode(items, reason)
-        if deterministic_audit.get("autoApprove") or not can_llm_override_audit_issues(deterministic_audit):
+        if locked_items:
+            deterministic_audit["manualReviewLocked"] = True
+            deterministic_audit["autoApprove"] = False
+        if locked_items or deterministic_audit.get("autoApprove") or not can_llm_override_audit_issues(deterministic_audit):
             return bind_snapshot(deterministic_audit)
         llm_audit = await _try_llm_auto_review_for_draft(list_result, deterministic_audit)
         return bind_snapshot(llm_audit or deterministic_audit)
@@ -2216,17 +2237,27 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
             batch,
             precomputed_audit=deterministic_audit,
         )
-        if not review_result.get("success"):
+        if not review_result.get("success") or review_result.get("warning"):
             logger.warning(f"[auto_review] LLM fallback failed: {review_result.get('message')}")
             return None
 
         ai_review = review_result.get("aiReview") or {}
         review_items = ai_review.get("items") if isinstance(ai_review.get("items"), list) else []
+        item_ids = [item.get("id") for item in items if isinstance(item, dict)]
+        if not item_ids or not review_flags.approved_item_ids_match(
+            [item.get("prId") for item in review_items if isinstance(item, dict)], item_ids,
+        ):
+            return None
+        approved_ids = [
+            item["prId"] for item in review_items
+            if isinstance(item, dict) and item.get("status") == "pass"
+            and not review_flags.item_requires_manual_review(item)
+        ]
         non_pass_items = [
             item for item in review_items
-            if isinstance(item, dict) and item.get("status") != "pass"
+            if isinstance(item, dict) and item.get("prId") not in approved_ids
         ]
-        if ai_review.get("verdict") == "pass" and not non_pass_items and review_items:
+        if ai_review.get("verdict") == "pass" and not non_pass_items:
             approved_items = []
             for item in items:
                 if not isinstance(item, dict):
@@ -2244,6 +2275,7 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
                 "summary": ai_review.get("headline") or "语言常识、读音和编码检查一致",
                 "issues": [],
                 "approvedItems": approved_items or deterministic_audit.get("approvedItems", []),
+                "approvedItemIds": approved_ids,
                 "llmReview": ai_review,
                 "llmFallback": True,
                 "encodeOnly": False,
@@ -2260,6 +2292,7 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
             **deterministic_audit,
             "summary": ai_review.get("headline") or deterministic_audit.get("summary", "存在不确定项，需要管理员审核"),
             "issues": issues or deterministic_audit.get("issues", []),
+            "approvedItemIds": approved_ids,
             "llmReview": ai_review,
             "llmFallback": True,
         }
@@ -2283,6 +2316,7 @@ def _auto_review_confirmation_digest(auto_review: Dict) -> str:
         "summary": auto_review.get("summary"),
         "issues": auto_review.get("issues") or [],
         "approvedItems": auto_review.get("approvedItems") or [],
+        "approvedItemIds": auto_review.get("approvedItemIds") or [],
         "manualReviewLocked": bool(auto_review.get("manualReviewLocked")),
         "llmFallback": bool(auto_review.get("llmFallback")),
         "encodeOnly": bool(auto_review.get("encodeOnly")),
@@ -2367,8 +2401,18 @@ async def _auto_approve_submitted_batch(
             data = response.json()
         except Exception:
             return {"success": False, "message": f"自动批准接口返回异常（HTTP {response.status_code}）"}
+        if not isinstance(data, dict):
+            return {"success": False, "message": f"自动批准接口返回异常（HTTP {response.status_code}）"}
         if response.is_success:
-            return data
+            approved_batch = data.get("batch")
+            if (
+                data.get("success") is True
+                and isinstance(approved_batch, dict)
+                and approved_batch.get("id") == batch_id
+                and approved_batch.get("status") == "Approved"
+            ):
+                return data
+            return {"success": False, "message": "批次已提交，但暂时无法确认最终审核结果"}
         return {
             "success": False,
             "message": data.get("message") or data.get("error") or f"自动批准失败: HTTP {response.status_code}",
@@ -2651,6 +2695,8 @@ async def keytao_submit_batch(
             "autoReview": auto_review,
         }, batch_id)
     submission_content_version = audited_content_version
+    approved_item_ids = auto_review.get("approvedItemIds") or []
+    snapshot_item_ids = [item.get("id") for item in auto_review.get("snapshotItems", [])]
 
     def prepare_submit_preview(data: object) -> Dict:
         if not _is_exact_submit_preview(
@@ -2711,6 +2757,8 @@ async def keytao_submit_batch(
                 "previewOnly": preview_only,
             }
             request_data["expectedContentVersion"] = submission_content_version
+            if approved_item_ids:
+                request_data["approvedItemIds"] = approved_item_ids
             if confirmed:
                 request_data["expectedSnapshotDigest"] = expected_server_snapshot_digest
                 request_data["expectedWarningDigest"] = expected_warning_digest
@@ -2759,14 +2807,25 @@ async def keytao_submit_batch(
                 data.setdefault("snapshotItems", auto_review.get("snapshotItems", []))
                 data["auditSnapshotDigest"] = auto_review.get("snapshotDigest", "")
                 consume_confirmation()
-                if _audit_allows_batch_auto_approve(auto_review):
-                    approve_result = await _auto_approve_submitted_batch(
-                        platform,
-                        platform_id,
-                        batch_id,
-                        auto_review,
-                        reported_content_version,
-                    )
+                if data.get("success") is True and _audit_allows_batch_auto_approve(auto_review):
+                    if (
+                        not approved_item_ids
+                        or not review_flags.approved_item_ids_match(approved_item_ids, snapshot_item_ids)
+                        or not review_flags.approved_item_ids_match(data.get("approvedItemIds"), approved_item_ids)
+                        or not isinstance(submitted_batch, dict)
+                        or submitted_batch.get("id") != batch_id
+                        or submitted_batch.get("status") != "Submitted"
+                        or reported_content_version != submission_content_version + 1
+                    ):
+                        approve_result = {"success": False, "message": "批次已提交，但未确认每条词的审核已记录"}
+                    else:
+                        approve_result = await _auto_approve_submitted_batch(
+                            platform,
+                            platform_id,
+                            batch_id,
+                            auto_review,
+                            reported_content_version,
+                        )
                     data["autoApproveResult"] = approve_result
                     data["autoApproved"] = bool(approve_result.get("success"))
                 return data

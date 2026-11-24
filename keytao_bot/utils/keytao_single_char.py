@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .keytao_encoding import pinyin_to_phonetic_code
+from .keytao_encoding import expand_fly_key_codes, pinyin_to_phonetic_code, scheme_phonetic_bases
 from .pinyin_reference import normalize_pinyin_syllable
 
 
@@ -32,7 +32,7 @@ def single_character_encoding(
     requested_reading: str = "",
     requested_meaning: str = "",
 ) -> dict[str, Any]:
-    """Project only reading-bound codes supplied by a valid Single response."""
+    """Build a verified candidate chain from a valid Single response."""
     failure = {
         "success": False, "word": word, "type": "Single",
         "encodeServiceConfirmed": False,
@@ -63,15 +63,21 @@ def single_character_encoding(
     if shape is not None and (not isinstance(shape, str) or re.fullmatch(r"[a-z]*", shape) is None):
         return failure
 
-    def validated_codes(pinyin: str, raw_codes: object) -> list[str]:
+    def validated_codes(pinyin: str, raw_codes: object, *, allow_fly_keys: bool = False) -> list[str]:
         phonetic = pinyin_to_phonetic_code(pinyin)
         if not phonetic or not isinstance(raw_codes, list) or not raw_codes:
             return []
-        single_chain = [phonetic + (shape or "")[:index] for index in range(min(4, len(shape or "")) + 1)]
-        if any(not isinstance(code, str) or code not in single_chain for code in raw_codes):
+        bases = scheme_phonetic_bases([pinyin]) if allow_fly_keys else [phonetic]
+        suffixes = [(shape or "")[:index] for index in range(min(4, len(shape or "")) + 1)]
+        chains = [[base + suffix for suffix in suffixes] for base in bases]
+        admissible_codes = {code for chain in chains for code in chain}
+        if any(not isinstance(code, str) or code not in admissible_codes for code in raw_codes):
             return []
         codes = list(dict.fromkeys(raw_codes))
-        if codes != [code for code in single_chain if code in codes]:
+        if any(
+            [code for code in codes if code.startswith(chain[0])] != [code for code in chain if code in codes]
+            for chain in chains
+        ):
             return []
         return codes
 
@@ -95,7 +101,9 @@ def single_character_encoding(
             and normalize_pinyin_syllable(str(item.get("pinyin") or "")) == requested
             and requested in known_readings
         ), None)
-        if match is None or not (codes := validated_codes(str(match.get("pinyin") or ""), match.get("codes"))):
+        if match is None or not (
+            codes := validated_codes(str(match.get("pinyin") or ""), match.get("codes"), allow_fly_keys=True)
+        ):
             return {**failure, "message": f"编码服务未返回「{word}」读音 {requested} 的单字候选编码，本次不推荐编码。"}
         pinyin, reading = str(match["pinyin"]), requested
     elif requested_meaning and not requested:
@@ -104,7 +112,7 @@ def single_character_encoding(
         "success": True, "word": word, "type": "Single", "encodingType": "单字",
         "chars": [char], "encodeServiceConfirmed": True,
         "pronunciations": [{
-            "pinyin": pinyin, "normalized": [reading], "codes": codes,
+            "pinyin": pinyin, "normalized": [reading], "codes": expand_fly_key_codes([reading], codes),
             "sources": [], "fallback": True, "requiresManualReview": True,
             "readingEvidenceKind": "own_character",
             "sourceSummary": "编码服务逐字读音",

@@ -1,21 +1,35 @@
 """Bot-owned presentation preferences that refine service candidate ordering."""
 
-from typing import Dict, Iterable, List
+from typing import Iterable, List
+
+_PREFERRED_INITIALS = {"zhe": "f", "che": "j", "chu": "j"}
 
 
 def order_reading_codes(pinyins: Iterable[str], codes: Iterable[str]) -> List[str]:
-    """Prefer the fe chain for every initial zhe reading, independent of glyph."""
-    from .keytao_encoding import _strip_pinyin_tone
+    """Rank legal candidates by preferred initials at the encoded positions."""
+    from .keytao_encoding import _phrase_code_positions, _strip_pinyin_tone, scheme_phonetic_bases
+
     syllables = list(pinyins)
     ordered = _dedupe_codes(codes)
-    if syllables and _strip_pinyin_tone(syllables[0]).rstrip("12345") == "zhe":
-        fe_prefix, qe_prefix = ("fe", "qe") if len(syllables) <= 2 else ("f", "q")
-        fe = [code for code in ordered if code.startswith(fe_prefix)]
-        qe = [code for code in ordered if code.startswith(qe_prefix)]
-        others = [code for code in ordered if not code.startswith((fe_prefix, qe_prefix))]
-        if fe and qe:
-            return [*fe, *qe, *others]
-    return ordered
+    if any(not isinstance(syllable, str) for syllable in syllables):
+        return ordered
+    stride = 2 if len(syllables) <= 2 else 1
+    preferred = [
+        (slot * stride, key)
+        for slot, index in enumerate(_phrase_code_positions(len(syllables)))
+        if (key := _PREFERRED_INITIALS.get(_strip_pinyin_tone(syllables[index]).rstrip("12345")))
+    ]
+    if not preferred:
+        return ordered
+    bases = scheme_phonetic_bases(syllables)
+    if len(bases) < 2:
+        return ordered
+    base_length = len(bases[0])
+    rank = {
+        base: sum(base[slot] != key for slot, key in preferred)
+        for base in bases
+    }
+    return sorted(ordered, key=lambda code: rank.get(code[:base_length], len(preferred) + 1))
 
 
 def _dedupe_codes(values: Iterable[object]) -> List[str]:
@@ -24,83 +38,3 @@ def _dedupe_codes(values: Iterable[object]) -> List[str]:
         for value in values
         if str(value or "").strip()
     ))
-
-
-def _zhe_chain_parts(values: Iterable[object]) -> tuple[List[str], List[str], List[str]]:
-    codes = _dedupe_codes(values)
-    return (
-        [code for code in codes if code.startswith("fe")],
-        [code for code in codes if code.startswith("qe")],
-        [code for code in codes if not code.startswith(("fe", "qe"))],
-    )
-
-
-def _reorder_statuses(payload: Dict, ordered_codes: List[str]) -> None:
-    statuses = payload.get("candidateStatuses")
-    if not isinstance(statuses, list):
-        return
-    status_by_code = {
-        str(item.get("code") or "").strip().lower(): item
-        for item in statuses
-        if isinstance(item, dict) and str(item.get("code") or "").strip()
-    }
-    payload["candidateStatuses"] = [
-        status_by_code[code]
-        for code in ordered_codes
-        if code in status_by_code
-    ]
-
-
-def apply_zhe_fe_chain_preference(
-    word: str,
-    payload: Dict,
-    *,
-    include_alternative_in_codes: bool = False,
-) -> Dict:
-    """Lead 哲(zhe) words with fe*, retaining qe* as the alternative chain."""
-    if not str(word or "").strip().startswith("哲") or not isinstance(payload, dict):
-        return payload
-    combined = _dedupe_codes([
-        *(payload.get("codes") or []),
-        *(payload.get("altCodes") or []),
-        *(payload.get("candidateCodes") or []),
-    ])
-    fe_codes, qe_codes, other_codes = _zhe_chain_parts(combined)
-    if not fe_codes or not qe_codes:
-        return payload
-
-    ordered_codes = [*fe_codes, *qe_codes, *other_codes]
-    payload["codes"] = (
-        ordered_codes
-        if include_alternative_in_codes
-        else [*fe_codes, *other_codes]
-    )
-    payload["altCodes"] = qe_codes
-    payload["candidateCodes"] = ordered_codes
-    payload["baseCode"] = fe_codes[0]
-    _reorder_statuses(payload, ordered_codes)
-    payload["recommendedCode"] = fe_codes[0]
-
-    for pronunciation in payload.get("pronunciations") or []:
-        if not isinstance(pronunciation, dict):
-            continue
-        pron_codes = _dedupe_codes(pronunciation.get("codes") or [])
-        pron_fe, pron_qe, pron_other = _zhe_chain_parts(pron_codes)
-        if not pron_fe or not pron_qe:
-            continue
-        ordered_pron_codes = [*pron_fe, *pron_qe, *pron_other]
-        pronunciation["codes"] = ordered_pron_codes
-        _reorder_statuses(pronunciation, ordered_pron_codes)
-        pronunciation["recommendedCode"] = pron_fe[0]
-    pronunciations = [
-        pronunciation
-        for pronunciation in payload.get("pronunciations") or []
-        if isinstance(pronunciation, dict)
-    ]
-    if pronunciations:
-        payload["recommendedCode"] = next((
-            str(pronunciation.get("recommendedCode") or "").strip()
-            for pronunciation in pronunciations
-            if str(pronunciation.get("recommendedCode") or "").strip()
-        ), payload["recommendedCode"])
-    return payload

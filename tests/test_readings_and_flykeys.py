@@ -2015,6 +2015,44 @@ class FlyReviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(expected + "i", expand_fly_key_codes(syllables, [standard, standard + "i"]))
         self.assertEqual(scheme_phonetic_bases(["zhèn", "gǎn"]), ["qngf"])
 
+    def test_preferred_initials_follow_all_encoded_positions(self):
+        from keytao_bot.utils.keytao_encoding import expand_fly_key_codes
+
+        for syllables, standard, preferred in (
+            (["shàng", "wèi", "zhě"], "ewq", "ewf"),
+            (["shàng", "zhe2", "wèi"], "eqw", "efw"),
+            (["zhě", "chē", "zhé"], "qjq", "fjf"),
+            (["chē", "chū"], "jejj", "jejj"),
+            (["shàng", "wèi", "chē", "zhé", "zhě"], "ewjq", "ewjf"),
+        ):
+            with self.subTest(syllables=syllables):
+                codes = expand_fly_key_codes(syllables, [standard, standard + "i"])
+                self.assertEqual(codes[:2], [preferred, preferred + "i"])
+                self.assertIn(standard, codes)
+                self.assertIn(standard + "i", codes)
+        self.assertEqual(
+            expand_fly_key_codes(["chē", "chū"], ["wejj", "wejji"]),
+            ["jejj", "jejji", "wejj", "wejji"],
+        )
+
+    def test_lookup_prefers_an_open_fly_slot_at_word_end(self):
+        result = harness._normalize_encode_response(
+            "上位者",
+            {
+                "codes": ["ewq", "ewqi", "ewqii", "ewqiiu"],
+                "altCodes": ["ewf", "ewfi", "ewfii", "ewfiiu"],
+                "phrasePinyins": ["shàng", "wèi", "zhě"],
+            },
+        )
+        occupied = harness._apply_candidate_occupancy(result, {
+            "success": True,
+            "results": [{"code": "ewf", "phrases": [{"word": "耍威风"}]}],
+        })
+        self.assertEqual(occupied["candidateCodes"], [
+            "ewf", "ewfi", "ewfii", "ewfiiu", "ewq", "ewqi", "ewqii", "ewqiiu",
+        ])
+        self.assertEqual(occupied["recommendedCode"], "ewfi")
+
     async def test_explicit_missing_fly_is_sealed_and_wrong_code_never_writes(self):
         state = harness.PendingAddWord(
             word="折煞", recommended_code="qeesi", candidates=[("qees", True), ("qeesi", False)],

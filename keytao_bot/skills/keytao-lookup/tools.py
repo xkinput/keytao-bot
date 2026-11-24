@@ -18,9 +18,7 @@ from keytao_bot.utils.keytao_encoding import (
     scheme_phonetic_bases,
 )
 from keytao_bot.utils.pending_confirmation import render_remediation_reply
-from keytao_bot.utils.keytao_candidate_preference import (
-    apply_zhe_fe_chain_preference,
-)
+from keytao_bot.utils.keytao_candidate_preference import order_reading_codes
 
 
 TYPE_LABELS = {
@@ -148,6 +146,12 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         code_source = "invalid"
 
     chars = _clean_encode_chars(encode_data.get("chars"))
+    source = infer_data if code_source == "infer-fallback" else encode_data
+    phrase_pinyins = source.get("phrasePinyins")
+    syllables = phrase_pinyins if isinstance(phrase_pinyins, list) and phrase_pinyins else [
+        item["pinyin"] for item in _clean_encode_chars(source.get("chars"))
+    ]
+    ordered_codes = order_reading_codes(syllables, [*codes, *alt_codes])
     alternate_pronunciation_codes = _build_alternate_pronunciation_codes(chars)
     phrase_pronunciation_codes = _build_phrase_pronunciation_codes(chars)
     pronunciation_variants = [*alternate_pronunciation_codes, *phrase_pronunciation_codes]
@@ -185,15 +189,16 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
 
     candidate_codes = _clean_code_list([
         *requested_candidate_codes,
-        *codes,
-        *alt_codes,
+        *ordered_codes,
         *alternate_codes,
     ])
     base_code = codes[0] if codes else None
     suggestion = infer_data.get("suggestion")
     recommended_code = suggestion if isinstance(suggestion, str) and "?" not in suggestion else None
-    if not recommended_code and codes and "?" not in codes[0]:
-        recommended_code = codes[0]
+    if codes and ordered_codes and "?" not in ordered_codes[0] and (
+        not recommended_code or ordered_codes[0] != codes[0]
+    ):
+        recommended_code = ordered_codes[0]
     if not recommended_code and candidate_codes:
         recommended_code = candidate_codes[0]
 
@@ -246,7 +251,7 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
             command=f"加词 {word}",
             words=(word,),
         )
-    return apply_zhe_fe_chain_preference(word, result)
+    return result
 
 
 def _scheme_requested_code_analysis(result: Dict, code: str) -> Dict:
@@ -443,10 +448,7 @@ def _apply_candidate_occupancy(encoding: Dict, lookup_result: Dict) -> Dict:
     display_groups = _build_candidate_display_groups(encoding, statuses)
     if display_groups:
         encoding["candidateDisplayGroups"] = display_groups
-    return apply_zhe_fe_chain_preference(
-        str(encoding.get("word") or ""),
-        encoding,
-    )
+    return encoding
 
 
 async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:

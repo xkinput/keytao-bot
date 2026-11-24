@@ -182,6 +182,15 @@ def item_requires_manual_review(item: Any) -> bool:
     return bool(remark_indicates_manual_review(item.get("remark")))
 
 
+def approved_item_ids_match(value: Any, expected: list[int]) -> bool:
+    return bool(
+        isinstance(value, list)
+        and all(type(item_id) is int and item_id > 0 for item_id in value)
+        and all(type(item_id) is int and item_id > 0 for item_id in expected)
+        and sorted(value) == sorted(expected)
+    )
+
+
 def audit_allows_batch_auto_approve(auto_review: Any) -> bool:
     """Return whether an audit is complete enough to call auto-approval."""
     return bool(
