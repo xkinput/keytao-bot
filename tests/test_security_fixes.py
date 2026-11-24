@@ -1292,6 +1292,50 @@ def test_web_api_auth_surface():
     check("empty-key auth bypass removed", "if WEB_API_KEY and authorization" not in source)
 
 
+def test_batch_review_output_header_is_an_authenticated_opt_in():
+    import importlib
+    from unittest.mock import AsyncMock, patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    web_api = _load_web_api()
+    app = FastAPI()
+    with patch.object(sys.modules["nonebot"], "get_app", return_value=app, create=True):
+        web_api = importlib.reload(web_api)
+
+    async def review(**kwargs):
+        ai_review = {"generatedAt": "2026-11-24T00:00:00Z", "items": []}
+        if not kwargs["items_only"]:
+            ai_review["headline"] = "Full review"
+        return {"success": True, "aiReview": ai_review}
+
+    mock_review = AsyncMock(side_effect=review)
+    path = "/api/keytao/batches/review"
+    body = {"batch": {"id": "sample"}, "focus_pr_id": 2, "local_review": {"items": []}}
+    item_headers = {"X-KeyTao-Review-Output": "items"}
+    with (
+        TestClient(app) as client,
+        patch.object(web_api, "WEB_API_KEY", "test-web-api-key"),
+        patch.object(web_api, "review_keytao_batch_with_llm", mock_review),
+    ):
+        denied = client.post(path, json=body, headers=item_headers)
+        assert denied.status_code == 401
+        mock_review.assert_not_awaited()
+
+        auth = {"Authorization": "Bearer test-web-api-key"}
+        items = client.post(path, json=body, headers={**auth, **item_headers})
+        assert items.status_code == 200
+        assert set(items.json()["aiReview"]) == {"generatedAt", "items"}
+        mock_review.assert_awaited_once_with(**body, items_only=True)
+
+        for headers in (auth, {**auth, "X-KeyTao-Review-Output": "unknown"}):
+            full = client.post(path, json=body, headers=headers)
+            assert full.status_code == 200
+            assert full.json()["aiReview"]["headline"] == "Full review"
+            mock_review.assert_awaited_with(**body, items_only=False)
+
+
 # ---------------------------------------------------------------------------
 # Adversarial review follow-ups
 # ---------------------------------------------------------------------------
@@ -1778,6 +1822,7 @@ if __name__ == "__main__":
     test_fly_key_variants_follow_pronunciation_correction()
     # Last: it installs permanent module stubs in sys.modules.
     test_web_api_auth_surface()
+    test_batch_review_output_header_is_an_authenticated_opt_in()
 
     total = passed + failed
     print("\n" + "=" * 60)

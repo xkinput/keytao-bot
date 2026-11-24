@@ -16179,7 +16179,8 @@ def test_batch_review_chunks_large_batches_and_isolates_failures():
         ]
         calls = []
 
-        async def fake_call(_batch, chunk, _audit, _local_review, _focus):
+        async def fake_call(_batch, chunk, _audit, _local_review, _focus, *, items_only):
+            assert not items_only
             ids = [item["id"] for item in chunk]
             calls.append(ids)
             if 6 in ids:
@@ -16391,6 +16392,86 @@ def test_batch_review_retries_incomplete_json_schema():
             "sparse pass exhaustion cannot preserve pass items",
             all(item.get("status") == "attention" for item in fallback_review.get("items", [])),
         )
+
+    asyncio.run(_run())
+
+
+def test_items_only_batch_review_preserves_review_evidence_through_retries_and_fallback():
+    async def _run():
+        items = [
+            {"id": 1, "word": "甲词", "code": "abc"},
+            {"id": 2, "word": "乙词", "code": "abd", "needsManualReview": True},
+            {"id": 3, "word": "丙词", "code": "efg"},
+        ]
+        batch = {"id": "item-review", "pullRequests": items}
+        audit = {"lookupFailed": True, "reviewedWords": {}}
+        local_review = {
+            "headline": "Summary not needed",
+            "riskCounts": {"pass": 1},
+            "items": [{"prId": 2, "status": "manual_review"}],
+            "codeChains": [{"code": "abc", "before": [{"word": "同链词"}]}],
+        }
+        good = json.dumps({
+            "items": [{
+                "prId": item_id,
+                "status": "pass",
+                "title": "词条已审",
+                "reasons": ["已核读音"],
+                "suggestions": ["保持编码"],
+                "sources": ["汉典"],
+                "evidence": ["词典支持"],
+            } for item_id in (1, 2)],
+            "headline": "Unexpected summary",
+        })
+        client = _FakeClient([
+            _FakeAIResponse("length"),
+            _FakeAIResponse("stop", good),
+            *[_FakeAIResponse("stop", "{}") for _ in range(3)],
+        ])
+        config = {
+            "api_key": "test",
+            "base_url": "https://example.test",
+            "model": "deepseek-v4-flash",
+            "max_tokens": 2500,
+            "max_tokens_cap": 12000,
+            "timeout": 30.0,
+            "temperature": 0.2,
+        }
+        module = keytao_batch_review_module
+        with (
+            patch.object(module, "AsyncOpenAI", new=object()),
+            patch.object(module, "get_llm_client", return_value=client),
+            patch.object(module, "_llm_config", return_value=config),
+            patch.object(module, "_review_chunk_size", return_value=2),
+            patch.object(module, "_review_chunk_concurrency", return_value=1),
+        ):
+            result = await module.review_keytao_batch_with_llm(
+                batch, local_review, focus_pr_id=2, precomputed_audit=audit, items_only=True,
+            )
+
+        review = result["aiReview"]
+        assert set(review) == {"generatedAt", "auditSealed", "items"}
+        assert review["auditSealed"] is True
+        assert result["reviewedAt"] == review["generatedAt"]
+        assert result["warning"]
+        assert [item["status"] for item in review["items"]] == ["pass", "manual_review", "attention"]
+        assert review["items"][0]["reviewRecord"]["sources"] == ["汉典"]
+        assert review["items"][2]["reviewRecord"]["source"] == "bot-llm-fallback"
+        payloads = [json.loads(call["messages"][1]["content"]) for call in client.completions.calls]
+        assert len(payloads) == 5
+        assert all(set(payload["requiredJsonShape"]) == {"items"} for payload in payloads)
+        assert all(set(payload["localReview"]) == {"items", "codeChains"} for payload in payloads)
+        assert [payload["focusPrId"] for payload in payloads] == [2, 2, None, None, None]
+        assert payloads[0]["localReview"]["codeChains"][0]["before"] == [{"word": "同链词"}]
+        assert payloads[0]["deterministicAudit"]["lookupFailed"] is True
+
+        with patch.object(module, "_call_llm_chunked", side_effect=RuntimeError("Failed review")):
+            fallback = await module.review_keytao_batch_with_llm(
+                batch, precomputed_audit=audit, items_only=True,
+            )
+        assert set(fallback["aiReview"]) == {"generatedAt", "auditSealed", "items"}
+        assert fallback["warning"] == "Failed review"
+        assert fallback["aiReview"]["items"][1]["status"] == "manual_review"
 
     asyncio.run(_run())
 
@@ -23798,6 +23879,7 @@ if __name__ == "__main__":
     test_batch_review_chunks_large_batches_and_isolates_failures()
     test_batch_review_retries_length_with_more_output_tokens()
     test_batch_review_retries_incomplete_json_schema()
+    test_items_only_batch_review_preserves_review_evidence_through_retries_and_fallback()
     test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries()
     test_draft_encode_candidates_include_alternate_pronunciations()
     test_draft_encode_candidates_include_phrase_polyphone_candidates()

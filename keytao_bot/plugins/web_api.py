@@ -261,12 +261,14 @@ try:
     async def keytao_batch_review(
         request: KeyTaoBatchReviewRequest,
         authorization: Optional[str] = Header(None),
+        review_output: Optional[str] = Header(None, alias="X-KeyTao-Review-Output"),
     ) -> dict:
         _check_auth(authorization)
         result = await review_keytao_batch_with_llm(
             batch=request.batch,
             local_review=request.local_review,
             focus_pr_id=request.focus_pr_id,
+            items_only=review_output == "items",
         )
         if not result.get("success"):
             raise HTTPException(status_code=502, detail=result.get("message") or "喵喵复审失败")

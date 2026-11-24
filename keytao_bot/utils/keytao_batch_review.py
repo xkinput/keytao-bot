@@ -745,6 +745,8 @@ def _fallback_review_from_llm_error(
     audit: Dict[str, Any],
     local_review: Optional[Dict[str, Any]],
     reason: str,
+    *,
+    items_only: bool = False,
 ) -> Dict[str, Any]:
     move_pairs = _move_pairs(items)
     audit_summary = _string(audit.get("summary"))
@@ -787,6 +789,9 @@ def _fallback_review_from_llm_error(
             "source": "bot-llm-fallback",
         })
 
+    if items_only:
+        return _normalize_llm_review({"items": raw_items}, items, local_review, audit, items_only=True)
+
     return _normalize_llm_review({
         "verdict": "manual_review" if any(item.get("status") == "manual_review" for item in raw_items) else "needs_attention",
         "headline": "本喵模型输出异常，已保守标记为需复核。",
@@ -810,6 +815,8 @@ def _normalize_llm_review(
     items: Sequence[ReviewItem],
     local_review: Optional[Dict[str, Any]],
     audit: Optional[Dict[str, Any]] = None,
+    *,
+    items_only: bool = False,
 ) -> Dict[str, Any]:
     raw_items = raw.get("items") if isinstance(raw.get("items"), list) else []
     raw_by_id: Dict[int, Dict[str, Any]] = {}
@@ -957,6 +964,18 @@ def _normalize_llm_review(
         )
         normalized_items.append(normalized_item)
 
+    # An audit-level seal prevents automatic approval regardless of item verdicts.
+    audit_sealed = bool(
+        isinstance(audit, dict)
+        and (audit.get("structuredManualReviewIssues") or audit.get("lookupFailed"))
+    )
+    if items_only:
+        return {
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "auditSealed": audit_sealed,
+            "items": normalized_items,
+        }
+
     chain_recommendations = raw.get("codeChainRecommendations")
     chain_by_key: Dict[str, List[str]] = {}
     if isinstance(chain_recommendations, list):
@@ -1043,12 +1062,6 @@ def _normalize_llm_review(
             for item in normalized_items[:12]
         )
 
-    # An audit-level seal (failed lookup, structured manual-review issues) makes
-    # the whole batch non-auto-approvable, independent of any per-item verdict.
-    audit_sealed = bool(
-        isinstance(audit, dict)
-        and (audit.get("structuredManualReviewIssues") or audit.get("lookupFailed"))
-    )
     if audit_sealed and verdict == "pass":
         verdict = "manual_review"
         headline = "确定性审查存在需管理员确认的封存项，本批次不能自动通过。" + headline
@@ -1188,11 +1201,13 @@ def _compact_audit_for_items(audit: Dict[str, Any], items: Sequence[ReviewItem])
 def _compact_local_review_for_items(
     local_review: Optional[Dict[str, Any]],
     items: Sequence[ReviewItem],
+    *,
+    items_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(local_review, dict):
         return None
     pr_ids = {int(item["id"]) for item in items}
-    compact = {
+    compact = {} if items_only else {
         key: local_review.get(key)
         for key in ("reviewer", "verdict", "headline", "riskCounts", "checklist")
         if key in local_review
@@ -1221,11 +1236,10 @@ def _items_for_llm(items: Sequence[ReviewItem]) -> List[ReviewItem]:
     return compact
 
 
-def _fallback_raw_review_for_chunk(items: Sequence[ReviewItem], reason: str) -> Dict[str, Any]:
-    return {
-        "verdict": "needs_attention",
-        "headline": "部分条目的模型输出不完整，已保守标记复核。",
-        "checklist": ["该分片模型输出异常，其他分片仍已正常完成。"],
+def _fallback_raw_review_for_chunk(
+    items: Sequence[ReviewItem], reason: str, *, items_only: bool = False,
+) -> Dict[str, Any]:
+    raw: Dict[str, Any] = {
         "items": [
             {
                 "prId": item.get("id"),
@@ -1238,8 +1252,15 @@ def _fallback_raw_review_for_chunk(items: Sequence[ReviewItem], reason: str) -> 
             }
             for item in items
         ],
-        "codeChainRecommendations": [],
     }
+    if not items_only:
+        raw.update({
+            "verdict": "needs_attention",
+            "headline": "部分条目的模型输出不完整，已保守标记复核。",
+            "checklist": ["该分片模型输出异常，其他分片仍已正常完成。"],
+            "codeChainRecommendations": [],
+        })
+    return raw
 
 
 def _merge_raw_chunk_reviews(reviews: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1304,7 +1325,15 @@ def _validate_llm_review_payload(
     return payload
 
 
-async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: Dict[str, Any], local_review: Optional[Dict[str, Any]], focus_pr_id: Optional[int]) -> Dict[str, Any]:
+async def _call_llm(
+    batch: Dict[str, Any],
+    items: Sequence[ReviewItem],
+    audit: Dict[str, Any],
+    local_review: Optional[Dict[str, Any]],
+    focus_pr_id: Optional[int],
+    *,
+    items_only: bool = False,
+) -> Dict[str, Any]:
     config = _llm_config()
     if not config["api_key"] or AsyncOpenAI is None:
         raise RuntimeError("喵喵 LLM 未配置，无法完整复审")
@@ -1347,21 +1376,22 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
         "每个条目的 reasons、suggestions、evidence 各保留最关键的 1 至 2 条，每条尽量不超过 80 个汉字。"
         "只返回完整 JSON，不要 Markdown。"
     )
-    schema_hint = {
+    item_shape = {
+        "prId": 1,
+        "status": "pass | attention | manual_review",
+        "title": "short label",
+        "reasons": ["why"],
+        "suggestions": ["what admin should do"],
+        "pronunciation": "optional pinyin",
+        "sources": ["汉典"],
+        "evidence": ["short evidence"],
+    }
+    schema_hint = {"items": [item_shape]} if items_only else {
         "verdict": "pass | needs_attention | manual_review",
         "headline": "one short Chinese sentence",
         "suggestedReviewNote": "Chinese review note for admins",
         "checklist": ["checked item"],
-        "items": [{
-            "prId": 1,
-            "status": "pass | attention | manual_review",
-            "title": "short label",
-            "reasons": ["why"],
-            "suggestions": ["what admin should do"],
-            "pronunciation": "optional pinyin",
-            "sources": ["汉典"],
-            "evidence": ["short evidence"],
-        }],
+        "items": [item_shape],
         "codeChainRecommendations": [{
             "code": "abc",
             "type": "Phrase",
@@ -1373,6 +1403,8 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
             "confidence": "high | medium | low",
         }],
     }
+    if items_only:
+        system_prompt += "JSON 顶层只允许 items 字段。"
     user_payload = {
         "batch": {
             "id": batch.get("id"),
@@ -1459,7 +1491,8 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
 
         try:
             parsed = _extract_json_object(content)
-            return _validate_llm_review_payload(parsed, items)
+            validated = _validate_llm_review_payload(parsed, items)
+            return {"items": validated["items"]} if items_only else validated
         except Exception as error:
             preview = content[:600].replace("\n", "\\n")
             logger.warning(
@@ -1477,6 +1510,8 @@ async def _call_llm_chunked(
     audit: Dict[str, Any],
     local_review: Optional[Dict[str, Any]],
     focus_pr_id: Optional[int],
+    *,
+    items_only: bool = False,
 ) -> Tuple[Dict[str, Any], List[str]]:
     chunks = _chunk_review_items(items, _review_chunk_size())
     semaphore = asyncio.Semaphore(_review_chunk_concurrency())
@@ -1490,14 +1525,15 @@ async def _call_llm_chunked(
                     batch,
                     chunk,
                     _compact_audit_for_items(audit, chunk),
-                    _compact_local_review_for_items(local_review, chunk),
+                    _compact_local_review_for_items(local_review, chunk, items_only=items_only),
                     chunk_focus,
+                    items_only=items_only,
                 )
             return result, None
         except Exception as error:
             warning = f"第 {index + 1}/{len(chunks)} 片复审输出异常：{error}"
             logger.warning(f"KeyTao LLM chunk review failed: {warning}")
-            return _fallback_raw_review_for_chunk(chunk, str(error)), warning
+            return _fallback_raw_review_for_chunk(chunk, str(error), items_only=items_only), warning
 
     results = await asyncio.gather(*(
         review_chunk(index, chunk)
@@ -1507,6 +1543,8 @@ async def _call_llm_chunked(
     warnings = [warning for _result, warning in results if warning]
     if len(raw_reviews) == 1:
         return raw_reviews[0], warnings
+    if items_only:
+        return {"items": [item for review in raw_reviews for item in review["items"]]}, warnings
     return _merge_raw_chunk_reviews(raw_reviews), warnings
 
 
@@ -1515,6 +1553,8 @@ async def review_keytao_batch_with_llm(
     local_review: Optional[Dict[str, Any]] = None,
     focus_pr_id: Optional[int] = None,
     precomputed_audit: Optional[Dict[str, Any]] = None,
+    *,
+    items_only: bool = False,
 ) -> Dict[str, Any]:
     items = _extract_items(batch)
     if not items:
@@ -1553,10 +1593,11 @@ async def review_keytao_batch_with_llm(
             audit,
             local_review,
             focus_pr_id,
+            items_only=items_only,
         )
     except Exception as error:
         logger.warning(f"KeyTao LLM batch review failed: {error}")
-        ai_review = _fallback_review_from_llm_error(items, audit, local_review, str(error))
+        ai_review = _fallback_review_from_llm_error(items, audit, local_review, str(error), items_only=items_only)
         return {
             "success": True,
             "aiReview": ai_review,
@@ -1564,7 +1605,7 @@ async def review_keytao_batch_with_llm(
             "warning": str(error),
         }
 
-    ai_review = _normalize_llm_review(raw_review, items, local_review, audit)
+    ai_review = _normalize_llm_review(raw_review, items, local_review, audit, items_only=items_only)
     result = {
         "success": True,
         "aiReview": ai_review,
