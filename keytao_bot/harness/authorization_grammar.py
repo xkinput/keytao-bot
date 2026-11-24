@@ -1006,7 +1006,7 @@ _DICTIONARY_DELETE_WORD_TOKEN = (
 _DICTIONARY_DELETE_PATTERNS = (
     re.compile(
         rf"^{_COMMAND_PREFIX_PATTERN}(?:删词|删除词条)\s*"
-        rf"[「“]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})[」”]?"
+        r"[「“]?(?P<word>[\u3400-\u9fffA-Za-z][\u3400-\u9fffA-Za-z0-9'.-]{0,29})[」”]?"
         rf"(?:\s+(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN}))?"
         r"(?:吧|啦|了)?$",
         re.IGNORECASE,

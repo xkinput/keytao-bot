@@ -389,6 +389,35 @@ class SemanticDirectExecTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已加入草稿", ctx.response)
         self.assertIsNone(self.store.get_record(self.author))
 
+    async def test_explicit_mixed_script_delete_skips_the_model(self):
+        self.rows = [{**self.row("AA制", "ssfk"), "type": "English"}]
+        self.batch_preview = True
+        self.client.create.side_effect = TimeoutError("offline intent model")
+        for message in ("删词 AA制 ssfk", "删词 AA制"):
+            with self.subTest(message=message):
+                self.calls.clear()
+                self.writes.clear()
+                handled, ctx = await self.stage(message, "delete", ("AA制",), ("ssfk",))
+                self.assertTrue(handled, ctx.response)
+                self.assertEqual(self.calls[0], ("keytao_lookup_by_word", {"word": "AA制"}))
+                self.assertEqual([name for name, _ in self.writes], ["keytao_batch_add_to_draft"])
+                self.assertEqual(self.writes[0][1]["items"], [
+                    {"action": "Delete", "word": "AA制", "code": "ssfk", "type": "English"},
+                ])
+                self.assertIn("已加入草稿", ctx.response)
+        self.client.create.assert_not_awaited()
+
+    async def test_explicit_mixed_script_delete_needs_a_unique_match(self):
+        self.rows = [{**self.row("AA制", code), "type": "English"} for code in ("ssfk", "ssfka")]
+        self.client.create.side_effect = TimeoutError("offline intent model")
+        for message in ("删词 AA制", "删词 AA制 xxxx"):
+            with self.subTest(message=message):
+                handled, ctx = await self.stage(message, "delete", ("AA制",), ())
+                self.assertTrue(handled, ctx.response)
+                self.assertIn("AA制", ctx.response)
+                self.assertEqual(self.writes, [])
+        self.client.create.assert_not_awaited()
+
     async def test_low_or_missing_confidence_actionable_write_ops_require_confirmation(self):
         cases = (
             ("把吃饱了撑换成我本来就", "move", ("吃饱了撑", "我本来就"), ()),

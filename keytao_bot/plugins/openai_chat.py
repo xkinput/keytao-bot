@@ -5408,6 +5408,20 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
     }
     fast_request = ctx.operation_request
     fast_op = fast_request.op if fast_request is not None else "none"
+    if (
+        fast_request is not None and fast_request.op == "delete" and "delete" in route_ops
+        and not ctx.reply_reference.is_reply
+        and _chat_commands.semantic_direct_exec_allowed(fast_request)
+    ):
+        ctx.response = await _chat_commands.execute_model_command_direct(
+            fast_request, fast_request.operands, ctx.platform, ctx.user_id,
+            ctx.conv_key, ctx.space_key, ctx.owner_label,
+        )
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+        await _finish_ai_chat_response(
+            ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+        )
+        return True
     # Fast swaps can include suffixes in an operand (e.g. "务实的码").
     if route_ops and ctx.normalized_message_text.strip():
         try:

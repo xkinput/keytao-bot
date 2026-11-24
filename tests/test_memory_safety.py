@@ -7311,6 +7311,8 @@ class MutationAuthorizationTests(unittest.TestCase):
         delete_forms = {
             "删词 五百万": ("五百万", ""),
             "删词 五百万 wbw": ("五百万", "wbw"),
+            "删词 AA制 ssfk": ("AA制", "ssfk"),
+            "删除词条「键道App」": ("键道App", ""),
             "删除词库里的「五百万」": ("五百万", ""),
             "把 jmtdu 的箭头删掉": ("箭头", "jmtdu"),
             "删除 箭头 @ jmtdu": ("箭头", "jmtdu"),
@@ -7337,6 +7339,9 @@ class MutationAuthorizationTests(unittest.TestCase):
         ))
         for message in (
             "不要删词 五百万",
+            "不要删词 AA制 ssfk",
+            "他说删词 AA制 ssfk",
+            "删词 AA制 ssfk？",
             "他说把 jmtdu 的箭头删掉",
             "删除 箭头 @ jmtdu？",
             "如果把「箭头」换到jmtd，把「剪贴」换到jmtdoa会怎样？",
