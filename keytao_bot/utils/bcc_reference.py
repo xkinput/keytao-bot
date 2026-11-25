@@ -60,6 +60,33 @@ def preserve_bcc(source_path, connection):
         return
 
 
+def bcc_deciding_channels(rows, signal_key):
+    """Order observed channels by the decision metric, preserving ties."""
+    return sorted(
+        (row for row in rows if row.get('count') is not None and row.get(signal_key) is not None),
+        key=lambda row: row[signal_key],
+        reverse=signal_key != 'rankFraction',
+    )
+
+
+def bcc_daily_value(bcc):
+    """Return the modern per-million value, rank fraction, and availability."""
+    if 'available' in bcc:
+        # Existing snapshots carry authoritative aggregates, including missing ranks.
+        return bcc.get('perMillion'), bcc.get('rankFraction'), bcc['available']
+    channels = {row['channel']: row for row in bcc.get('channels', [])}
+    if not set(CHANNELS).issubset(channels):
+        return None, None, False
+    observed = [channels[channel] for channel in CHANNELS if channels[channel]['count'] is not None]
+    by_frequency = bcc_deciding_channels(observed, 'perMillion')
+    by_rank = bcc_deciding_channels(observed, 'rankFraction')
+    return (
+        by_frequency[0]['perMillion'] if by_frequency else None,
+        by_rank[0]['rankFraction'] if by_rank and len(by_rank) == len(observed) else None,
+        True,
+    )
+
+
 def lookup_bcc(connection, word):
     kind = "char" if len(word) == 1 else "word"
     result = {"available": False, "attested": False, "tokenType": kind,
@@ -89,15 +116,12 @@ def lookup_bcc(connection, word):
     } for row in rows}
     result['historicalChannels'] = [channels.get(row['channel'], row)
                                     for row in result['historicalChannels']]
-    # Historical evidence never completes a missing modern channel set.
-    if not set(CHANNELS).issubset(channels):
+    modern_channels = [channels[channel] for channel in CHANNELS if channel in channels]
+    per_million, rank_fraction, available = bcc_daily_value({'channels': modern_channels})
+    if not available:
         return result
-    observed = [channels[channel] for channel in CHANNELS if channels[channel]['count'] is not None]
-    ranked = [row['rankFraction'] for row in observed if row['rankFraction'] is not None]
-    result.update(available=True, attested=bool(observed),
-                  channels=[channels[channel] for channel in CHANNELS],
-                  perMillion=max((row['perMillion'] for row in observed), default=None),
-                  rankFraction=min(ranked) if observed and len(ranked) == len(observed) else None)
+    result.update(available=available, attested=any(row['count'] is not None for row in modern_channels),
+                  channels=modern_channels, perMillion=per_million, rankFraction=rank_fraction)
     return result
 
 
@@ -107,7 +131,8 @@ def comparison_signal(front, behind):
         return None
     cross_type = front['tokenType'] != behind['tokenType']
     key = 'rankFraction' if cross_type else 'perMillion'
-    values = [item.get(key) for item in (front, behind)]
+    values = [rank if cross_type else frequency
+              for frequency, rank, _ in map(bcc_daily_value, (front, behind))]
     if any(value is None or value <= 0 for value in values):
         return None
     # A smaller relative rank is stronger; invert it to retain the ratio rule.

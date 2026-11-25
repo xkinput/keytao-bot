@@ -4,6 +4,8 @@ import math
 from decimal import Decimal, ROUND_CEILING
 from typing import Iterable
 
+from .bcc_reference import bcc_deciding_channels
+
 
 def render_commonness_summary(assessment: dict) -> str:
     """The comparator's summary already carries BCC/legacy/semantic evidence."""
@@ -27,11 +29,15 @@ def _numeric_commonness_value(value: object):
     return None
 
 
+def uses_dictionary_presence_frequency(reason: str) -> bool:
+    return reason == "dictionary_presence_margin"
+
+
 def _comparison_frequency(commonness: dict, reason: str, web_fallback: bool):
     if web_fallback:
         return _numeric_commonness_value(commonness.get("score"))
     reference = commonness.get("reference") or {}
-    if reason == "dictionary_presence_margin":
+    if uses_dictionary_presence_frequency(reason):
         return _numeric_commonness_value(reference.get("dictionaryPresenceCount"))
     bcc = commonness.get("bcc") or reference.get("bcc") or {}
     historical = "historical" in reason
@@ -51,13 +57,14 @@ def _comparison_frequency(commonness: dict, reason: str, web_fallback: bool):
     elif "balanced_tiebreak" in reason:
         rows = [row for row in rows if row.get("channel") == "多领域"]
     signal = "rankFraction" if "relative_rank" in reason else "perMillion"
-    observed = [row for row in rows
-                if _numeric_commonness_value(row.get("count")) is not None
-                and _numeric_commonness_value(row.get(signal)) is not None]
+    observed = bcc_deciding_channels(
+        (row for row in rows
+         if _numeric_commonness_value(row.get("count")) is not None
+         and _numeric_commonness_value(row.get(signal)) is not None),
+        signal,
+    )
     if observed:
-        strongest = min(observed, key=lambda row: row[signal]) if signal == "rankFraction" else max(
-            observed, key=lambda row: row[signal],
-        )
+        strongest = observed[0]
         if reason.startswith("bcc_"):
             value = strongest[signal]
             return (1 / value if value else None) if signal == "rankFraction" else value
