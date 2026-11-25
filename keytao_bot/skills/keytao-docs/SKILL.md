@@ -92,6 +92,8 @@ description: 键道输入法文档查询工具。当用户询问概念性问题�
 
 - 官网地址: https://keytao.vercel.app
 - 文档地址: https://keytao-docs.vercel.app
+- 通用方案发行包（全平台通用 `keytao-v*.zip`，不含输入法主题）：https://github.com/xkinput/KeyTao/releases/latest
+- 各系统输入法主题包（weasel / squirrel / 元书 / trime）：https://github.com/xkinput/KeyTao/releases/tag/theme
 - iOS 元书输入法码表包稳定下载链接（自动指向最新版）：https://keytao.vercel.app/api/install/ios-latest
 - 该工具从 GitHub 实时获取最新文档内容
 - 每次查询最多返回3个相关文档片段
