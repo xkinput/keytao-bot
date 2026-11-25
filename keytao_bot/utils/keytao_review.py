@@ -60,11 +60,13 @@ from .pronunciation_resolution import (
     score_web_pronunciations,
 )
 from .review_flags import (
+    ReviewDisposition,
     apply_review_disposition,
     apply_manual_review_flag,
     build_auto_review_remark,
     manual_review_reason,
     read_manual_review_flag,
+    read_review_disposition,
     remark_indicates_manual_review,
 )
 
@@ -4474,6 +4476,16 @@ async def prepare_reviewed_word(
         return apply_review_disposition(result, "lookup_unavailable")
     if not evidence_lookup_complete:
         return apply_review_disposition(result, "pronunciation_lookup_incomplete")
+    if (
+        requested_code
+        and has_semantic_pronunciation
+        and explicit_reading_choice is None
+        and not (punctuated_phrase or has_authority or has_web_model_agreement)
+        and not _has_exact_existing_phrase(result["existing"], word, requested_code, "Phrase")
+    ):
+        assessment = _assess_semantic_context_auto_pass(word, requested_code, result)
+        if assessment["accepted"]:
+            return _apply_common_sense_reading(result, assessment)
     if requires_manual_pronunciation_review:
         evidence_kinds = {
             str(pronunciation.get("readingEvidenceKind") or "")
@@ -7529,6 +7541,7 @@ def _assess_semantic_context_auto_pass(
             and not review.get("lookupFailed")
         ),
         "singleSemanticPronunciation": len(semantic_pronunciations) == 1,
+        "matchingCandidateCode": bool(code and code in (pronunciation.get("codes") or [])),
         "knownCharacterReadings": known_character_readings,
         "concreteMeaning": concrete_meaning,
         "meaningConfidence": meaning_confident,
@@ -7539,7 +7552,7 @@ def _assess_semantic_context_auto_pass(
     basis_line = ""
     if not failed_checks:
         basis_line = (
-            "该词可自动通过（语境读音与含义明确，"
+            f"语言常识：{meaning}，该词可自动通过（语境读音与含义明确，"
             f"{non_obscurity['reason']}；"
             f"语料/词典证据：{non_obscurity['evidence']}）"
         )
@@ -7562,6 +7575,23 @@ def _assess_semantic_context_auto_pass(
             "requiresResolvedMultiSenseChoice": True,
         },
     }
+
+
+def _apply_common_sense_reading(
+    review: Dict[str, Any],
+    assessment: Dict[str, Any],
+) -> Dict[str, Any]:
+    basis_line = assessment["basisLine"]
+    review.update({
+        "autoReviewable": True,
+        "autoReviewReason": basis_line,
+        "requiresManualPronunciationReview": False,
+        "semanticContextAutoPass": assessment,
+        "commonSenseSources": [basis_line],
+    })
+    return apply_review_disposition(
+        apply_manual_review_flag(review, False, basis_line), "common_sense_reading",
+    )
 
 
 async def _shared_prepare_reviewed_word(
@@ -7729,14 +7759,14 @@ async def _audit_single_item(
         return outcome
 
     cache_key = (word, phrase_type)
-    review = await progress.run_stage(
+    review = (await progress.run_stage(
         "review",
         _shared_prepare_reviewed_word(
             config, word, phrase_type, review_tasks,
             requested_reading=str(item.get("requestedReading") or "").strip(),
         ),
         AUDIT_REVIEW_STAGE_TIMEOUT,
-    )
+    )).copy()
     outcome.reviewed_words[cache_key] = review
     if not review.get("success"):
         outcome.issues.append(f"「{word}」审词失败：{review.get('message', '未知错误')}")
@@ -7776,6 +7806,17 @@ async def _audit_single_item(
         outcome.sealed_issues.append(issue)
         return outcome
 
+    disposition = read_review_disposition(review)
+    if disposition is ReviewDisposition.BLOCK or (
+        disposition is ReviewDisposition.SEAL
+        and review.get("reviewVerdictSite") not in {"entity_context_reading", "missing_authoritative_page"}
+    ):
+        reason = manual_review_reason(review) or review.get("message") or "读音审核未通过"
+        issue = f"「{word}」@{code} {reason}，需要管理员审核"
+        outcome.issues.append(issue)
+        outcome.sealed_issues.append(issue)
+        return outcome
+
     candidate_codes = _candidate_codes_from_review(
         review,
         include_fallback=not bool(review.get("autoReviewable")),
@@ -7783,7 +7824,10 @@ async def _audit_single_item(
     if not review.get("autoReviewable"):
         if code not in candidate_codes:
             available = ", ".join(sorted(candidate_codes)[:8])
-            outcome.issues.append(f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}")
+            issue = f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}"
+            outcome.issues.append(issue)
+            if review.get("requiresManualPronunciationReview"):
+                outcome.sealed_issues.append(issue)
             return outcome
 
         if phrase_type == "Single" and review.get("type") == "Single":
@@ -7801,14 +7845,8 @@ async def _audit_single_item(
             )
             review["semanticContextAutoPass"] = semantic_context_assessment
             if semantic_context_assessment.get("accepted"):
-                basis_line = str(
-                    semantic_context_assessment.get("basisLine") or ""
-                ).strip()
-                apply_review_disposition(
-                    review,
-                    SEMANTIC_CONTEXT_AUTO_PASS_SITE,
-                )
-                apply_manual_review_flag(review, False, basis_line)
+                _apply_common_sense_reading(review, semantic_context_assessment)
+                basis_line = review["autoReviewReason"]
                 semantic_item = {
                     "word": word,
                     "code": code,
@@ -7826,10 +7864,16 @@ async def _audit_single_item(
                 )
                 outcome.code_chain_priority_reviews.append(priority_review)
                 return outcome
-            issue = (
-                f"「{word}」读音由有明确含义支撑的整词语境判定，"
-                "但缺少权威整词读音来源，需要管理员审核"
-            )
+            if (
+                semantic_context_assessment["pronunciation"]
+                and "matchingCandidateCode" in semantic_context_assessment["failedChecks"]
+            ):
+                issue = f"「{word}」编码 {code} 不在语境读音候选链中，需要管理员审核"
+            else:
+                issue = (
+                    f"「{word}」读音由有明确含义支撑的整词语境判定，"
+                    "但缺少权威整词读音来源，需要管理员审核"
+                )
             outcome.issues.append(issue)
             outcome.sealed_issues.append(issue)
             return outcome
@@ -7999,11 +8043,14 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
             if not task.done():
                 task.cancel()
     approved_item_ids: List[int] = []
+    sealed_item_ids: List[int] = []
     for item, outcome in zip(items, outcomes):
         issues.extend(outcome.issues)
         sealed_issues.extend(outcome.sealed_issues)
         approved_items.extend(outcome.approved_items)
         item_id = item.get("id")
+        if type(item_id) is int and item_id > 0 and outcome.sealed_issues:
+            sealed_item_ids.append(item_id)
         if (
             type(item_id) is int and item_id > 0
             and outcome.approved_items and not (outcome.issues or outcome.sealed_issues or outcome.skipped_items)
@@ -8077,6 +8124,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         "issues": issues,
         # Subset of ``issues`` that code has sealed: no LLM pass may reopen them.
         "structuredManualReviewIssues": sealed_issues,
+        "sealedItemIds": sealed_item_ids,
         "approvedItems": approved_items,
         "approvedItemIds": approved_item_ids,
         "skippedItems": skipped_items,
@@ -8125,6 +8173,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
     reason = summary if auto_approve else (issues[0] if issues else summary)
     apply_manual_review_flag(result, not auto_approve, reason)
     if auto_approve and semantic_context_items:
+        # The reviewed-add preview uses this batch site to clear the initial entity seal.
         return apply_review_disposition(
             result,
             SEMANTIC_CONTEXT_AUTO_PASS_SITE,

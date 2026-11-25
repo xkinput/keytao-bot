@@ -167,6 +167,7 @@ def check(name: str, result: bool):
 def test_review_disposition_registry():
     expected = {
         "semantic_context_common_word": ReviewDisposition.PASS,
+        "common_sense_reading": ReviewDisposition.PASS,
         "empty_word": ReviewDisposition.BLOCK,
         "pronunciation_unresolved": ReviewDisposition.BLOCK,
         "code_unresolved": ReviewDisposition.BLOCK,

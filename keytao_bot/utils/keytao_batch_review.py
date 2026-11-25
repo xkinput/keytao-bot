@@ -688,25 +688,11 @@ def _reviewed_word_entry(
     return None
 
 
-def _audit_supports_item_code(
-    audit: Optional[Dict[str, Any]],
-    word: str,
-    code: str,
-    phrase_type: str = "",
-) -> bool:
-    return _audit_pronunciation_for_item_code(audit, word, code, phrase_type) is not None
-
-
 def _audit_pronunciation_for_item_code(
-    audit: Optional[Dict[str, Any]],
-    word: str,
+    review: Dict[str, Any],
     code: str,
-    phrase_type: str = "",
 ) -> Optional[Dict[str, Any]]:
-    if not isinstance(audit, dict) or not word or not code:
-        return None
-    review = _reviewed_word_entry(audit, word, phrase_type)
-    if not isinstance(review, dict):
+    if not code:
         return None
     for pronunciation in review.get("pronunciations", []):
         if isinstance(pronunciation, dict):
@@ -866,7 +852,7 @@ def _fallback_review_from_llm_error(
         if pr.get("hasConflict") or (isinstance(pr.get("conflictInfo"), dict) and pr["conflictInfo"].get("hasConflict")):
             status = "manual_review"
             title = "冲突需要管理员确认"
-            conflict_reason = _string(pr.get("conflictReason") or pr.get("conflictInfo", {}).get("impact"))
+            conflict_reason = _string(pr.get("conflictReason") or (pr.get("conflictInfo") or {}).get("impact"))
             if conflict_reason:
                 reasons.insert(0, conflict_reason)
 
@@ -928,6 +914,12 @@ def _normalize_llm_review(
             continue
 
     move_pairs = _move_pairs(items)
+    sealed_item_ids = set((audit or {}).get("sealedItemIds") or [])
+    common_sense_basis = {
+        (item.get("word"), item.get("code")): item["basisLine"]
+        for item in (audit or {}).get("semanticContextAutoPassItems") or []
+        if isinstance(item, dict) and item.get("basisLine")
+    }
     normalized_items: List[Dict[str, Any]] = []
     for pr in items:
         pr_id = int(pr["id"])
@@ -944,23 +936,13 @@ def _normalize_llm_review(
         if not suggestions:
             suggestions = [_string(raw_item.get("suggestion")) or "按读音、编码、冲突和编码链顺序继续复核。"]
 
-        if pr.get("action") == "Delete" and (word, code) not in move_pairs:
-            status = "manual_review"
-            reasons.insert(0, "这是纯删除操作，需要管理员确认。")
-            suggestions.insert(0, "确认该词确实不应存在；若是改码，请补齐新增侧。")
-
-        if pr.get("hasConflict") or (isinstance(pr.get("conflictInfo"), dict) and pr["conflictInfo"].get("hasConflict")):
-            status = "manual_review"
-            conflict_reason = _string(pr.get("conflictReason") or pr.get("conflictInfo", {}).get("impact"))
-            if conflict_reason:
-                reasons.insert(0, conflict_reason)
-            suggestions.insert(0, "先解决冲突，再决定是否批准。")
-
         phrase_type = _string(pr.get("type") or "Phrase") or "Phrase"
         sources = _list_of_strings(raw_item.get("sources"), limit=8)
         evidence = _list_of_strings(raw_item.get("evidence"), limit=8)
         pronunciation = _string(raw_item.get("pronunciation"))
-        audit_pronunciation = _audit_pronunciation_for_item_code(audit, word, code, phrase_type)
+        word_review = _reviewed_word_entry(audit, word, phrase_type) or {}
+        audit_pronunciation = _audit_pronunciation_for_item_code(word_review, code)
+        common_sense_sources = _list_of_strings(common_sense_basis.get((word, code)))
         context_pronunciation = (
             audit_pronunciation.get("contextPronunciation")
             if isinstance(audit_pronunciation, dict)
@@ -992,7 +974,7 @@ def _normalize_llm_review(
         # bogus evidence text. They must never upgrade an item to "pass": only
         # structured fields are allowed to do that.
         if _contains_generic_encoding_guess(combined_review_text) or contradicts_context_pronunciation:
-            if _audit_supports_item_code(audit, word, code, phrase_type):
+            if audit_pronunciation is not None:
                 status = "pass"
                 reasons = [
                     f"确定性审词候选链包含 {code}，编码按键道规则可推出；"
@@ -1024,10 +1006,13 @@ def _normalize_llm_review(
                     *[line for line in evidence if not _contains_generic_encoding_guess([line])],
                 ]
 
-        # A structured verdict is terminal: when code stamped this item
-        # needsManualReview, no LLM verdict may downgrade it to "pass".
-        item_manual_flag = item_requires_manual_review(pr)
-        if item_manual_flag is True and status != "manual_review":
+        # Apply terminal verdicts after any model-text corrections.
+        item_sealed = (
+            item_requires_manual_review(pr)
+            or pr_id in sealed_item_ids
+            or word_review.get("lookupFailed") is True
+        )
+        if item_sealed and status != "manual_review":
             status = "manual_review"
             normalized_title = "本喵建议复核"
             reason = manual_review_reason(pr)
@@ -1038,9 +1023,58 @@ def _normalize_llm_review(
             )
             suggestions.insert(0, "请管理员按结构化审核记录确认后再决定是否批准。")
 
+        pure_delete = pr.get("action") == "Delete" and (word, code) not in move_pairs
+        if pure_delete:
+            status = "manual_review"
+            reasons.insert(0, "这是纯删除操作，需要管理员确认。")
+            suggestions.insert(0, "确认该词确实不应存在；若是改码，请补齐新增侧。")
+
+        conflict_info = pr.get("conflictInfo") if isinstance(pr.get("conflictInfo"), dict) else {}
+        has_conflict = pr.get("hasConflict") or conflict_info.get("hasConflict")
+        if has_conflict:
+            status = "manual_review"
+            conflict_reason = _string(pr.get("conflictReason") or conflict_info.get("impact"))
+            if conflict_reason:
+                reasons.insert(0, conflict_reason)
+            suggestions.insert(0, "先解决冲突，再决定是否批准。")
+
+        authority_reading = any(
+            isinstance(source, dict) and source.get("category") != "web_pronunciation"
+            for source in (audit_pronunciation or {}).get("sources") or []
+        )
+        commonness = None
+        if items_only or (status == "pass" and not authority_reading):
+            try:
+                commonness = item_commonness(word)
+            except Exception as error:
+                logger.warning(f"KeyTao batch review commonness failed for PR {pr_id}: {error}")
+
+        if has_conflict:
+            priority, priority_reason = "high", "条目存在冲突"
+        elif pure_delete:
+            priority, priority_reason = "high", "纯删除需人工确认"
+        elif status == "manual_review":
+            if word_review.get("lookupFailed") or word_review.get("pronunciationEvidenceComplete") is False:
+                priority, priority_reason = "high", "读音或编码查询未完成"
+            elif not audit_pronunciation and word_review.get("pronunciations"):
+                priority, priority_reason = "high", "编码未经候选链佐证"
+            else:
+                priority, priority_reason = "high", "条目需人工复核"
+        elif status == "attention":
+            priority, priority_reason = "medium", "条目建议复核"
+        elif authority_reading:
+            priority, priority_reason = "low", "有权威读音来源"
+        elif commonness:
+            priority, priority_reason = "low", "有词典、规范或语料依据"
+        else:
+            priority = "medium"
+            priority_reason = "仅凭语言常识" if common_sense_sources else "缺少独立来源佐证"
+
         normalized_item = {
             "prId": pr_id,
             "status": status,
+            "priority": priority,
+            "priorityReason": priority_reason,
             "severity": _severity_for_status(status),
             "title": normalized_title or ("本喵建议通过" if status == "pass" else "本喵建议复核"),
             "reasons": list(dict.fromkeys(reasons))[:6],
@@ -1054,18 +1088,18 @@ def _normalize_llm_review(
                 "evidence": list(dict.fromkeys(evidence))[:8] or ["本喵已调用 LLM 完成复审。"],
             },
         }
+        if common_sense_sources:
+            normalized_item["reviewRecord"]["commonSenseSources"] = common_sense_sources
         if items_only:
-            try:
-                normalized_item["reviewRecord"]["commonness"] = item_commonness(word)
-            except Exception as error:
-                logger.warning(f"KeyTao batch review commonness failed for PR {pr_id}: {error}")
+            if commonness is not None:
+                normalized_item["reviewRecord"]["commonness"] = commonness
             if suggested_orders and pr_id in suggested_orders:
                 normalized_item["suggestedOrder"] = suggested_orders[pr_id]
         # Write the structured verdict back onto the normalized item so the
         # flag survives the LLM round-trip instead of being silently dropped.
         apply_manual_review_flag(
             normalized_item,
-            item_manual_flag or status == "manual_review",
+            item_sealed or status == "manual_review",
             manual_review_reason(pr),
         )
         normalized_items.append(normalized_item)
@@ -1277,6 +1311,7 @@ def _compact_audit_for_items(audit: Dict[str, Any], items: Sequence[ReviewItem])
             "reviewDisposition",
             "reviewVerdictSite",
             "structuredManualReviewIssues",
+            "sealedItemIds",
             "lookupFailed",
         )
         if key in audit
@@ -1477,10 +1512,11 @@ async def _call_llm(
         "审核 CSS 时应检查短码表、同码链优先级、词频/结构对齐，不得以 zhi/fou 与 f/ao 不对应为理由判错。"
         "常见现代汉语词语、成语、熟语、大众明确知晓的固定表达，或广为人知的实体名/简称/别名，"
         "包括明星艺名、历史人物姓名/字/号/别名、角色名、品牌/产品、作品、地名、组织机构等。"
-        "例如“敬德”可指尉迟敬德/尉迟恭字敬德，“杰伦”可指周杰伦。即使没有抓到该短词自己的权威读音页，"
-        "只要你能明确给出读音和含义，且目标编码在 deterministicAudit 的读音候选链中，可以建议通过；"
-        "此时 evidence 写“本喵语言常识：读音/含义大众通行”，sources 可以为空或写“语言常识”。"
-        "陌生专名、冷僻词、网络临时造词、多音读法不稳、含义不明或编码不在候选链中，仍要标为人工确认或复核。"
+        "例如“敬德”可指尉迟敬德/尉迟恭字敬德，“杰伦”可指周杰伦。"
+        "熟语/常见词的可信读音可用语言常识作为来源，即使没有独立的权威读音页。"
+        "读音和含义明确、目标编码在 deterministicAudit 对应读音的候选链中时，标为 pass；"
+        "此时 sources 填“语言常识”，evidence 写明依据。"
+        "遇到编码不在该读音的候选链中、读音存疑、冲突或疑似错字等实质疑点时，标为 manual_review。"
         "只有读音、编码和常用度/语言常识证据一致时才建议通过；证据不足、歧义或纯删除要标为人工确认或复核。"
         "注意提交资格与自动通过资格不是一回事：只有编码/结构硬冲突、重复写入或确定无效的修改才应表述为阻止提交；"
         "manual_review/needs_attention 表示可以提交给管理员，但不能由本喵自动通过。建议中必须使用这一准确口径。"
