@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -15,16 +16,19 @@ except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
 from . import http_client
+from .bcc_reference import bcc_daily_value, bcc_deciding_channels
 from .http_client import KeytaoApiError
 from .keytao_review import (
     LOOKUP_FAILURE_REASON,
     ReviewHttpConfig,
+    _query_commonness_reference,
     audit_draft_items,
     fetch_keytao_encode,
     get_llm_client,
     llm_config,
     lookup_codes,
     prepare_reviewed_word,
+    rank_code_chain_by_commonness,
     reviewed_word_key,
 )
 from .review_flags import (
@@ -740,6 +744,96 @@ def _is_css_item(pr: ReviewItem) -> bool:
     return _string(pr.get("type") or "Phrase") in {"CSS", "CSSSingle"}
 
 
+def _item_commonness(word: str) -> Dict[str, str]:
+    reference = _query_commonness_reference(word)
+    commonness = {}
+    bcc = reference.get("bcc") or {}
+    if bcc.get("attested"):
+        primary_value, _, _ = bcc_daily_value(bcc)
+        label, reason = (
+            ("口语/多领域", "bcc_frequency_ratio") if primary_value is not None
+            else ("仅新闻/文学", "bcc_secondary_channels")
+        )
+        rows = bcc_deciding_channels(bcc.get("channels", []), "perMillion", reason=reason)
+        if rows:
+            updated_at = _string(rows[0].get("updatedAt"))[:10]
+            corpus = f"BCC {updated_at}" if updated_at else "BCC"
+            commonness["daily"] = f"{label} 每百万 {rows[0]['perMillion']:g}（{corpus}）"
+
+    standards = reference.get("standards") or {}
+    authority = []
+    general = standards.get("generalLevel")
+    if len(word) == 1 and general in (1, 2, 3):
+        authority.append(f"通用规范{'一二三'[general - 1]}级")
+    hsk = standards.get("hskLevel")
+    if hsk in (1, 2, 3, 4, 5, 6, 7):
+        authority.append(f"HSK {'7-9' if hsk == 7 else hsk}级")
+    presence = reference.get("dictionaryPresenceCount") or 0
+    if presence > 0:
+        authority.append(f"词典收录 {presence}")
+    if authority:
+        commonness["authority"] = "；".join(authority)
+    return commonness
+
+
+async def _suggested_item_orders(
+    items: Sequence[ReviewItem],
+    local_review: Optional[Dict[str, Any]],
+    focus_pr_id: Optional[int],
+) -> Dict[int, Dict[str, Any]]:
+    chains = (local_review or {}).get("codeChains")
+    if not isinstance(chains, list):
+        return {}
+
+    target_ids_by_chain: Dict[Tuple[str, str], List[int]] = {}
+    for item in items:
+        if focus_pr_id is None or item["id"] == focus_pr_id:
+            target_ids_by_chain.setdefault((item["code"], item["type"]), []).append(item["id"])
+
+    orders = {}
+    for chain in chains:
+        if not isinstance(chain, dict):
+            continue
+        code = _string(chain.get("code")).lower()
+        phrase_type = _string(chain.get("type") or "Phrase")
+        target_ids = target_ids_by_chain.get((code, phrase_type))
+        after = chain.get("after")
+        # shortcut: Skip chains over eight entries until pairwise ranking is cheaper.
+        if not target_ids or not isinstance(after, list) or not 2 <= len(after) <= 8:
+            continue
+        if any(
+            not isinstance(entry, dict)
+            or entry.get("code") != code
+            or entry.get("type") != phrase_type
+            or not isinstance(entry.get("word"), str)
+            or (entry.get("weight") is not None and type(entry["weight"]) is not int)
+            for entry in after
+        ):
+            continue
+        words = [entry["word"] for entry in after]
+        ranking = await rank_code_chain_by_commonness(after, offline_only=True)
+        if ranking.get("status") != "reorder":
+            continue
+        ordered_words = [entry["word"] for entry in ranking["proposedOrder"]]
+        if ordered_words == words or len(ordered_words) != len(words) or set(ordered_words) != set(words):
+            continue
+
+        snapshot = sorted(after, key=lambda entry: (
+            entry.get("weight") is None, entry.get("weight"), entry["word"],
+        ))
+        digest_input = "\n".join(
+            f"{code}|{phrase_type}|{entry['word']}|{entry.get('weight')}" for entry in snapshot
+        )
+        order = {
+            "code": code,
+            "type": phrase_type,
+            "orderedWords": ordered_words,
+            "chainDigest": hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16],
+        }
+        orders.update((pr_id, order) for pr_id in target_ids)
+    return orders
+
+
 def _fallback_review_from_llm_error(
     items: Sequence[ReviewItem],
     audit: Dict[str, Any],
@@ -747,6 +841,7 @@ def _fallback_review_from_llm_error(
     reason: str,
     *,
     items_only: bool = False,
+    suggested_orders: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     move_pairs = _move_pairs(items)
     audit_summary = _string(audit.get("summary"))
@@ -790,7 +885,10 @@ def _fallback_review_from_llm_error(
         })
 
     if items_only:
-        return _normalize_llm_review({"items": raw_items}, items, local_review, audit, items_only=True)
+        return _normalize_llm_review(
+            {"items": raw_items}, items, local_review, audit,
+            items_only=True, suggested_orders=suggested_orders,
+        )
 
     return _normalize_llm_review({
         "verdict": "manual_review" if any(item.get("status") == "manual_review" for item in raw_items) else "needs_attention",
@@ -817,6 +915,7 @@ def _normalize_llm_review(
     audit: Optional[Dict[str, Any]] = None,
     *,
     items_only: bool = False,
+    suggested_orders: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     raw_items = raw.get("items") if isinstance(raw.get("items"), list) else []
     raw_by_id: Dict[int, Dict[str, Any]] = {}
@@ -955,6 +1054,13 @@ def _normalize_llm_review(
                 "evidence": list(dict.fromkeys(evidence))[:8] or ["本喵已调用 LLM 完成复审。"],
             },
         }
+        if items_only:
+            try:
+                normalized_item["reviewRecord"]["commonness"] = _item_commonness(word)
+            except Exception as error:
+                logger.warning(f"KeyTao batch review commonness failed for PR {pr_id}: {error}")
+            if suggested_orders and pr_id in suggested_orders:
+                normalized_item["suggestedOrder"] = suggested_orders[pr_id]
         # Write the structured verdict back onto the normalized item so the
         # flag survives the LLM round-trip instead of being silently dropped.
         apply_manual_review_flag(
@@ -1231,7 +1337,12 @@ def _items_for_llm(items: Sequence[ReviewItem]) -> List[ReviewItem]:
     compact: List[ReviewItem] = []
     for item in items:
         value = dict(item)
-        value["remark"] = _string(value.get("remark"))[:1200]
+        value["remark"] = "\n".join(
+            line for line in _string(value.get("remark")).splitlines()
+            if not line.lstrip().startswith((
+                "常用：", "常用:", "收录：", "收录:", "排序：", "排序:", "校验：", "校验:",
+            ))
+        )[:1200]
         compact.append(value)
     return compact
 
@@ -1586,6 +1697,12 @@ async def review_keytao_batch_with_llm(
                 logger.warning(f"KeyTao encode-only fallback audit failed: {encode_error}")
                 audit = _fallback_audit_for_llm(items, reason)
 
+    suggested_orders = None
+    if items_only:
+        try:
+            suggested_orders = await _suggested_item_orders(items, local_review, focus_pr_id)
+        except Exception as error:
+            logger.warning(f"KeyTao batch review suggested orders failed: {error}")
     try:
         raw_review, chunk_warnings = await _call_llm_chunked(
             batch,
@@ -1597,7 +1714,10 @@ async def review_keytao_batch_with_llm(
         )
     except Exception as error:
         logger.warning(f"KeyTao LLM batch review failed: {error}")
-        ai_review = _fallback_review_from_llm_error(items, audit, local_review, str(error), items_only=items_only)
+        ai_review = _fallback_review_from_llm_error(
+            items, audit, local_review, str(error),
+            items_only=items_only, suggested_orders=suggested_orders,
+        )
         return {
             "success": True,
             "aiReview": ai_review,
@@ -1605,7 +1725,10 @@ async def review_keytao_batch_with_llm(
             "warning": str(error),
         }
 
-    ai_review = _normalize_llm_review(raw_review, items, local_review, audit, items_only=items_only)
+    ai_review = _normalize_llm_review(
+        raw_review, items, local_review, audit,
+        items_only=items_only, suggested_orders=suggested_orders,
+    )
     result = {
         "success": True,
         "aiReview": ai_review,

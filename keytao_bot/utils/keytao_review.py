@@ -6316,7 +6316,9 @@ def _compare_web_commonness_results(
     }
 
 
-async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
+async def compare_word_commonness(
+    front_word: str, behind_word: str, *, offline_only: bool = False,
+) -> Dict:
     front_word = front_word.strip()
     behind_word = behind_word.strip()
     front_reference = _query_commonness_reference(front_word)
@@ -6331,7 +6333,7 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
             front_reference,
             behind_reference,
         )
-        if (front_reference.get('attested') or behind_reference.get('attested')
+        if (offline_only or front_reference.get('attested') or behind_reference.get('attested')
                 or _authority_standard_level(front_word, front_reference) is not None
                 or _authority_standard_level(behind_word, behind_reference) is not None
                 or any(historical_attested(item.get('bcc') or {})
@@ -6339,6 +6341,17 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
                 or comparison['decisionReason'].startswith('bcc_historical_')):
             record_commonness_evidence(comparison)
             return comparison
+
+    if offline_only:
+        return {
+            "success": False,
+            "verdict": "not_enough_evidence",
+            "frontWord": front_word,
+            "behindWord": behind_word,
+            "decisionReason": "reference_unavailable",
+            "summary": "离线常用度资料不可用",
+            "webFallback": False,
+        }
 
     front, behind = await asyncio.gather(
         _estimate_word_commonness_web_fallback(front_word),
@@ -6777,6 +6790,7 @@ async def rank_code_chain_by_commonness(
     *,
     semantic_review_loader: Optional[Any] = None,  # Compatibility with existing chat callers.
     tie_break_words: Optional[Sequence[str]] = None,
+    offline_only: bool = False,
 ) -> Dict[str, Any]:
     """Rank one server-resolved same-code/type chain conservatively.
 
@@ -6786,6 +6800,7 @@ async def rank_code_chain_by_commonness(
     """
     normalized = [dict(entry) for entry in entries if isinstance(entry, dict)]
     normalized.sort(key=lambda entry: (
+        offline_only and entry.get("weight") is None,
         int(entry.get("weight") or 0),
         str(entry.get("word") or ""),
     ))
@@ -6821,10 +6836,11 @@ async def rank_code_chain_by_commonness(
     comparisons: List[Dict[str, Any]] = []
     evidence_by_word: Dict[str, str] = {}
     edges: Dict[str, set[str]] = {word: set() for word in words}
+    compare_options = {"offline_only": True} if offline_only else {}
 
     for left_index, left_word in enumerate(words):
         for right_word in words[left_index + 1:]:
-            comparison = await compare_word_commonness(left_word, right_word)
+            comparison = await compare_word_commonness(left_word, right_word, **compare_options)
             if not isinstance(comparison, dict):
                 comparison = {
                     "success": False,
@@ -6868,7 +6884,10 @@ async def rank_code_chain_by_commonness(
                         "reason": "not_enough_evidence",
                         "currentOrder": normalized,
                         "comparisons": [*comparisons, comparison],
-                        "evidenceLines": [evidence_by_word[word] for word in words],
+                        "evidenceLines": [
+                            evidence_by_word[word] for word in words
+                            if not offline_only or word in evidence_by_word
+                        ],
                     }
             comparisons.append(comparison)
             if verdict == "close":
@@ -6878,7 +6897,10 @@ async def rank_code_chain_by_commonness(
                         "reason": "not_enough_evidence",
                         "currentOrder": normalized,
                         "comparisons": comparisons,
-                        "evidenceLines": [evidence_by_word[word] for word in words],
+                        "evidenceLines": [
+                            evidence_by_word[word] for word in words
+                            if not offline_only or word in evidence_by_word
+                        ],
                     }
                 continue
             # Chat can use authority evidence to reorder an existing chain.

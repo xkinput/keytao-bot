@@ -58,6 +58,9 @@ def protected_candidate_occupants(
             and assessment.get("occupantWord") == occupant
             and assessment.get("occupantCode") == normalized_code
             and assessment.get("verdict") == "front_more_common"
+            and assessment.get("decisionReason") not in (
+                "modern_semantic_vs_dictionary_dominated", "dictionary_presence_margin",
+            )
             for assessment in trusted_assessments
         )
     )
