@@ -35,6 +35,27 @@ class GithubSyncNotificationTest(unittest.TestCase):
         self.assertIn("Rea、GarthTB、朝歌、EVO", result)
         self.assertIn("感谢以上贡献者", result)
         self.assertIn("本次触发时待同步批次：28 个", result)
+        self.assertIn("keytao-v1.3.5.zip", result)
+
+    def test_counts_deletions_in_total_entries(self) -> None:
+        result = build_github_sync_notification({
+            "prUrl": "https://github.com/xkinput/KeyTao/pull/180",
+            "releaseTag": "v1.3.35",
+            "syncSummary": {
+                "contributors": ["Rea", "GarthTB"],
+                "totalEntries": 3,
+                "stats": [
+                    {"type": "词组", "create": 2, "change": 1, "delete": 0},
+                    {"type": "单字", "create": 0, "change": 0, "delete": 1},
+                ],
+            },
+        })
+
+        self.assertIn("• 总计 4 条词条", result)
+        self.assertIn("• 词组：新增 2，修改 1", result)
+        self.assertIn("• 单字：删除 1", result)
+        self.assertIn("本次词库贡献者（2 位）", result)
+        self.assertIn("keytao-v1.3.35.zip", result)
 
     def test_keeps_legacy_response_compatible(self) -> None:
         result = build_github_sync_notification({

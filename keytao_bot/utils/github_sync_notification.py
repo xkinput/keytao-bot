@@ -43,6 +43,18 @@ def build_github_sync_notification(data: dict[str, Any]) -> str:
         ]
         total_entries = sync_summary.get("totalEntries")
         stats = sync_summary.get("stats", [])
+        if isinstance(stats, list):
+            stats_total = 0
+            for stat in stats:
+                if not isinstance(stat, dict):
+                    continue
+                for key in ("create", "change", "delete"):
+                    try:
+                        stats_total += max(0, int(stat.get(key) or 0))
+                    except (TypeError, ValueError):
+                        pass
+            if stats_total > 0:
+                total_entries = stats_total
 
         lines.extend(["", "本次更新："])
         if total_entries is not None:
@@ -64,5 +76,8 @@ def build_github_sync_notification(data: dict[str, Any]) -> str:
 
     if pending_count is not None:
         lines.extend(["", f"本次触发时待同步批次：{pending_count} 个。"])
-    lines.append("请大家检查并及时更新词库。")
+    if release_tag:
+        lines.append(f"通用方案包 keytao-{release_tag}.zip 正在打包发布，完成后即可更新词库。")
+    else:
+        lines.append("请大家检查并及时更新词库。")
     return "\n".join(lines)
