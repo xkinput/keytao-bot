@@ -56,13 +56,13 @@ DEFAULT_PRONUNCIATION_RESOLUTION_CACHE_DB = (
     / "data"
     / "pronunciation_resolution_cache.db"
 )
-PRONUNCIATION_CACHE_SCHEMA_VERSION = 2
+PRONUNCIATION_CACHE_SCHEMA_VERSION = 3
 POSITIVE_CACHE_TTL_SECONDS = 24 * 60 * 60
 NEGATIVE_CACHE_TTL_SECONDS = 15 * 60
 
 
 def _cacheable_web_result(payload: dict[str, Any]) -> dict[str, Any]:
-    """Keep only scored readings and validated domains in durable storage."""
+    """Keep scored readings, domains and verified dictionary entry URLs."""
     candidates: list[dict[str, Any]] = []
     raw_candidates = [
         candidate
@@ -92,7 +92,12 @@ def _cacheable_web_result(payload: dict[str, Any]) -> dict[str, Any]:
             domain = str(value or "").strip().lower().rstrip(".")
             if is_valid_pronunciation_domain(domain) and domain not in domains:
                 domains.append(domain)
-        candidates.append({"normalized": normalized, "domains": domains})
+        entry_urls = {
+            row["domain"]: row["dictionaryEntryUrl"]
+            for row in candidate.get("evidence") or []
+            if isinstance(row, dict) and row.get("domain") in domains and row.get("dictionaryEntryUrl")
+        }
+        candidates.append({"normalized": normalized, "domains": domains, "entryUrls": entry_urls})
     selected_normalized = (
         [
             normalize_pinyin_syllable(str(value or ""))
@@ -124,8 +129,9 @@ def _hydrate_cached_web_result(payload: dict[str, Any]) -> dict[str, Any]:
         ]
         if not normalized or not all(normalized):
             continue
+        entry_urls = cached.get("entryUrls") or {}
         evidence = [
-            {"domain": domain, "highTrust": _is_high_trust_domain(domain)}
+            {"domain": domain, "highTrust": _is_high_trust_domain(domain), "url": entry_urls.get(domain, "")}
             for domain in dict.fromkeys(domains)
         ]
         candidates.append({

@@ -8225,6 +8225,7 @@ async def _perform_submit_current_draft(
     authorized_content_version: Optional[int] = None,
     authorize_current_draft: bool = False,
     shown_others_submitted: Optional[List[Dict]] = None,
+    reminder_content_version: Optional[int] = None,
 ) -> DraftActionResult:
     """Submit a draft without writing follow-up state into the conversation slot."""
     # A confirmed server ticket is the mutation stage. Keeping the public
@@ -8253,6 +8254,10 @@ async def _perform_submit_current_draft(
             PendingToolConfirm(function_name="keytao_submit_batch", args=arguments),
             submit_data,
         )
+        if reminder_content_version is not None and (
+            submit_data.get("batchId") != batch_id or not server_warning_ticket_is_complete(pending_state)
+        ):
+            return DraftActionResult(render_remediation_reply("提交检查不完整", command="查看草稿"))
         words, others = await _lookup_submit_others_submitted(submit_data, platform, user_id)
         unseen = [item for item in others if item not in (shown_others_submitted or [])]
         if unseen:
@@ -8278,6 +8283,7 @@ async def _perform_submit_current_draft(
         can_auto_confirm = (
             auto_confirm
             and not confirmed
+            and (reminder_content_version is None or submit_data.get("contentVersion") == reminder_content_version)
             and (
                 _semantic_direct_words.get() is None
                 or server_warning_ticket_is_complete(pending_state)
@@ -8846,6 +8852,7 @@ async def _perform_clear_current_draft(
     user_id: str,
     *,
     batch_id: str = "",
+    expected_content_version: Optional[int] = None,
 ) -> DraftActionResult:
     """Clear the sender's exact current/restored draft without a second prompt."""
     list_data = await _fetch_current_draft_items(
@@ -8873,6 +8880,11 @@ async def _perform_clear_current_draft(
             ),
             data=list_data,
         )
+    if expected_content_version is not None and (
+        list_data.get("status", list_data.get("batchStatus")) != "Draft"
+        or list_data.get("contentVersion") != expected_content_version
+    ):
+        return DraftActionResult(render_remediation_reply("草稿内容或状态已变化", command="查看草稿"))
     resolved_batch_id = listed_batch_id or str(batch_id or "")
     items = list_data.get("items")
     if not isinstance(items, list):
@@ -9485,6 +9497,8 @@ async def _try_handle_draft_clear_command(
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    *,
+    reminder_target: Optional[Tuple[str, int]] = None,
 ) -> Optional[str]:
     if not _message_authorizes_draft_clear(message_text, command_intent):
         return None
@@ -9497,7 +9511,13 @@ async def _try_handle_draft_clear_command(
             platform,
             user_id,
         )
-    result = await _perform_clear_current_draft(platform, user_id)
+    if reminder_target is None:
+        result = await _perform_clear_current_draft(platform, user_id)
+    else:
+        batch_id, version = reminder_target
+        result = await _perform_clear_current_draft(
+            platform, user_id, batch_id=batch_id, expected_content_version=version,
+        )
     if result.pending_state is not None:
         conversation_state_store.set((platform, user_id), result.pending_state, space_key=space_key, owner_label=owner_label)
     if result.success or result.invalidate_pending:

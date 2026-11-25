@@ -17,7 +17,7 @@ from typing import Any, Dict, Literal, Optional
 
 from fastapi import Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, field_validator
 from nonebot import get_driver
 from nonebot.log import logger
 
@@ -96,6 +96,7 @@ class KeyTaoBatchReviewRequest(BaseModel):
     batch: Dict[str, Any]
     local_review: Optional[Dict[str, Any]] = None
     focus_pr_id: Optional[int] = None
+    target_pr_ids: Optional[list[StrictInt]] = None
     deadline_ms: Optional[int] = Field(default=None, strict=True, ge=10_000, le=290_000)
 
 
@@ -365,6 +366,13 @@ try:
         review_output: Optional[str] = Header(None, alias="X-KeyTao-Review-Output"),
     ) -> dict:
         _check_auth(authorization)
+        if request.target_pr_ids is not None:
+            if not request.target_pr_ids:
+                raise HTTPException(status_code=422, detail="target_pr_ids 不能为空")
+            batch_ids = {item["id"] for item in batch_review._extract_items(request.batch)}
+            unknown_ids = sorted(set(request.target_pr_ids) - batch_ids)
+            if unknown_ids:
+                raise HTTPException(status_code=422, detail=f"target_pr_ids 包含不属于该批次的 ID：{unknown_ids}")
         items_only = review_output == "items"
         result = await review_keytao_batch_with_llm(
             batch=request.batch,
@@ -373,6 +381,7 @@ try:
             items_only=items_only,
             deadline_ms=request.deadline_ms or (280_000 if items_only else 170_000),
             is_disconnected=http_request.is_disconnected,
+            **({"target_pr_ids": request.target_pr_ids} if request.target_pr_ids is not None else {}),
         )
         if not result.get("success"):
             raise HTTPException(status_code=502, detail=result.get("message") or "喵喵复审失败")

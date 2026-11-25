@@ -31,7 +31,7 @@ class PolyphoneStandardReadingTests(unittest.IsolatedAsyncioTestCase):
             review, "detect_polyphonic_characters", return_value={"苕": ["tiao", "shao"]},
         ))
         self.enterContext(patch.object(review, "resolve_compositional_pronunciation", return_value=None))
-        self.enterContext(patch.object(
+        self.web = self.enterContext(patch.object(
             review, "_search_pronunciation_web_evidence",
             AsyncMock(return_value={"status": "no_evidence", "candidates": [], "searchComplete": True}),
         ))
@@ -105,6 +105,31 @@ class PolyphoneStandardReadingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([1], audit["sealedItemIds"])
         self.assertEqual([], audit["approvedItemIds"])
 
+    async def test_generic_web_and_llm_agreement_on_tiao_pi_is_sealed(self):
+        self.web.return_value = review.score_web_pronunciations(WORD, [
+            {"url": f"https://{domain}/tiao-pi", "title": WORD, "snippet": "苕皮 拼音：tiáo pí"}
+            for domain in ("recipes.example", "food.example")
+        ])
+        self.assertEqual("resolved", self.web.return_value["status"])
+        prepared = await review.prepare_reviewed_word(CONFIG, WORD)
+        self.assertEqual("web_model_agreement", prepared["pronunciationResolution"]["status"])
+        self.assertEqual("SEAL", prepared["reviewDisposition"])
+        self.assertFalse(prepared["autoReviewable"])
+        for fields in ({}, {"action": "Change", "oldWord": "苕皮儿"}):
+            item, audit = await self.audit("tcpk", **fields)
+            self.assertEqual([1], audit["sealedItemIds"])
+            self.assertEqual("manual_review", self.normalize_pass(item, audit)["status"])
+
+    async def test_web_agreement_uses_only_the_exact_dictionary_entry(self):
+        for path, approved in (("blog/苕皮", False), ("hans/小苕皮", False), ("hans/苕皮", True)):
+            with self.subTest(path=path):
+                review._clear_review_caches()
+                self.web.return_value = review.score_web_pronunciations(WORD, [{
+                    "url": f"https://www.zdic.net/{path}", "title": WORD, "snippet": "苕皮 拼音：tiáo pí",
+                }])
+                result = await review.prepare_reviewed_word(CONFIG, WORD)
+                self.assertIs(approved, result["autoReviewable"])
+
     async def test_prompt_states_standard_mandarin_rule(self):
         create = AsyncMock(return_value=SimpleNamespace(choices=[]))
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
@@ -162,6 +187,22 @@ class PolyphoneStandardReadingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(("manual_review", "high", "编码未经候选链佐证"),
                                      (result["status"], result["priority"], result["priorityReason"]))
                     self.assertTrue(result["needsManualReview"])
+
+    async def test_types_without_phonetic_chains_avoid_out_of_chain_seal(self):
+        self.fixture(WORD, "tiao pi", ["tcpk"], "shao pi", "ezpk", authority=True)
+        prepared = await review.prepare_reviewed_word(CONFIG, WORD)
+        for phrase_type in ("Supplement", "Symbol", "Link"):
+            for action in ("Create", "Change"):
+                with self.subTest(phrase_type=phrase_type, action=action), patch.object(
+                    review, "prepare_reviewed_word", AsyncMock(return_value=prepared),
+                ):
+                    item, audit = await self.audit(
+                        "zzzz", type=phrase_type, action=action, oldWord="旧词",
+                    )
+                    self.assertEqual([], audit["sealedItemIds"])
+                    self.assertEqual("pass", self.normalize_pass(item, audit)["status"])
+                    fallback = await batch_review._fallback_audit_with_encode_inner(CONFIG, [item], "超时")
+                    self.assertEqual([], fallback["sealedItemIds"])
 
     async def test_explicit_code_in_alternate_group_is_writeable_but_sealed(self):
         prepared = await review.prepare_reviewed_word(CONFIG, WORD, requested_code="ezpk")

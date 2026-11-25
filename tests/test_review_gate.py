@@ -175,6 +175,7 @@ def test_review_disposition_registry():
         "invalid_code": ReviewDisposition.BLOCK,
         "injection_shaped_input": ReviewDisposition.BLOCK,
         "missing_authoritative_page": ReviewDisposition.SEAL,
+        "polyphone_web_agreement_unverified": ReviewDisposition.SEAL,
         "pronunciation_lookup_incomplete": ReviewDisposition.SEAL,
         "entity_context_reading": ReviewDisposition.SEAL,
         "requested_encode_group": ReviewDisposition.SEAL,
@@ -2256,14 +2257,14 @@ def test_unknown_polyphone_resolution_ladder_and_stop_conditions():
         and outcome["composition_model"].await_count == 0,
     )
     check(
-        "web and model agreement selects the non-default reading chain",
+        "web and model agreement selects the chain but requires dictionary corroboration",
         outcome["agreed"].get("status") == "web_model_agreement"
         and outcome["agreeing_search"].await_count == 2
         and outcome["agreeing_model"].await_count == 1
         and outcome["agreed"].get("groups", [{}])[0].get("normalized")
         == ["bo", "ji"]
         and outcome["agreed"].get("groups", [{}])[0].get("requiresManualReview")
-        is False,
+        is True,
     )
     check(
         "web disagreement renders both returned chains and skips model override",
@@ -2572,9 +2573,9 @@ def test_s53_thin_muscle_prepare_and_render_contract():
             "results": [
                 {
                     "title": "薄肌解剖术语",
-                    "url": "https://baike.baidu.com/item/%E8%96%84%E8%82%8C",
+                    "url": "https://www.zdic.net/hans/%E8%96%84%E8%82%8C",
                     "snippet": "薄肌 拼音：bó jī。",
-                    "provider": "fixture-baike",
+                    "provider": "fixture-handian",
                 },
                 {
                     "title": "薄肌读音",
@@ -2673,8 +2674,8 @@ def test_s53_thin_muscle_prepare_and_render_contract():
     check(
         "rendered review names web evidence and exposes only the resolved chain",
         "「薄肌」未收录：bó jī，可自动通过" in review_line
-        and "网络（baike.baidu.com）" in review_line
-        and "https://baike.baidu.com/item/%E8%96%84%E8%82%8C" in review_line
+        and "汉典" in review_line
+        and "https://www.zdic.net/hans/%E8%96%84%E8%82%8C" in review_line
         and "语义判断" in admin_note
         and "bljk" in rendered
         and "bzjk" not in rendered,

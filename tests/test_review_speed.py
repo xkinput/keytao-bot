@@ -232,6 +232,8 @@ class ReviewDeadlineEndpointTests(unittest.TestCase):
         with TestClient(app) as client, patch.object(web_api, "review_keytao_batch_with_llm", run_review):
             for invalid in (9999, 290001, "15000", 15000.0, True):
                 self.assertEqual(422, client.post(path, headers=auth, json={"batch": {}, "deadline_ms": invalid}).status_code)
+            for invalid in ("1", [True], ["1"], [1.5]):
+                self.assertEqual(422, client.post(path, headers=auth, json={"batch": {}, "target_pr_ids": invalid}).status_code)
             run_review.assert_not_awaited()
             for headers, deadline, expected in (
                 (auth, None, 170_000),
@@ -243,4 +245,15 @@ class ReviewDeadlineEndpointTests(unittest.TestCase):
                 self.assertEqual(200, client.post(path, headers=headers, json=body).status_code)
                 kwargs = run_review.await_args.kwargs
                 self.assertEqual(expected, kwargs["deadline_ms"])
+                self.assertNotIn("target_pr_ids", kwargs)
                 self.assertIs(web_api.Request.is_disconnected, kwargs["is_disconnected"].__func__)
+            run_review.reset_mock()
+            batch = {"pullRequests": [{"id": 2}, {"id": 3}]}
+            for targets, detail in (([], "不能为空"), ([2, 99], "99")):
+                response = client.post(path, headers=auth, json={"batch": batch, "target_pr_ids": targets})
+                self.assertEqual(422, response.status_code)
+                self.assertIn(detail, response.json()["detail"])
+            run_review.assert_not_awaited()
+            response = client.post(path, headers=auth, json={"batch": batch, "target_pr_ids": [2, 3]})
+            self.assertEqual(200, response.status_code)
+            self.assertEqual([2, 3], run_review.await_args.kwargs["target_pr_ids"])

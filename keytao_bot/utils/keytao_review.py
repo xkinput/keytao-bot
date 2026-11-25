@@ -240,6 +240,7 @@ COMMON_KNOWN_MIN_SCORE = 0.55
 COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
 CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
+NO_PRONUNCIATION_CHAIN_TYPES = CSS_REVIEW_TYPES | {"Supplement", "Symbol", "Link"}
 # Proxy requests fan out in parallel by source. One proxy attempt is capped at
 # 2 seconds; if it is unavailable, the reliable direct path still gets its
 # existing two 2.25-second attempts plus 0.5-second backoff. That 7-second
@@ -352,6 +353,7 @@ AUTHORITATIVE_SOURCES = [
     },
     # xh.5156edu.com is a future GB2312/POST carrier option.
 ]
+AUTHORITATIVE_DICTIONARY_MIN_TRUST = 3
 
 # Authoritative contract from keytao-next's fixed evidence allowlist. Keep this
 # explicit even while the names are identical so drift cannot silently turn a
@@ -3020,7 +3022,12 @@ async def _search_pronunciation_web_evidence(word: str) -> Dict[str, Any]:
             and attempt.get("status") != "skipped"
         ])
 
+    results.sort(key=lambda row: not _web_dictionary_source(word, str(row.get("url") or "")))
     scored = score_web_pronunciations(word, results)
+    for candidate in scored["candidates"]:
+        for row in candidate["evidence"]:
+            if _web_dictionary_source(word, row["url"]):
+                row["dictionaryEntryUrl"] = row["url"]
     result = {
         **scored,
         "queries": list(queries),
@@ -3082,25 +3089,54 @@ def _review_group_from_returned(
     }
 
 
-def _web_sources(candidate: Dict[str, Any]) -> list[Dict[str, Any]]:
+def _web_dictionary_source(word: str, url: str) -> Dict[str, Any]:
+    try:
+        page = urlparse(url)
+        host = (page.hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return {}
+    if (
+        page.scheme not in {"http", "https"} or page.username or page.password
+        or not _direct_url_entry_matches_word(url, word)
+    ):
+        return {}
+    for source in AUTHORITATIVE_SOURCES:
+        if (
+            host == source["domain"]
+            and source["category"] == "dictionary"
+            and source["trust"] >= AUTHORITATIVE_DICTIONARY_MIN_TRUST
+            and _source_applies_to_word(source, word)
+            and (
+                not source.get("direct_urls")
+                or any(unquote(page.path).rstrip("/") == urlparse(template.format(word=word)).path
+                       for template in source["direct_urls"])
+            )
+        ):
+            return source
+    return {}
+
+
+def _web_sources(word: str, candidate: Dict[str, Any]) -> list[Dict[str, Any]]:
     sources: list[Dict[str, Any]] = []
     seen_domains: set[str] = set()
     for row in candidate.get("evidence") or []:
         if not isinstance(row, dict):
             continue
         domain = str(row.get("domain") or "").strip().lower()
+        url = str(row.get("url") or "").strip()
+        dictionary = _web_dictionary_source(word, url)
         if (
             not is_valid_pronunciation_domain(domain)
-            or domain in seen_domains
+            or (domain in seen_domains and not dictionary)
         ):
             continue
         seen_domains.add(domain)
         sources.append({
-            "sourceId": f"web-pronunciation:{domain}",
-            "source": f"网络（{domain}）",
-            "url": str(row.get("url") or "").strip(),
-            "category": "web_pronunciation",
-            "trust": 4 if row.get("highTrust") else 2,
+            "sourceId": dictionary.get("id", f"web-pronunciation:{domain}"),
+            "source": dictionary.get("label", f"网络（{domain}）"),
+            "url": url,
+            "category": dictionary.get("category", "web_pronunciation"),
+            "trust": dictionary.get("trust", 4 if row.get("highTrust") else 2),
             "evidenceRole": "web-pronunciation",
         })
     return sources
@@ -3315,7 +3351,7 @@ async def resolve_unknown_polyphonic_pronunciation(
     if semantic_group is not None and agreeing_candidate is not None:
         returned = returned_by_sequence.get(semantic_sequence)
         assert returned is not None
-        sources = _web_sources(agreeing_candidate)
+        sources = _web_sources(word, agreeing_candidate)
         domains = "、".join(
             str(source.get("source") or "").strip()
             for source in sources
@@ -3325,7 +3361,7 @@ async def resolve_unknown_polyphonic_pronunciation(
             sources=sources,
             source_summary=f"{domains} + 语义判断" if domains else "网络 + 语义判断",
             evidence_kind="web_semantic_agreement",
-            requires_manual_review=False,
+            requires_manual_review=not any(source["category"] == "dictionary" for source in sources),
             semantic=True,
             context=semantic_group.get("contextPronunciation"),
         )
@@ -3772,7 +3808,7 @@ async def prepare_reviewed_word(
                 and source.get("category") == "dictionary"
                 and isinstance(source.get("trust"), (int, float))
                 and not isinstance(source.get("trust"), bool)
-                and source["trust"] >= 3
+                and source["trust"] >= AUTHORITATIVE_DICTIONARY_MIN_TRUST
                 for source in group.get("sources") or []
             )
         ]
@@ -4351,9 +4387,18 @@ async def prepare_reviewed_word(
         for source in pronunciation.get("sources") or []
         if isinstance(source, dict)
     )
+    web_model_groups = [
+        pronunciation for pronunciation in pronunciations
+        if pronunciation.get("readingEvidenceKind") == "web_semantic_agreement"
+    ]
     has_web_model_agreement = any(
-        pronunciation.get("readingEvidenceKind") == "web_semantic_agreement"
-        for pronunciation in pronunciations
+        any(
+            source.get("category") == "dictionary"
+            and source.get("trust", 0) >= AUTHORITATIVE_DICTIONARY_MIN_TRUST
+            for source in pronunciation.get("sources") or []
+            if isinstance(source, dict)
+        )
+        for pronunciation in web_model_groups
     )
     has_web_pronunciation = any(
         source.get("category") == "web_pronunciation"
@@ -4365,7 +4410,9 @@ async def prepare_reviewed_word(
     requires_manual_pronunciation_review = any(
         bool(pron.get("requiresManualReview"))
         for pron in pronunciations
-    ) or multi_sense_choice.get("status") == "ambiguous" or punctuated_phrase
+    ) or multi_sense_choice.get("status") == "ambiguous" or punctuated_phrase or (
+        bool(web_model_groups) and not has_web_model_agreement
+    )
     auto_reviewable = (
         (has_authority or has_web_model_agreement)
         and evidence_lookup_complete
@@ -4383,6 +4430,8 @@ async def prepare_reviewed_word(
         auto_review_reason = "网络读音证据与独立语义判断一致"
     elif has_authority:
         auto_review_reason = "至少一个权威来源给出读音"
+    elif web_model_groups:
+        auto_review_reason = "多音字缺少支持该普通话读音的权威整词词典证据，仍需管理员审核"
     elif has_web_pronunciation:
         auto_review_reason = "网络读音证据已定位候选读音，仍需管理员审核"
     elif has_semantic_pronunciation:
@@ -4507,6 +4556,8 @@ async def prepare_reviewed_word(
         assessment = _assess_semantic_context_auto_pass(word, requested_code, result)
         if assessment["accepted"]:
             return _apply_common_sense_reading(result, assessment)
+    if web_model_groups and not has_web_model_agreement:
+        return apply_review_disposition(result, "polyphone_web_agreement_unverified")
     if requires_manual_pronunciation_review:
         evidence_kinds = {
             str(pronunciation.get("readingEvidenceKind") or "")
@@ -7784,8 +7835,16 @@ async def _audit_single_item(
             outcome.sealed_issues.append(issue)
             outcome.lookup_transient = True
             return outcome
-        if new_review.get("success") and code not in _candidate_codes_from_review(
-            new_review, include_fallback=not bool(new_review.get("autoReviewable")),
+        if new_review.get("reviewVerdictSite") == "polyphone_web_agreement_unverified":
+            issue = f"「{word}」@{code} {manual_review_reason(new_review)}"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
+            return outcome
+        if (
+            phrase_type not in NO_PRONUNCIATION_CHAIN_TYPES and new_review.get("success")
+            and code not in _candidate_codes_from_review(
+                new_review, include_fallback=not bool(new_review.get("autoReviewable")),
+            )
         ):
             issue = f"「{word}」编码 {code} 不在读音候选链中"
             outcome.issues.append(issue)
@@ -7858,17 +7917,17 @@ async def _audit_single_item(
         outcome.sealed_issues.append(issue)
         return outcome
 
-    candidate_codes = _candidate_codes_from_review(
-        review,
-        include_fallback=not bool(review.get("autoReviewable")),
-    )
-    if code not in candidate_codes:
-        available = ", ".join(sorted(candidate_codes)[:8])
-        chain = "权威读音候选链" if review.get("autoReviewable") else "读音候选链"
-        issue = f"「{word}」编码 {code} 不在{chain}中，可选：{available or '无'}"
-        outcome.issues.append(issue)
-        outcome.sealed_issues.append(issue)
-        return outcome
+    if phrase_type not in NO_PRONUNCIATION_CHAIN_TYPES:
+        candidate_codes = _candidate_codes_from_review(
+            review, include_fallback=not bool(review.get("autoReviewable")),
+        )
+        if code not in candidate_codes:
+            available = ", ".join(sorted(candidate_codes)[:8])
+            chain = "权威读音候选链" if review.get("autoReviewable") else "读音候选链"
+            issue = f"「{word}」编码 {code} 不在{chain}中，可选：{available or '无'}"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
+            return outcome
     if not review.get("autoReviewable"):
         if phrase_type == "Single" and review.get("type") == "Single":
             reason = str(review.get("manualReviewReason") or review.get("autoReviewReason") or "单字字形收录需复核").strip()

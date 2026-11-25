@@ -9,9 +9,11 @@ import unicodedata
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from datetime import datetime, timezone
+from functools import lru_cache
 from itertools import islice
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, List, Dict, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, List, Dict, Tuple
 
 from nonebot import on_message, on_command, get_driver
 from nonebot.adapters import Bot, Event
@@ -63,6 +65,9 @@ from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.conversational_reply import enforce_conversational_reply
 from ..utils.draft_mutation_store import (
     get_default_draft_mutation_claim_store,
+)
+from ..utils.draft_reminder import (
+    DraftReminderStore, draft_snapshot_is_current, reminder_confirmation_is_current, reminder_group_cutoff,
 )
 from ..utils.completed_draft_undo import (
     _operation_rows,
@@ -918,6 +923,8 @@ async def should_handle(bot: Bot, event: Event) -> bool:
             if isinstance(event, PrivateMessageEvent):
                 return True
             if isinstance(event, GroupMessageEvent):
+                if _route_draft_reminder(bot, event):
+                    return True
                 reply_to_message = getattr(event, 'reply_to_message', None)
                 if reply_to_message:
                     bot_info = await bot.get_me()
@@ -950,6 +957,8 @@ async def should_handle(bot: Bot, event: Event) -> bool:
             if isinstance(event, QQPrivateMessageEvent):
                 return True
             if isinstance(event, QQGroupMessageEvent):
+                if _route_draft_reminder(bot, event):
+                    return True
                 if os.getenv("KEYTAO_WORD_DISCOVERY") == "1":
                     import sys
                     from ..harness.word_discovery import discovery_reply_route
@@ -3500,6 +3509,8 @@ async def _start_retention_cleanup() -> None:
 
 
 STATE_METRICS_INTERVAL_SECONDS = 60 * 60
+DRAFT_REMINDER_SCAN_SECONDS = 5 * 60
+DRAFT_REMINDER_REPLY_COMMANDS = {"确认", "提交", "清空草稿"}
 _STATE_METRICS_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
 
@@ -3520,16 +3531,20 @@ def _log_state_metrics_once() -> str:
 
 
 async def _state_metrics_loop() -> None:
+    loop = asyncio.get_running_loop()
+    next_metrics = loop.time() + STATE_METRICS_INTERVAL_SECONDS
     while True:
-        await asyncio.sleep(STATE_METRICS_INTERVAL_SECONDS)
-        try:
-            await asyncio.to_thread(_log_state_metrics_once)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.warning(
-                f"[state_metrics_error] collection_failed error={type(error).__name__}"
-            )
+        await asyncio.sleep(DRAFT_REMINDER_SCAN_SECONDS)
+        if loop.time() >= next_metrics:
+            next_metrics += STATE_METRICS_INTERVAL_SECONDS
+            try:
+                await asyncio.to_thread(_log_state_metrics_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    f"[state_metrics_error] collection_failed error={type(error).__name__}"
+                )
         try:
             await _scan_draft_reminders_once()
         except asyncio.CancelledError:
@@ -3538,19 +3553,93 @@ async def _state_metrics_loop() -> None:
             logger.warning(f"[draft_reminder_error] scan_failed error={type(error).__name__}")
 
 
-def _draft_reminder_store():
-    from ..utils.draft_reminder import DraftReminderStore
+@lru_cache(maxsize=1)
+def _draft_reminder_store() -> DraftReminderStore:
     return DraftReminderStore(get_default_draft_mutation_claim_store().db_path)
+
+
+async def _list_web_reminder_candidates(
+    idle_minutes: int, modified_after: float, exclude_ids: list[str], now: float,
+) -> AsyncIterator[tuple[list[Dict], Optional[float]]]:
+    from ..utils import http_client
+
+    page_size, max_pages = 100, 5
+    params = {"idleMinutes": idle_minutes, "limit": page_size,
+              "modifiedAfter": datetime.fromtimestamp(modified_after, timezone.utc).isoformat()}
+    if exclude_ids:
+        params["excludeIds"] = ",".join(exclude_ids)
+    groups = {}
+    group_after = reminder_group_cutoff(now)
+    for page in range(max_pages):
+        try:
+            payload = await http_client.keytao_json(
+                "GET", "/api/bot/drafts/idle", params=params, timeout=5.0, retries=1,
+            )
+        except http_client.KeytaoApiError as error:
+            logger.warning(f"[draft_reminder_error] web_list_failed error={type(error).__name__}")
+            return
+        rows = payload.get("drafts") if isinstance(payload, dict) and payload.get("success") is True else None
+        if not isinstance(rows, list):
+            logger.warning("[draft_reminder_error] web_list_malformed")
+            return
+        candidates = []
+        invalid_rows = False
+        next_after = None
+        for index, row in enumerate(rows[:page_size]):
+            if not isinstance(row, dict):
+                invalid_rows = True
+                continue
+            modified_at = str(row.get("lastModifiedAt"))
+            try:
+                modified = datetime.fromisoformat(modified_at)
+            except ValueError:
+                invalid_rows = True
+                continue
+            if modified.tzinfo is None:
+                invalid_rows = True
+                continue
+            last_write = modified.timestamp()
+            if index == page_size - 1 and page + 1 < max_pages and last_write > modified_after:
+                next_after = last_write
+                next_cursor = modified_at
+            batch_id = row.get("batchId")
+            actor = str(row.get("creatorQqId") or "")
+            version, count = row.get("contentVersion"), row.get("itemCount")
+            if (
+                not isinstance(batch_id, str) or not batch_id
+                or not actor.isascii() or not actor.isdecimal()
+                or type(version) is not int or version < 0
+                or type(count) is not int or count <= 0
+            ):
+                invalid_rows = True
+                continue
+            if last_write < modified_after:
+                continue
+            if actor not in groups:
+                groups[actor] = history_store.latest_group_for_actor("qq", actor, after=group_after, now=now)
+            if groups[actor]:
+                candidates.append({
+                    "platform": "qq", "actor": actor, "creator_qq_id": actor, "group_id": groups[actor],
+                    "batch_id": batch_id, "content_version": version, "item_count": count,
+                    "last_write": last_write, "batch_url": row.get("batchUrl") or "",
+                })
+        if invalid_rows:
+            logger.warning("[draft_reminder_error] web_list_malformed_rows")
+        yield candidates, next_after
+        if next_after is None:
+            return
+        modified_after = next_after
+        params = {**params, "modifiedAfter": next_cursor}
 
 
 async def _read_reminder_draft(candidate: Dict) -> Dict:
     tool = skills_manager.get_tool_function("keytao_list_draft_items")
     if tool is None:
         return {}
-    # The per-user latest selector only returns Draft; an explicit batch ID
-    # would also permit Rejected batches, so deliberately omit it.
-    draft = await tool(platform=candidate["platform"], platform_id=candidate["actor"])
-    return {"status": "Draft", **draft} if isinstance(draft, dict) else {}
+    draft = await tool(
+        platform=candidate["platform"], platform_id=candidate["actor"], batch_id=candidate["batch_id"],
+    )
+    return draft if isinstance(draft, dict) else {}
 
 
 async def _send_draft_reminder(candidate: Dict, text: str) -> str:
@@ -3583,7 +3672,55 @@ async def _send_draft_reminder(candidate: Dict, text: str) -> str:
 async def _scan_draft_reminders_once() -> int:
     if os.getenv("KEYTAO_DRAFT_REMINDER") != "1":
         return 0
-    return await _draft_reminder_store().scan(_read_reminder_draft, _send_draft_reminder)
+    return await _draft_reminder_store().scan(
+        _read_reminder_draft, _send_draft_reminder, list_web_candidates=_list_web_reminder_candidates,
+        find_user=_user_resolver.find_user_by_platform,
+    )
+
+
+def _reminder_reply_id(platform: str, event: Event) -> Optional[str]:
+    if platform == "qq":
+        return extract_onebot_reply_id(event)
+    message_id = getattr(getattr(event, "reply_to_message", None), "message_id", None)
+    return str(message_id) if message_id is not None else None
+
+
+def _plain_reminder_message(platform: str, event: Event) -> bool:
+    message = getattr(event, "original_message", None) or getattr(event, "message", None) or ()
+    return not _reminder_reply_id(platform, event) and all(
+        getattr(segment, "type", None) == "text" for segment in message
+    )
+
+
+def _reminder_message_in_window(event: Event, receipt: Dict) -> bool:
+    timestamp = getattr(event, "time", None) or getattr(event, "date", None)
+    if isinstance(timestamp, datetime):
+        timestamp = timestamp.timestamp()
+    return reminder_confirmation_is_current(receipt, timestamp)
+
+
+def _route_draft_reminder(bot: Bot, event: Event) -> bool:
+    if os.getenv("KEYTAO_DRAFT_REMINDER") != "1":
+        return False
+    address = get_conversation_key(bot, event)
+    text = event.get_plaintext().strip().rstrip("。.!！ ")
+    if not text or address.space_type != "group":
+        return False
+    message_id = _reminder_reply_id(address.platform, event)
+    if message_id:
+        return text in DRAFT_REMINDER_REPLY_COMMANDS and _draft_reminder_store().resolve_receipt(
+            address.platform, address.space_id, message_id,
+        ) is not None
+    if not _plain_reminder_message(address.platform, event):
+        return False
+    store = _draft_reminder_store()
+    receipt = store.pending_plain_reply(address.platform, address.space_id, address.actor_id)
+    if receipt is None or not _reminder_message_in_window(event, receipt):
+        return False
+    if text == "确认":
+        return True
+    store.update_confirmation(receipt, confirm=False)
+    return False
 
 
 async def _start_state_metrics() -> None:
@@ -4061,22 +4198,76 @@ async def _stage_draft_reminder_reply(ctx: TurnContext) -> bool:
         return False
     command = ctx.normalized_message_text.strip().rstrip("。.!！ ")
     memory = ctx.memory_context
-    if (command not in {"提交", "清空草稿"} or memory is None
-            or memory.space_type != "group" or not ctx.reply_reference.is_reply):
+    if command not in DRAFT_REMINDER_REPLY_COMMANDS or memory is None or memory.space_type != "group":
         return False
-    if ctx.platform == "qq":
-        message_id = extract_onebot_reply_id(ctx.event)
-    elif ctx.platform == "telegram":
-        message_id = getattr(getattr(ctx.event, "reply_to_message", None), "message_id", None)
+    quoted = ctx.reply_reference.is_reply
+    if not quoted and (
+        command != "确认" or ctx.message_text.strip().rstrip("。.!！ ") != "确认"
+        or not _plain_reminder_message(ctx.platform, ctx.event)
+    ):
+        return False
+    store = _draft_reminder_store()
+    if quoted:
+        receipt = store.resolve_receipt(ctx.platform, memory.space_id, _reminder_reply_id(ctx.platform, ctx.event) or "")
     else:
-        return False
-    receipt = _draft_reminder_store().resolve_receipt(ctx.platform, memory.space_id, str(message_id or ""))
+        receipt = store.pending_plain_reply(ctx.platform, memory.space_id, ctx.user_id)
     if receipt is None:
         return False
+    rejection = None
+    if quoted and command == "确认" and receipt["actor"] != ctx.user_id:
+        rejection = "这条提醒只能由草稿作者确认"
+    elif command == "确认" and not _reminder_message_in_window(ctx.event, receipt):
+        if not quoted:
+            return False
+        rejection = "提醒已过期，请回复「提交」"
+    if rejection is not None:
+        ctx.response = rejection
+        await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, memory, rejection, ctx.QQMessageSegment)
+        return True
+    active = draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id))
+    if command == "确认":
+        if receipt["status"] == "sent":
+            return True
+        if not quoted:
+            # Native replies name their target. A bare confirmation belongs to
+            # the newest active prompt in this actor's group conversation.
+            pending = conversation_state_store.get_record(ctx.conv_key)
+            newer_ticket = (
+                pending is not None and isinstance(pending.state, (PendingAddWord, PendingToolConfirm))
+                and pending.created_at >= receipt["result_at"]
+            )
+            newer_operation = (
+                active is not None and active.status == "awaiting_confirmation" and active.owner_key == ctx.conv_key
+                and time.time() - (time.monotonic() - active.updated_at) >= receipt["result_at"]
+            )
+            if newer_ticket or newer_operation:
+                store.update_confirmation(receipt, confirm=False)
+                return False
+        if active is None or active.status == "awaiting_confirmation":
+            if not store.update_confirmation(receipt, quoted=quoted, confirm=True):
+                return True
+            ctx.response = await _submit_reminded_draft(ctx, receipt)
+        else:
+            if not quoted:
+                store.update_confirmation(receipt, confirm=False)
+            ctx.response = _active_operation_message_for_request(active, ctx.platform, ctx.user_id)
+        remember_conversation(ctx.conv_key, memory, ctx.message_text, ctx.response)
+        await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, memory, ctx.response, ctx.QQMessageSegment)
+        return True
+
     if receipt["actor"] != ctx.user_id:
         ctx.response = "这条提议不是发给你的，本次未执行。"
-    elif (active := draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id))) is not None:
+    elif active is not None:
         ctx.response = _active_operation_message_for_request(active, ctx.platform, ctx.user_id)
+    elif receipt.get("status") in {"pending", "reply_only", "confirmed"}:
+        if command == "提交":
+            ctx.response = await _submit_reminded_draft(ctx, receipt)
+        else:
+            ctx.response = await _chat_commands._try_handle_draft_clear_command(
+                command, MessageCommandIntent(intent="draft_clear", confidence=1.0),
+                ctx.platform, ctx.user_id, ctx.space_key, ctx.owner_label,
+                reminder_target=(receipt["batch_id"], receipt["content_version"]),
+            )
     else:
         ctx.response = await _try_handle_draft_management_command(
             command, ctx.platform, ctx.user_id, ctx.space_key, ctx.owner_label,
@@ -4086,6 +4277,33 @@ async def _stage_draft_reminder_reply(ctx: TurnContext) -> bool:
         )
     await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, memory, ctx.response, ctx.QQMessageSegment)
     return True
+
+
+async def _submit_reminded_draft(ctx: TurnContext, receipt: Dict) -> str:
+    batch_id = receipt["batch_id"]
+    draft = await _read_reminder_draft(receipt)
+    if not draft_snapshot_is_current(draft, batch_id):
+        return render_remediation_reply("这批草稿已无法提交", command="查看草稿")
+    scope = {
+        "batch_id": batch_id,
+        "authorize_current_draft": True,
+        "reminder_content_version": receipt["content_version"],
+    }
+    result = await _perform_submit_current_draft(
+        ctx.platform, ctx.user_id,
+        auto_confirm=draft["contentVersion"] == receipt["content_version"], **scope,
+    )
+    if (result.data or {}).get("staleConfirmation") is True:
+        result = await _perform_submit_current_draft(ctx.platform, ctx.user_id, **scope)
+    if result.pending_state is not None:
+        stored = conversation_state_store.set(
+            ctx.conv_key, result.pending_state, owner_label=ctx.owner_label,
+        )
+        if not stored:
+            return render_remediation_reply("草稿提交确认暂时无法保存", command="查看草稿")
+        if (result.data or {}).get("contentVersion") != receipt["content_version"]:
+            return "草稿内容已变化，请重新确认。\n" + result.text
+    return result.text
 
 
 async def _stage_community_vote(ctx: TurnContext) -> bool:

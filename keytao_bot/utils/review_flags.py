@@ -49,6 +49,7 @@ REVIEW_VERDICT_SITE_POLICIES = {
     "invalid_code": ReviewDisposition.BLOCK,
     "injection_shaped_input": ReviewDisposition.BLOCK,
     "missing_authoritative_page": ReviewDisposition.SEAL,
+    "polyphone_web_agreement_unverified": ReviewDisposition.SEAL,
     "pronunciation_lookup_incomplete": ReviewDisposition.SEAL,
     "entity_context_reading": ReviewDisposition.SEAL,
     "requested_encode_group": ReviewDisposition.SEAL,

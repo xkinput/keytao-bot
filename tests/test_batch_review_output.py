@@ -220,6 +220,45 @@ class BatchReviewOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("词典收录 2", item["reviewRecord"]["commonness"]["authority"])
         self.assertEqual(["日常词", "冷词"], item["suggestedOrder"]["orderedWords"])
 
+    async def test_target_filter_keeps_the_full_audit_and_move_pair_context(self):
+        items = [
+            {"id": 1, "action": "Delete", "word": "日常词", "code": "abcd"},
+            {"id": 2, "action": "Create", "word": "日常词", "code": "abcdi"},
+            {"id": 3, "action": "Create", "word": "学习", "code": "xxab"},
+        ]
+        audit = AsyncMock(return_value={"sealedItemIds": [3], "sealedItemReasons": {3: "审查封存"}})
+        with patch.object(batch_review, "_prepare_deterministic_audit", audit):
+            result = await batch_review.review_keytao_batch_with_llm(
+                {"pullRequests": items}, items_only=True, target_pr_ids=[1, 3, 3, 99],
+            )
+        self.assertEqual([1, 2, 3], [item["id"] for item in audit.await_args.args[0]])
+        self.assertEqual([[1]], [[item["id"] for item in payload["pullRequests"]] for payload in self.payloads])
+        self.assertEqual(
+            [(1, "pass"), (3, "manual_review")],
+            [(item["prId"], item["status"]) for item in result["aiReview"]["items"]],
+        )
+
+    async def test_target_filter_applies_to_empty_requests_and_llm_fallback(self):
+        items = [
+            {"id": 1, "word": "日常词", "code": "abcd"},
+            {"id": 2, "word": "学习", "code": "xxab"},
+        ]
+        with (
+            patch.object(batch_review, "_prepare_deterministic_audit", return_value={}) as audit,
+            patch.object(batch_review, "_call_llm_chunked", side_effect=RuntimeError("fake outage")) as llm,
+        ):
+            empty = await batch_review.review_keytao_batch_with_llm(
+                {"pullRequests": items}, items_only=True, target_pr_ids=[],
+            )
+            self.assertEqual([], empty["aiReview"]["items"])
+            audit.assert_awaited_once()
+            llm.assert_not_awaited()
+            fallback = await batch_review.review_keytao_batch_with_llm(
+                {"pullRequests": items}, items_only=True, target_pr_ids=[2],
+            )
+        self.assertEqual([2], [item["prId"] for item in fallback["aiReview"]["items"]])
+        self.assertEqual("attention", fallback["aiReview"]["items"][0]["status"])
+
     async def test_enrichment_errors_preserve_normal_and_fallback_items(self):
         after = [chain_entry("冷词", 1), chain_entry("日常词", 2)]
         query_reference = batch_review._query_commonness_reference

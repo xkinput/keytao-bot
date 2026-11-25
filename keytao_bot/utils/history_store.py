@@ -230,6 +230,11 @@ class HistoryStore:
                 ON conversations(platform, space_type, space_id, user_id, id DESC)
             """)
             cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_history_recent_group_actor
+                ON conversations(platform, user_id, id DESC)
+                WHERE space_type = 'group' AND role = 'user'
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS history_conversation_state (
                     platform TEXT NOT NULL,
                     space_type TEXT NOT NULL,
@@ -320,6 +325,16 @@ class HistoryStore:
             
             logger.debug(f"Retrieved {len(messages)} history messages for {address}")
             return messages
+
+    def latest_group_for_actor(self, platform: str, actor: str, *, after: float, now: float) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT space_id, CAST(strftime('%s', timestamp) AS INTEGER) AS spoken_at "
+                "FROM conversations WHERE platform=? AND user_id=? AND space_type='group' AND role='user' "
+                "AND spoken_at BETWEEN ? AND ? ORDER BY spoken_at DESC, id DESC LIMIT 1",
+                (platform, actor, after, now),
+            ).fetchone()
+        return str(row[0]) if row else ""
 
     def get_space_history(
         self,

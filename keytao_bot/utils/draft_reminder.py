@@ -1,4 +1,4 @@
-"""Durable, bounded reminders backed by the bot's completed draft writes."""
+"""Durable reminders for idle KeyTao drafts."""
 
 import json
 import math
@@ -14,6 +14,51 @@ from zoneinfo import ZoneInfo
 
 DAY_SECONDS = 24 * 60 * 60
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+CONFIRMATION_SECONDS = 2 * 60 * 60
+READ_RETRY_SECONDS = 60 * 60
+RECEIPT_COLUMNS = "platform,actor,batch_id,group_id,content_version,status,result_at"
+
+
+def reminder_idle_minutes() -> int:
+    try:
+        return max(5, int(os.getenv("KEYTAO_DRAFT_REMINDER_IDLE_MINUTES", "20")))
+    except ValueError:
+        return 20
+
+
+def _age_cutoff(now: float, setting: str, default_days: int) -> float:
+    try:
+        days = max(0, int(os.getenv(setting, str(default_days))))
+    except ValueError:
+        days = default_days
+    return now - days * DAY_SECONDS
+
+
+def reminder_group_cutoff(now: float) -> float:
+    return _age_cutoff(now, "KEYTAO_DRAFT_REMINDER_GROUP_MAX_AGE_DAYS", 30)
+
+
+def reminder_confirmation_is_current(receipt: Dict, timestamp: object) -> bool:
+    delivered_at = receipt.get("result_at")
+    if type(delivered_at) not in (int, float) or type(timestamp) not in (int, float):
+        return False
+    expires_at = delivered_at + CONFIRMATION_SECONDS
+    return int(delivered_at) <= timestamp < expires_at and time.time() < expires_at
+
+
+def _day_start(now: float) -> float:
+    return datetime.fromtimestamp(now, SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def draft_snapshot_is_current(draft: Dict, batch_id: str) -> bool:
+    items = draft.get("items")
+    return (
+        draft.get("success") is True and draft.get("batchId") == batch_id
+        and draft.get("status", draft.get("batchStatus")) == "Draft"
+        and type(draft.get("contentVersion")) is int and draft["contentVersion"] >= 0
+        and isinstance(items, list) and bool(items) and all(isinstance(row, dict) for row in items)
+        and draft.get("count", len(items)) == len(items) and not draft.get("itemsTruncationNotice")
+    )
 
 
 def initialize_reminder_schema(connection: sqlite3.Connection) -> None:
@@ -47,6 +92,22 @@ def initialize_reminder_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS draft_reminder_receipt "
         "ON draft_reminder_attempt(platform, group_id, message_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS draft_reminder_actor_due "
+        "ON draft_reminder_attempt(platform, actor, intended_at)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS draft_reminder_rollout ("
+        "id INTEGER PRIMARY KEY CHECK (id=1), started_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS draft_reminder_read_retry ("
+        "batch_id TEXT PRIMARY KEY, retry_after REAL NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS draft_reminder_account_day ("
+        "account_id TEXT NOT NULL, day_start REAL NOT NULL, PRIMARY KEY (day_start, account_id))"
     )
 
 
@@ -120,8 +181,25 @@ class DraftReminderStore:
         with self._connect() as connection:
             record_draft_write(connection, scope, platform, actor, payload)
 
-    def _bootstrap_existing_writes(self) -> None:
-        """Import at most twenty pre-feature journal records per hourly scan."""
+    def _rollout_time(self, now: float) -> float:
+        with self._connect() as connection:
+            row = connection.execute("SELECT started_at FROM draft_reminder_rollout WHERE id=1").fetchone()
+            if row is None:
+                connection.execute("INSERT OR IGNORE INTO draft_reminder_rollout VALUES (1,?)", (now,))
+                row = connection.execute("SELECT started_at FROM draft_reminder_rollout WHERE id=1").fetchone()
+            return row["started_at"]
+
+    def _prepare_scan_history(self, now: float) -> list[str]:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM draft_reminder_read_retry WHERE retry_after<=?", (now,))
+            connection.execute("DELETE FROM draft_reminder_account_day WHERE day_start<?", (_day_start(now),))
+            return [row["batch_id"] for row in connection.execute(
+                "SELECT batch_id FROM draft_reminder_attempt GROUP BY batch_id "
+                "ORDER BY MAX(intended_at) DESC, batch_id DESC LIMIT 200"
+            )]
+
+    def _bootstrap_existing_writes(self, modified_after: float) -> None:
+        """Import at most twenty pre-feature journal records per scan."""
         with self._connect() as connection:
             if connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='completed_draft_operation'"
@@ -131,52 +209,62 @@ class DraftReminderStore:
                 "SELECT c.scope,c.platform,c.actor,c.payload_json FROM completed_draft_operation c "
                 "JOIN draft_operation_actor_write w ON w.platform=c.platform AND w.actor=c.actor "
                 "AND w.operation_id=c.operation_id "
-                "WHERE json_valid(c.payload_json) AND NOT EXISTS ("
+                "WHERE json_valid(c.payload_json) AND json_extract(c.payload_json,'$.completedAt')>=? "
+                "AND NOT EXISTS ("
                 "SELECT 1 FROM draft_reminder_batch b WHERE b.batch_id=json_extract(c.payload_json,'$.batchId') "
-                "AND b.last_write>=json_extract(c.payload_json,'$.completedAt')) LIMIT 20"
+                "AND b.last_write>=json_extract(c.payload_json,'$.completedAt')) LIMIT 20",
+                (modified_after,),
             ).fetchall()
             for row in rows:
                 record_draft_write(connection, row["scope"], row["platform"], row["actor"], json.loads(row["payload_json"]))
 
-    def _candidates(self, now: float) -> list:
+    def _candidates(self, now: float, idle_minutes: int, modified_after: float, web_candidates: list[Dict]) -> list[Dict]:
+        idle_before = now - idle_minutes * 60
+        group_after = reminder_group_cutoff(now)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT b.* FROM draft_reminder_batch b WHERE b.active=1 AND b.last_write<=? "
+                "SELECT b.* FROM draft_reminder_batch b WHERE b.active=1 AND b.last_write BETWEEN ? AND ? "
+                "AND b.last_checked<=? "
                 "AND NOT EXISTS (SELECT 1 FROM draft_reminder_attempt a WHERE a.batch_id=b.batch_id "
-                "AND a.content_version=b.content_version) "
-                "AND (SELECT COUNT(*) FROM draft_reminder_attempt a WHERE a.batch_id=b.batch_id)<3 "
-                "AND NOT EXISTS (SELECT 1 FROM draft_reminder_attempt a WHERE a.batch_id=b.batch_id "
-                "AND a.intended_at>?) "
-                "ORDER BY b.last_checked,b.last_write,b.batch_id LIMIT 20",
-                (now - DAY_SECONDS, now - DAY_SECONDS),
+                "OR (a.platform=b.platform AND a.actor=b.actor AND a.intended_at>=?))",
+                (max(modified_after, group_after), idle_before, now - READ_RETRY_SECONDS, _day_start(now)),
             ).fetchall()
-        return [dict(row) for row in rows]
+            candidates = {row["batch_id"]: {**row, "bot_write": dict(row)} for row in rows}
+            for web in web_candidates:
+                batch_id = web["batch_id"]
+                local = connection.execute(
+                    "SELECT * FROM draft_reminder_batch WHERE batch_id=?", (batch_id,),
+                ).fetchone()
+                if local is not None:
+                    if not local["active"] or local["last_write"] >= web["last_write"]:
+                        continue
+                    if local["last_write"] >= group_after:
+                        web = {**web, **{key: local[key] for key in ("platform", "actor", "group_id")}}
+                if modified_after <= web["last_write"] <= idle_before:
+                    candidates[batch_id] = {**web, "bot_write": dict(local) if local else None}
+        return sorted(candidates.values(), key=lambda row: (row["last_write"], row["batch_id"]))
 
-    def _claim(self, candidate: Dict, now: float) -> bool:
+    @staticmethod
+    def _attempted(connection: sqlite3.Connection, candidate: Dict, now: float) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM draft_reminder_attempt WHERE batch_id=? "
+            "OR (platform=? AND actor=? AND intended_at>=?) LIMIT 1",
+            (candidate["batch_id"], candidate["platform"], candidate["actor"], _day_start(now)),
+        ).fetchone() is not None
+
+    def _claim(self, candidate: Dict, now: float, account_id: str) -> bool:
         key = (candidate["platform"], candidate["actor"], candidate["batch_id"])
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT platform,actor,content_version,last_write,group_id,active FROM draft_reminder_batch "
-                "WHERE batch_id=?", (candidate["batch_id"],),
+                "SELECT * FROM draft_reminder_batch WHERE batch_id=?", (candidate["batch_id"],),
             ).fetchone()
-            if (
-                current is None or not current["active"]
-                or current["platform"] != candidate["platform"] or current["actor"] != candidate["actor"]
-                or current["content_version"] != candidate["content_version"]
-                or current["last_write"] != candidate["last_write"]
-                or current["group_id"] != candidate["group_id"]
-            ):
+            if (dict(current) if current else None) != candidate["bot_write"] or self._attempted(connection, candidate, now):
                 return False
-            attempts = connection.execute(
-                "SELECT content_version,intended_at FROM draft_reminder_attempt "
-                "WHERE batch_id=?", (candidate["batch_id"],),
-            ).fetchall()
-            if (
-                len(attempts) >= 3
-                or any(row["content_version"] == candidate["content_version"] for row in attempts)
-                or any(now - row["intended_at"] < DAY_SECONDS for row in attempts)
-            ):
+            if account_id and not connection.execute(
+                "INSERT OR IGNORE INTO draft_reminder_account_day VALUES (?,?)",
+                (account_id, _day_start(now)),
+            ).rowcount:
                 return False
             connection.execute(
                 "INSERT INTO draft_reminder_attempt "
@@ -191,71 +279,125 @@ class DraftReminderStore:
             return None
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT a.platform,a.actor,a.batch_id,a.group_id,a.content_version "
-                "FROM draft_reminder_attempt a WHERE a.platform=? AND a.group_id=? "
-                "AND a.message_id=? AND a.status='sent'",
+                f"SELECT {RECEIPT_COLUMNS} FROM draft_reminder_attempt WHERE platform=? AND group_id=? "
+                "AND message_id=? AND status IN ('sent','pending','reply_only','confirmed')",
                 (platform, group_id, str(message_id)),
             ).fetchone()
         return dict(row) if row else None
 
+    def pending_plain_reply(
+        self, platform: str, group_id: str, actor: str, *, now: Optional[float] = None,
+    ) -> Optional[Dict]:
+        now = time.time() if now is None else now
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT {RECEIPT_COLUMNS} FROM draft_reminder_attempt "
+                "WHERE platform=? AND group_id=? AND actor=? AND status='pending' "
+                "AND result_at>? AND result_at<=? ORDER BY result_at DESC LIMIT 1",
+                (platform, group_id, actor, now - CONFIRMATION_SECONDS, now),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_confirmation(self, receipt: Dict, *, quoted: bool = False, confirm: bool) -> bool:
+        status = "confirmed" if confirm else "reply_only"
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE draft_reminder_attempt SET status=? "
+                "WHERE platform=? AND group_id=? AND actor=? AND batch_id=? AND content_version=? "
+                "AND (status='pending' OR (? AND status='reply_only')) AND result_at>?",
+                (status, receipt["platform"], receipt["group_id"], receipt["actor"], receipt["batch_id"],
+                 receipt["content_version"], quoted, time.time() - CONFIRMATION_SECONDS),
+            )
+            return updated.rowcount == 1
+
     async def scan(
-        self, read_draft: Callable, send_reminder: Callable, *, now: Optional[float] = None,
+        self, read_draft: Callable, send_reminder: Callable, *,
+        list_web_candidates: Optional[Callable] = None, find_user: Optional[Callable] = None,
+        now: Optional[float] = None,
     ) -> int:
         if os.environ.get("KEYTAO_DRAFT_REMINDER") != "1":
             return 0
         fixed_now = now
         now = time.time() if fixed_now is None else fixed_now
+        rollout = self._rollout_time(now)
         if not 8 <= datetime.fromtimestamp(now, SHANGHAI).hour < 23:
             return 0
-        self._bootstrap_existing_writes()
+        modified_after = max(rollout, _age_cutoff(now, "KEYTAO_DRAFT_REMINDER_MAX_AGE_DAYS", 7))
+        self._bootstrap_existing_writes(modified_after)
+        idle_minutes = reminder_idle_minutes()
+        exclude_ids = self._prepare_scan_history(now)
+        pages = list_web_candidates(idle_minutes, modified_after, exclude_ids, now) if list_web_candidates else None
+        web_candidates, page_end = await anext(pages, ([], None)) if pages is not None else ([], None)
+        accounts = {}
         sent = 0
-        for candidate in self._candidates(now):
-            key = (candidate["platform"], candidate["actor"], candidate["batch_id"])
-            with self._connect() as connection:
-                connection.execute(
-                    "UPDATE draft_reminder_batch SET last_checked=? WHERE batch_id=?",
-                    (now, candidate["batch_id"]),
-                )
-            try:
-                draft = await read_draft(candidate)
-            except Exception:
-                continue
-            if not isinstance(draft, dict):
-                continue
-            items = draft.get("items")
-            if (
-                draft.get("success") is not True or draft.get("batchId") != candidate["batch_id"]
-                or draft.get("status", draft.get("batchStatus")) != "Draft"
-                or type(draft.get("contentVersion")) is not int
-                or draft["contentVersion"] != candidate["content_version"]
-                or not isinstance(items, list) or not items or any(not isinstance(row, dict) for row in items)
-                or draft.get("count", len(items)) != len(items) or draft.get("itemsTruncationNotice")
-            ):
-                continue
-            url = str(draft.get("batchUrl") or candidate["batch_url"])
-            intended_at = time.time() if fixed_now is None else fixed_now
-            if (
-                not 8 <= datetime.fromtimestamp(intended_at, SHANGHAI).hour < 23
-                or not url or not self._claim(candidate, intended_at)
-            ):
-                continue
-            modified = datetime.fromtimestamp(candidate["last_write"], SHANGHAI).strftime("%Y-%m-%d %H:%M")
-            text = (
-                f"你的草稿还没有提交（{len(items)} 条，最后修改于 {modified}）。\n"
-                f"草稿地址：{url}\n回复「提交」提交，或「清空草稿」放弃。"
-            )
-            message_id, status = "", "error"
-            try:
-                message_id = str(await send_reminder(candidate, text) or "")
-                status = "sent" if message_id else "unknown"
-                sent += int(status == "sent")
-            except Exception:
-                pass
-            with self._connect() as connection:
-                connection.execute(
-                    "UPDATE draft_reminder_attempt SET status=?,message_id=?,result_at=? "
-                    "WHERE platform=? AND actor=? AND batch_id=? AND content_version=? AND status='intent'",
-                    (status, message_id, time.time() if fixed_now is None else fixed_now,
-                     *key, candidate["content_version"]),
-                )
+        checked_batches = set()
+        check_limit = 20
+        while True:
+            web_asked = False
+            check_limit += len(web_candidates)
+            for candidate in self._candidates(now, idle_minutes, modified_after, web_candidates):
+                if len(checked_batches) >= check_limit:
+                    break
+                # Leave newer local drafts for the next merge to keep oldest-first ordering.
+                if page_end is not None and candidate["last_write"] > page_end:
+                    break
+                batch_id = candidate["batch_id"]
+                if batch_id in checked_batches:
+                    continue
+                with self._connect() as connection:
+                    if self._attempted(connection, candidate, now):
+                        continue
+                    if connection.execute(
+                        "SELECT 1 FROM draft_reminder_read_retry WHERE batch_id=? AND retry_after>?", (batch_id, now),
+                    ).fetchone():
+                        continue
+                checked_batches.add(batch_id)
+                try:
+                    draft = await read_draft(candidate)
+                except Exception:
+                    draft = {}
+                url = str(draft.get("batchUrl") or candidate["batch_url"]) if isinstance(draft, dict) else ""
+                if (
+                    not url or not draft_snapshot_is_current(draft, batch_id)
+                    or draft["contentVersion"] != candidate["content_version"]
+                    or len(draft["items"]) != candidate.get("item_count", len(draft["items"]))
+                ):
+                    checked_at = time.time() if fixed_now is None else fixed_now
+                    with self._connect() as connection:
+                        connection.execute(
+                            "INSERT INTO draft_reminder_read_retry VALUES (?,?) ON CONFLICT(batch_id) DO UPDATE SET "
+                            "retry_after=MAX(retry_after, excluded.retry_after)", (batch_id, checked_at + READ_RETRY_SECONDS),
+                        )
+                    continue
+                key = (candidate["platform"], candidate["actor"], batch_id)
+                identity = ("qq", candidate["creator_qq_id"]) if candidate.get("creator_qq_id") else key[:2]
+                if find_user is not None and identity not in accounts:
+                    user = await find_user(*identity)
+                    account_id = user.get("id") if isinstance(user, dict) else None
+                    accounts[identity] = str(account_id).strip() if type(account_id) in (int, str) else ""
+                intended_at = time.time() if fixed_now is None else fixed_now
+                if (
+                    not 8 <= datetime.fromtimestamp(intended_at, SHANGHAI).hour < 23
+                    or not self._claim(candidate, intended_at, accounts.get(identity, ""))
+                ):
+                    continue
+                web_asked = web_asked or "creator_qq_id" in candidate
+                text = f"你有草稿未提交（{len(draft['items'])} 条），是否帮你提交？提交请回复「确认」\n{url}"
+                message_id, status = "", "error"
+                try:
+                    message_id = str(await send_reminder(candidate, text) or "")
+                    status = "pending" if message_id else "unknown"
+                    sent += int(status == "pending")
+                except Exception:
+                    pass
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE draft_reminder_attempt SET status=?,message_id=?,result_at=? "
+                        "WHERE platform=? AND actor=? AND batch_id=? AND content_version=? AND status='intent'",
+                        (status, message_id, time.time() if fixed_now is None else fixed_now,
+                         *key, candidate["content_version"]),
+                    )
+            if page_end is None:
+                break
+            web_candidates, page_end = await anext(pages, ([], None)) if not web_asked else ([], None)
         return sent

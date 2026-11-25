@@ -21,6 +21,7 @@ from .bcc_reference import bcc_daily_value, bcc_deciding_channels
 from .http_client import KeytaoApiError
 from .keytao_review import (
     LOOKUP_FAILURE_REASON,
+    NO_PRONUNCIATION_CHAIN_TYPES,
     ReviewHttpConfig,
     _pronunciation_lookup_incomplete_reason,
     _query_commonness_reference,
@@ -547,6 +548,8 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
         if phrase_type in {"CSS", "CSSSingle"}:
             approved_items.append(f"{action}：{word}@{code} 是声笔笔短码表条目，交由 LLM 按 CSS 优先级复审")
             continue
+        if phrase_type in NO_PRONUNCIATION_CHAIN_TYPES:
+            continue
         if _audit_pronunciation_for_item_code(review, code):
             context_corrected = any(
                 isinstance(pronunciation, dict)
@@ -738,10 +741,12 @@ def _item_seal_reasons(items: Sequence[ReviewItem], audit: Dict[str, Any]) -> Di
                     reason = issue
                     break
         word_review = _reviewed_word_entry(audit, word, _string(item.get("type")) or "Phrase") or {}
+        if word_review.get("reviewVerdictSite") == "polyphone_web_agreement_unverified":
+            reason = reason or manual_review_reason(word_review)
         pronunciation_lookup_reason = _pronunciation_lookup_incomplete_reason(word_review)
         if (
             item.get("action") != "Delete"
-            and not _is_css_item(item)
+            and (_string(item.get("type")) or "Phrase") not in NO_PRONUNCIATION_CHAIN_TYPES
             and code
             and word_review.get("pronunciations")
             and not pronunciation_lookup_reason
@@ -904,6 +909,7 @@ def _fallback_review_from_llm_error(
     *,
     items_only: bool = False,
     suggested_orders: Optional[Dict[int, Dict[str, Any]]] = None,
+    target_pr_ids: Optional[set[int]] = None,
 ) -> Dict[str, Any]:
     move_pairs = _move_pairs(items)
     audit_summary = _string(audit.get("summary"))
@@ -911,6 +917,8 @@ def _fallback_review_from_llm_error(
     raw_items: List[Dict[str, Any]] = []
 
     for pr in items:
+        if target_pr_ids is not None and pr["id"] not in target_pr_ids:
+            continue
         word = _string(pr.get("word"))
         code = _string(pr.get("code")).lower()
         action = _string(pr.get("action") or "Create") or "Create"
@@ -950,6 +958,7 @@ def _fallback_review_from_llm_error(
         return _normalize_llm_review(
             {"items": raw_items}, items, local_review, audit,
             items_only=True, suggested_orders=suggested_orders,
+            target_pr_ids=target_pr_ids,
         )
 
     return _normalize_llm_review({
@@ -967,7 +976,7 @@ def _fallback_review_from_llm_error(
         ],
         "items": raw_items,
         "codeChainRecommendations": [],
-    }, items, local_review, audit)
+    }, items, local_review, audit, target_pr_ids=target_pr_ids)
 
 
 def _normalize_llm_review(
@@ -978,6 +987,7 @@ def _normalize_llm_review(
     *,
     items_only: bool = False,
     suggested_orders: Optional[Dict[int, Dict[str, Any]]] = None,
+    target_pr_ids: Optional[set[int]] = None,
 ) -> Dict[str, Any]:
     raw_items = raw.get("items") if isinstance(raw.get("items"), list) else []
     raw_by_id: Dict[int, Dict[str, Any]] = {}
@@ -1000,6 +1010,8 @@ def _normalize_llm_review(
     normalized_items: List[Dict[str, Any]] = []
     for pr in items:
         pr_id = int(pr["id"])
+        if target_pr_ids is not None and pr_id not in target_pr_ids:
+            continue
         raw_item = raw_by_id.get(pr_id, {})
         seal_reason = seal_reasons.get(pr_id)
         if seal_reason:
@@ -1609,6 +1621,7 @@ async def _call_llm(
         "如果目标编码已经出现在 keytao_encode 候选链中，不得说“无法由读音推出”或“多出某个字母”。"
         "CSS/CSSSingle 是键道声笔笔短码表，fa/fao 等码位不等同普通 Phrase 双拼+形码，"
         "审核 CSS 时应检查短码表、同码链优先级、词频/结构对齐，不得以 zhi/fou 与 f/ao 不对应为理由判错。"
+        "Supplement/Symbol/Link 没有普通读音候选链规则，按相应类型、用途和冲突审查。"
         "常见现代汉语词语、成语、熟语、大众明确知晓的固定表达，或广为人知的实体名/简称/别名，"
         "包括明星艺名、历史人物姓名/字/号/别名、角色名、品牌/产品、作品、地名、组织机构等。"
         "例如“敬德”可指尉迟敬德/尉迟恭字敬德，“杰伦”可指周杰伦。"
@@ -1858,6 +1871,7 @@ async def review_keytao_batch_with_llm(
     precomputed_audit: Optional[Dict[str, Any]] = None,
     *,
     items_only: bool = False,
+    target_pr_ids: Optional[list[int]] = None,
     deadline_ms: Optional[int] = None,
     is_disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> Dict[str, Any]:
@@ -1868,6 +1882,8 @@ async def review_keytao_batch_with_llm(
     if not items:
         return {"success": False, "message": "批次没有可审查条目"}
 
+    target_ids = None if target_pr_ids is None else set(target_pr_ids)
+    targets = items if target_ids is None else [item for item in items if item["id"] in target_ids]
     audit = precomputed_audit
     suggested_orders = None
 
@@ -1877,7 +1893,7 @@ async def review_keytao_batch_with_llm(
             audit = await _prepare_deterministic_audit(items)
         if items_only:
             try:
-                suggested_orders = await _suggested_item_orders(items, local_review, focus_pr_id)
+                suggested_orders = await _suggested_item_orders(targets, local_review, focus_pr_id)
             except Exception as error:
                 logger.warning(f"KeyTao batch review suggested orders failed: {error}")
 
@@ -1889,8 +1905,8 @@ async def review_keytao_batch_with_llm(
         if audit is None:
             audit = _fallback_audit_for_llm(items, warnings[0])
 
-    seal_reasons = _item_seal_reasons(items, audit)
-    llm_items = [item for item in items if item["id"] not in seal_reasons]
+    seal_reasons = _item_seal_reasons(targets, audit)
+    llm_items = [item for item in targets if item["id"] not in seal_reasons]
     raw_review: Dict[str, Any] = {}
     try:
         if llm_items:
@@ -1904,6 +1920,7 @@ async def review_keytao_batch_with_llm(
         ai_review = _fallback_review_from_llm_error(
             items, audit, local_review, str(error),
             items_only=items_only, suggested_orders=suggested_orders,
+            target_pr_ids=target_ids,
         )
         return {
             "success": True,
@@ -1915,6 +1932,7 @@ async def review_keytao_batch_with_llm(
     ai_review = _normalize_llm_review(
         raw_review, items, local_review, audit,
         items_only=items_only, suggested_orders=suggested_orders,
+        target_pr_ids=target_ids,
     )
     result = {
         "success": True,

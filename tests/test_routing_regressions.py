@@ -1,5 +1,6 @@
 """Topic regressions: routing regressions."""
 
+import time
 import unittest as _stage_t_unittest
 from tests.helpers import (
     AgentRequestContext,
@@ -127,7 +128,9 @@ from tests.helpers import B5DeleteTests
 
 # Source: test_b6_policy.py
 class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
-    setUp = B6ReminderTests_setUp
+    def setUp(self):
+        B6ReminderTests_setUp(self)
+        self.store._rollout_time(self.now - 4 * DAY_SECONDS)
 
     write = B6ReminderTests_write
 
@@ -135,8 +138,8 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
 
     scan = B6ReminderTests_scan
 
-    async def test_24_hour_boundary_and_exact_receipt(self):
-        self.write(written=self.now - DAY_SECONDS + 1)
+    async def test_twenty_minute_boundary_and_exact_receipt(self):
+        self.write(written=self.now - 20 * 60 + 1)
         self.assertEqual(await self.scan(), 0)
         self.read.assert_not_awaited()
         self.assertEqual(await self.scan(self.now + 1), 1)
@@ -144,8 +147,8 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((candidate["actor"], candidate["group_id"]), ("owner", "group"))
         self.assertEqual(
             text,
-            "你的草稿还没有提交（1 条，最后修改于 2026-10-26 10:00）。\n"
-            "草稿地址：https://offline.invalid/draft/b6-draft\n回复「提交」提交，或「清空草稿」放弃。",
+            "你有草稿未提交（1 条），是否帮你提交？提交请回复「确认」\n"
+            "https://offline.invalid/draft/b6-draft",
         )
         receipt = self.store.resolve_receipt("qq", "group", "reminder-message")
         self.assertEqual((receipt["actor"], receipt["batch_id"]), ("owner", "b6-draft"))
@@ -165,12 +168,12 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.scan(self.now + 2 * DAY_SECONDS), 0)
         self.assertEqual(self.send.await_count, 1)
 
-    async def test_batch_cap_is_three_distinct_versions(self):
+    async def test_batch_reminder_is_once_across_versions(self):
         for version in range(1, 5):
             current = self.now + (version - 1) * 2 * DAY_SECONDS
             self.write(version=version, written=current - DAY_SECONDS)
-            self.assertEqual(await self.scan(current), int(version <= 3))
-        self.assertEqual(self.send.await_count, 3)
+            self.assertEqual(await self.scan(current), int(version == 1))
+        self.assertEqual(self.send.await_count, 1)
 
     async def test_batch_caps_are_shared_across_linked_platform_accounts(self):
         for version in range(1, 5):
@@ -183,8 +186,8 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
                  "batchId": "shared-batch", "batchUrl": "https://offline.invalid/shared-batch",
                  "after": {"batchId": "shared-batch", "contentVersion": version, "items": [{"id": 1}]}},
             )
-            self.assertEqual(await self.scan(current), int(version <= 3))
-        self.assertEqual(self.send.await_count, 3)
+            self.assertEqual(await self.scan(current), int(version == 1))
+        self.assertEqual(self.send.await_count, 1)
 
     async def test_same_version_and_latest_group_are_global_per_batch(self):
         self.write(written=self.now - 2 * DAY_SECONDS)
@@ -200,20 +203,20 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.scan(self.now + 2 * DAY_SECONDS), 0)
         self.assertEqual(self.send.await_count, 1)
 
-    async def test_repeated_reminder_needs_full_24_hours(self):
+    async def test_another_batch_only_sends_on_the_next_shanghai_day(self):
         self.write(written=self.now - 2 * DAY_SECONDS)
         self.assertEqual(await self.scan(), 1)
-        self.write(version=2, written=self.now - DAY_SECONDS)
-        self.assertEqual(await self.scan(self.now + DAY_SECONDS - 1), 0)
-        self.assertEqual(await self.scan(self.now + DAY_SECONDS), 1)
+        self.write(batch="another", written=self.now - DAY_SECONDS)
+        self.assertEqual(await self.scan(self.now + 60), 0)
+        self.assertEqual(await self.scan(self.now + DAY_SECONDS - 1), 1)
 
     async def test_batch_submitted_empty_missing_or_version_changed_meantime_skips(self):
         self.write()
-        for overrides in (
+        for scan_index, overrides in enumerate((
             {"status": "Pending"}, {"items": []}, {"success": False},
             {"batchId": "another"}, {"contentVersion": 2}, {"count": 2},
             {"status": None}, {"itemsTruncationNotice": "truncated"},
-        ):
+        )):
             with self.subTest(overrides=overrides):
                 draft = await self.snapshot({
                     "batch_id": "b6-draft", "content_version": 1,
@@ -221,7 +224,8 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.read.side_effect = None
                 self.read.return_value = {**draft, **overrides}
-                self.assertEqual(await self.scan(), 0)
+                self.assertEqual(await self.scan(self.now + scan_index * 3600), 0)
+        self.assertEqual(self.read.await_count, 8)
         self.send.assert_not_awaited()
 
     async def test_restart_does_not_duplicate_success_or_uncertain_delivery(self):
@@ -230,8 +234,8 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.scan(self.now + DAY_SECONDS, DraftReminderStore(self.db_path)), 0)
         self.write(batch="uncertain")
         self.send.side_effect = TimeoutError("uncertain send")
-        self.assertEqual(await self.scan(), 0)
-        self.assertEqual(await self.scan(self.now + DAY_SECONDS, DraftReminderStore(self.db_path)), 0)
+        self.assertEqual(await self.scan(self.now + DAY_SECONDS), 0)
+        self.assertEqual(await self.scan(self.now + 2 * DAY_SECONDS, DraftReminderStore(self.db_path)), 0)
         self.assertEqual(self.send.await_count, 2)
 
     async def test_send_intent_is_committed_before_delivery_and_crash_is_not_retried(self):
@@ -272,8 +276,8 @@ class B6ReminderTests(unittest.IsolatedAsyncioTestCase):
         self.read.side_effect = unavailable
         self.assertEqual(await self.scan(), 0)
         self.assertEqual(len(checked), 20)
-        self.assertEqual(await self.scan(self.now + 3600), 0)
-        self.assertEqual(len(checked), 40)
+        self.assertEqual(await self.scan(self.now + 300), 0)
+        self.assertEqual(len(checked), 25)
         self.assertEqual(len(set(checked)), 25)
 
     async def test_latest_write_controls_group_and_submission_closes_candidate(self):
@@ -385,12 +389,12 @@ class B6ReminderIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.chat._scan_draft_reminders_once(), 0)
             store.assert_not_called()
 
-    async def test_latest_list_is_actor_scoped_without_rejected_batch_selector(self):
-        listed = AsyncMock(return_value={"success": True, "batchId": "b6-draft", "items": [{"id": 1}]})
+    async def test_list_is_actor_and_batch_scoped_without_inventing_draft_status(self):
+        listed = AsyncMock(return_value={"success": True, "status": "Rejected", "batchId": "b6-draft", "items": [{"id": 1}]})
         with patch.object(self.chat.skills_manager, "get_tool_function", return_value=listed):
             data = await self.chat._read_reminder_draft({"platform": "qq", "actor": "owner", "batch_id": "b6-draft"})
-        listed.assert_awaited_once_with(platform="qq", platform_id="owner")
-        self.assertEqual(data["status"], "Draft")
+        listed.assert_awaited_once_with(platform="qq", platform_id="owner", batch_id="b6-draft")
+        self.assertEqual(data["status"], "Rejected")
 
     async def test_journal_transaction_records_actual_last_write_and_group(self):
         from keytao_bot.utils.draft_mutation_store import DraftMutationClaimStore
@@ -405,20 +409,24 @@ class B6ReminderIntegrationTests(unittest.IsolatedAsyncioTestCase):
             store = DraftReminderStore(journal.db_path)
             send = AsyncMock(return_value="receipt")
             with patch.dict(os.environ, {"KEYTAO_DRAFT_REMINDER": "1"}):
+                await store.scan(B6ReminderTests_snapshot, send, now=now - 2 * DAY_SECONDS - 10 * 3600)
                 self.assertEqual(await store.scan(B6ReminderTests_snapshot, send, now=now), 1)
             self.assertEqual(send.await_args.args[0]["group_id"], "42")
 
     async def test_quoted_reminder_commands_use_normal_path_for_author_only(self):
         from types import SimpleNamespace
+        now = int(time.time())
         memory = self.harness.ChatMemoryContext(
             platform="qq", user_id="owner", space_type="group", space_id="42",
         )
-        receipt_store = SimpleNamespace(resolve_receipt=lambda *args: {"actor": "owner", "batch_id": "b6-draft"})
+        receipt_store = SimpleNamespace(resolve_receipt=lambda *args: {
+            "actor": "owner", "batch_id": "b6-draft", "status": "sent", "result_at": now,
+        })
         for actor in ("owner", "other"):
             for command in ("提交", "清空草稿"):
                 with self.subTest(actor=actor, command=command):
                     ctx = self.chat.TurnContext(
-                        bot=SimpleNamespace(), event=SimpleNamespace(), platform="qq", user_id=actor,
+                        bot=SimpleNamespace(), event=SimpleNamespace(time=now), platform="qq", user_id=actor,
                         message_text=command, normalized_message_text=command,
                         memory_context=memory, conv_key=memory.conversation_address,
                         space_key=memory.conversation_address.space_key,
@@ -444,18 +452,19 @@ class B6ReminderIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reminder_submit_cannot_bypass_running_draft_operation(self):
         from types import SimpleNamespace
+        now = int(time.time())
         memory = self.harness.ChatMemoryContext(
             platform="qq", user_id="owner", space_type="group", space_id="42",
         )
         coordinator = self.harness.DraftOperationCoordinator()
         active = coordinator.begin(memory.conversation_address, "add_and_submit")
         ctx = self.chat.TurnContext(
-            bot=SimpleNamespace(), event=SimpleNamespace(), platform="qq", user_id="owner",
+            bot=SimpleNamespace(), event=SimpleNamespace(time=now), platform="qq", user_id="owner",
             message_text="提交", normalized_message_text="提交", memory_context=memory,
             conv_key=memory.conversation_address, space_key=memory.conversation_address.space_key,
         )
         ctx.reply_reference = self.harness.ReplyReferenceInfo(is_reply=True)
-        receipt_store = SimpleNamespace(resolve_receipt=lambda *args: {"actor": "owner"})
+        receipt_store = SimpleNamespace(resolve_receipt=lambda *args: {"actor": "owner", "result_at": now})
         with (
             patch.dict(os.environ, {"KEYTAO_DRAFT_REMINDER": "1"}),
             patch.object(self.chat, "draft_operation_coordinator", coordinator),
