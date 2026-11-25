@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 from . import http_client
 from .commonness_copy import render_commonness_summary, uses_dictionary_presence_frequency
-from .bcc_reference import (HISTORICAL_CHANNELS, bcc_daily_value, bcc_deciding_channels,
+from .bcc_reference import (HISTORICAL_CHANNELS, bcc_daily_value, bcc_deciding_channels, bcc_secondary_value,
                             comparison_signal, format_bcc, format_frequency, format_historical,
                             historical_attested, historical_comparison_signal, lookup_bcc)
 from .http_client import KeytaoApiError
@@ -92,6 +92,16 @@ COMMONNESS_CORPUS_SCORE_SATURATION = 1_000
 COMMONNESS_BCC_SCORE_SATURATION_PER_MILLION = 20
 COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT = 10
 COMMONNESS_DICTIONARY_PRESENCE_MARGIN = 2
+COMMONNESS_AUTO_APPROVE_REASONS = (
+    "bcc_frequency_ratio",
+    "bcc_frequency_ratio_balanced_tiebreak",
+    "bcc_relative_rank_ratio",
+    "bcc_relative_rank_ratio_balanced_tiebreak",
+    "bcc_primary_one_sided",
+    "bcc_secondary_channels",
+    "frequency_ratio",
+    "corpus_attested_with_no_presence_deficit",
+)
 
 # A context/meaning-backed reading may clear a missing-whole-word-page seal
 # only when it is also demonstrably non-obscure. The word-frequency threshold
@@ -5735,7 +5745,7 @@ def _reference_commonness_result(word: str, reference: Dict[str, Any]) -> Dict[s
     frequency = reference.get("corpusFrequency")
     bcc = reference.get("bcc") or {}
     use_bcc = bcc.get("available") and bcc.get("attested")
-    corpus_value = bcc["perMillion"] if use_bcc else frequency
+    corpus_value = (bcc["perMillion"] or bcc_secondary_value(bcc)) if use_bcc else frequency
     # 20 per million is approximately the legacy 1,000 / 60M-token ceiling.
     saturation = COMMONNESS_BCC_SCORE_SATURATION_PER_MILLION if use_bcc else COMMONNESS_CORPUS_SCORE_SATURATION
     presence_count = int(reference.get("dictionaryPresenceCount") or 0)
@@ -5967,9 +5977,9 @@ def _reference_comparison_summary(
     # Share the table formatter so small observations and rounding stay identical.
     rank_based = 'relative_rank' in reason
     signal_key = 'rankFraction' if rank_based else 'perMillion'
-    strongest = [bcc_deciding_channels(bcc.get('channels', []), signal_key)
+    strongest = [bcc_deciding_channels(bcc.get('channels', []), signal_key, reason=reason)
                  for bcc in (front_bcc, behind_bcc)]
-    channel_names = ['多领域'] if 'balanced_tiebreak' in reason else []
+    channel_names = []
     for row in [rows[0] for rows in strongest if rows] + [row for rows in strongest for row in rows[1:]]:
         if row['channel'] not in channel_names:
             channel_names.append(row['channel'])
@@ -6006,9 +6016,16 @@ def _reference_comparison_summary(
                       f"{format_frequency(rows[0]['count'], rows[0]['perMillion'])} vs "
                       f"「{second_word}」{format_frequency(rows[1]['count'], rows[1]['perMillion'])}")
         basis += '；仅作历史语料末级破平'
+    elif reason == 'bcc_primary_one_sided':
+        basis = (f"「{first_word}」{bcc_summary(front_bcc)}；"
+                 f"「{second_word}」仅见于新闻或文学，优先按口语和多领域判定")
+    elif reason == 'bcc_modern_signal_unavailable':
+        basis = '现代 BCC 双方均有收录，缺少可比较的频道频次或字／词表内排名'
     elif reason.startswith('bcc_'):
         basis = (f"「{first_word}」{bcc_summary(front_bcc)}；"
                  f"「{second_word}」{bcc_summary(behind_bcc)}")
+        if reason.removesuffix('_below_threshold') == 'bcc_secondary_channels':
+            basis += '；双方在口语和多领域均未收录，采用新闻和文学比较'
         if 'balanced_tiebreak' in reason:
             basis += "；最高频道信号相同，采用多领域比较"
         if reason.startswith('bcc_relative_rank_'):
@@ -6067,6 +6084,7 @@ def _compare_reference_commonness(
 
     front_bcc = front_reference.get("bcc") or {}
     behind_bcc = behind_reference.get("bcc") or {}
+    both_bcc_attested = front_bcc.get("attested") and behind_bcc.get("attested")
     bcc_signal = comparison_signal(front_bcc, behind_bcc)
     if bcc_signal is not None:
         left, right, reason = bcc_signal
@@ -6076,8 +6094,9 @@ def _compare_reference_commonness(
             verdict = "behind_more_common"
         else:
             verdict = "close"
-        if verdict == "close":
             reason += "_below_threshold"
+    elif both_bcc_attested:
+        reason = "bcc_modern_signal_unavailable"
     elif isinstance(front_frequency, int) and isinstance(behind_frequency, int):
         if front_frequency > behind_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
             verdict = "front_more_common"
@@ -6113,7 +6132,7 @@ def _compare_reference_commonness(
             verdict = frequency_verdict
             reason = "corpus_attested_with_no_presence_deficit"
 
-    if verdict == "not_enough_evidence" and reason != "frequency_below_minimum":
+    if verdict == "not_enough_evidence" and not both_bcc_attested and reason != "frequency_below_minimum":
         presence_delta = front_presence - behind_presence
         if presence_delta >= COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
             verdict = "front_more_common"
@@ -7691,9 +7710,8 @@ async def _shared_prepare_reviewed_word(
 
 
 def _css_change_reason_allows_pass(comparison: Dict) -> bool:
-    # ponytail: B1 keeps the blacklist until a later batch introduces a whitelist.
     return (comparison.get("verdict") == "front_more_common"
-            and comparison.get("decisionReason") != "dictionary_presence_margin")
+            and comparison.get("decisionReason") in COMMONNESS_AUTO_APPROVE_REASONS)
 
 
 async def _audit_single_item(
@@ -8005,9 +8023,8 @@ async def _audit_single_item(
 
 
 def _priority_move_reason_allows_pass(comparison: Dict) -> bool:
-    # ponytail: B1 keeps the blacklist until a later batch introduces a whitelist.
     return (comparison.get("verdict") == "front_more_common"
-            and comparison.get("decisionReason") != "dictionary_presence_margin")
+            and comparison.get("decisionReason") in COMMONNESS_AUTO_APPROVE_REASONS)
 
 
 async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> Dict:

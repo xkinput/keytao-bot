@@ -1,7 +1,8 @@
-"""Freeze the B1 commonness decisions against synthetic, offline evidence."""
+"""Freeze the B3 commonness decisions against synthetic, offline evidence."""
 
 from contextlib import closing
 import json
+import math
 from pathlib import Path
 import socket
 import sqlite3
@@ -27,8 +28,12 @@ PAIRS = {
     "unattested_both_with_historical_supplement": ("注甲", "注乙"),
     "balanced_exact_tie": ("平词甲", "平词乙"),
     "balanced_breaks_peak_tie": ("平词甲", "平词丙"),
+    "primary_one_sided": ("新闻甲", "文学丙"),
+    "secondary_only_pair": ("副词甲", "副词乙"),
+    "secondary_only_cross_type": ("副", "副词丙"),
+    "secondary_only_close": ("副词丙", "文学独词"),
 }
-SNAPSHOT = Path(__file__).with_name("golden") / "commonness_b1.json"
+SNAPSHOT = Path(__file__).with_name("golden") / "commonness_b3.json"
 
 
 def seed_reference(path):
@@ -41,6 +46,11 @@ def seed_reference(path):
         "平词甲": {"多领域": (7, 90), "新闻": (50, 40)},
         "平词乙": {"多领域": (7, 95), "文学": (50, 41)},
         "平词丙": {"多领域": (2, 130), "文学": (50, 41)},
+        "副词甲": {"新闻": (40, 20), "文学": (2, 200)},
+        "副词乙": {"新闻": (5, 100), "文学": (20, 50)},
+        "副": {"新闻": (50, 500)},
+        "副词丙": {"文学": (5, 1)},
+        "文学独词": {"文学": (5, 100)},
     }
     with closing(sqlite3.connect(path)) as database, database:
         create_schema(database)
@@ -53,6 +63,9 @@ def seed_reference(path):
             ("词典甲", None, 3),
             ("词典乙", None, 1),
             ("低频旧词", 9, 0),
+            ("副词甲", 2, 0),
+            ("副词乙", 1000, 0),
+            ("文学独词", 999, 0),
         ])
         for kind in ("char", "word"):
             for channel in CHANNELS:
@@ -220,6 +233,17 @@ class CommonnessGoldenTests(unittest.IsolatedAsyncioTestCase):
                 row.update(await self.audit_rows(front, behind))
                 snapshot[case] = row
 
+        estimate = await review.estimate_word_commonness("文学独词")
+        self.assert_offline(estimate)
+        self.assertAlmostEqual(estimate["signals"]["corpus"], math.log1p(5) / math.log1p(20))
+        snapshot["single_literature_only"] = {"estimate": {
+            "attested": estimate["bcc"]["attested"],
+            "primaryPerMillion": estimate["bcc"]["perMillion"],
+            "corpusSource": estimate["corpusSource"],
+            "rawCorpusPerMillion": estimate["rawSignals"]["corpus"],
+            "score": round(estimate["score"], 6),
+        }}
+
         front, behind = "网页甲", "网页乙"
         web = {
             "success": True, "verdict": "front_more_common", "webFallback": True,
@@ -240,6 +264,62 @@ class CommonnessGoldenTests(unittest.IsolatedAsyncioTestCase):
             for site, outcome in row.items():
                 with self.subTest(case=case, site=site):
                     self.assertEqual(actual[case][site], outcome)
+
+    async def test_secondary_pair_uses_the_same_strict_ratio_threshold(self):
+        with patch.object(review, "COMMONNESS_FREQUENCY_RATIO_THRESHOLD", 2):
+            result = await review.compare_word_commonness(*PAIRS["secondary_only_pair"])
+        self.assert_offline(result)
+        self.assertEqual((result["verdict"], result["decisionReason"]),
+                         ("close", "bcc_secondary_channels_below_threshold"))
+
+    async def test_auto_approval_whitelist_at_both_audit_sites(self):
+        allowed = (
+            "bcc_frequency_ratio",
+            "bcc_frequency_ratio_balanced_tiebreak",
+            "bcc_relative_rank_ratio",
+            "bcc_relative_rank_ratio_balanced_tiebreak",
+            "bcc_primary_one_sided",
+            "bcc_secondary_channels",
+            "frequency_ratio",
+            "corpus_attested_with_no_presence_deficit",
+        )
+        blocked = (
+            "bcc_frequency_ratio_below_threshold",
+            "bcc_frequency_ratio_balanced_tiebreak_below_threshold",
+            "bcc_relative_rank_ratio_below_threshold",
+            "bcc_relative_rank_ratio_balanced_tiebreak_below_threshold",
+            "bcc_secondary_channels_below_threshold",
+            "bcc_modern_signal_unavailable",
+            "bcc_historical_classical_frequency_ratio",
+            "bcc_historical_classical_relative_rank_ratio",
+            "bcc_historical_early_modern_frequency_ratio",
+            "bcc_historical_early_modern_relative_rank_ratio",
+            "local_signal_insufficient",
+            "frequency_ratio_below_threshold",
+            "frequency_below_minimum",
+            "corpus_and_dictionary_vs_absent",
+            "dictionary_presence_margin",
+            "incumbent_frequency_vs_absent",
+            "incumbent_historical_frequency_vs_absent",
+            "modern_frequency_insufficient",
+            "modern_semantic_vs_dictionary_dominated",
+            "listed_order_tiebreak",
+            "future_reason",
+            "", None,
+        )
+        cases = [(reason, "front_more_common", True) for reason in allowed]
+        cases += [(reason, "front_more_common", False) for reason in blocked]
+        cases += [("frequency_ratio", verdict, False)
+                  for verdict in ("behind_more_common", "close", "not_enough_evidence")]
+        for reason, verdict, approve in cases:
+            with self.subTest(reason=reason, verdict=verdict):
+                with patch.object(review, "compare_word_commonness", return_value={
+                    "success": True, "verdict": verdict, "decisionReason": reason,
+                }):
+                    rows = await self.audit_rows("新词甲", "旧词乙")
+                self.assertEqual(rows["cssChange"]["status"], "pass" if approve else "needs_admin")
+                self.assertEqual(rows["priorityMove"]["status"],
+                                 "approved" if approve else "without_priority_approval")
 
     async def test_completely_unattested_pair_requires_fallback(self):
         # Without even a historical supplement the public comparison has no offline result.

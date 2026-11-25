@@ -36,6 +36,8 @@ def uses_dictionary_presence_frequency(reason: str) -> bool:
 def _comparison_frequency(commonness: dict, reason: str, web_fallback: bool):
     if web_fallback:
         return _numeric_commonness_value(commonness.get("score"))
+    if reason == "bcc_modern_signal_unavailable":
+        return None
     reference = commonness.get("reference") or {}
     if uses_dictionary_presence_frequency(reason):
         return _numeric_commonness_value(reference.get("dictionaryPresenceCount"))
@@ -54,14 +56,13 @@ def _comparison_frequency(commonness: dict, reason: str, web_fallback: bool):
         rows = selected
     elif reason.startswith(("frequency_", "corpus_")):
         return _numeric_commonness_value(reference.get("corpusFrequency"))
-    elif "balanced_tiebreak" in reason:
-        rows = [row for row in rows if row.get("channel") == "多领域"]
     signal = "rankFraction" if "relative_rank" in reason else "perMillion"
     observed = bcc_deciding_channels(
         (row for row in rows
          if _numeric_commonness_value(row.get("count")) is not None
          and _numeric_commonness_value(row.get(signal)) is not None),
         signal,
+        reason=reason,
     )
     if observed:
         strongest = observed[0]
@@ -69,6 +70,8 @@ def _comparison_frequency(commonness: dict, reason: str, web_fallback: bool):
             value = strongest[signal]
             return (1 / value if value else None) if signal == "rankFraction" else value
         return strongest["count"]
+    if reason in {"bcc_primary_one_sided", "bcc_secondary_channels"}:
+        return None
     return _numeric_commonness_value(reference.get("corpusFrequency"))
 
 

@@ -4,6 +4,8 @@ import logging
 import sqlite3
 
 CHANNELS = ("多领域", "新闻", "文学", "口语")
+PRIMARY_CHANNELS = ("多领域", "口语")
+SECONDARY_CHANNELS = ("新闻", "文学")
 HISTORICAL_CHANNELS = ("古代汉语", "近代汉语")
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS bcc_dataset (
@@ -60,24 +62,29 @@ def preserve_bcc(source_path, connection):
         return
 
 
-def bcc_deciding_channels(rows, signal_key):
+def bcc_deciding_channels(rows, signal_key, *, reason=''):
     """Order observed channels by the decision metric, preserving ties."""
+    channels = None
+    if 'balanced_tiebreak' in reason:
+        channels = ('多领域',)
+    elif reason.startswith(('bcc_frequency_ratio', 'bcc_relative_rank_ratio', 'bcc_primary_one_sided')):
+        channels = PRIMARY_CHANNELS
+    elif reason.removesuffix('_below_threshold') == 'bcc_secondary_channels':
+        channels = SECONDARY_CHANNELS
     return sorted(
-        (row for row in rows if row.get('count') is not None and row.get(signal_key) is not None),
+        (row for row in rows if row.get('count') is not None and row.get(signal_key) is not None
+         and (channels is None or row.get('channel') in channels)),
         key=lambda row: row[signal_key],
         reverse=signal_key != 'rankFraction',
     )
 
 
 def bcc_daily_value(bcc):
-    """Return the modern per-million value, rank fraction, and availability."""
-    if 'available' in bcc:
-        # Existing snapshots carry authoritative aggregates, including missing ranks.
-        return bcc.get('perMillion'), bcc.get('rankFraction'), bcc['available']
+    """Return primary-channel frequency and rank, with four-channel availability."""
     channels = {row['channel']: row for row in bcc.get('channels', [])}
     if not set(CHANNELS).issubset(channels):
         return None, None, False
-    observed = [channels[channel] for channel in CHANNELS if channels[channel]['count'] is not None]
+    observed = [channels[channel] for channel in PRIMARY_CHANNELS if channels[channel]['count'] is not None]
     by_frequency = bcc_deciding_channels(observed, 'perMillion')
     by_rank = bcc_deciding_channels(observed, 'rankFraction')
     return (
@@ -85,6 +92,11 @@ def bcc_daily_value(bcc):
         by_rank[0]['rankFraction'] if by_rank and len(by_rank) == len(observed) else None,
         True,
     )
+
+
+def bcc_secondary_value(bcc):
+    rows = bcc_deciding_channels(bcc.get('channels', []), 'perMillion', reason='bcc_secondary_channels')
+    return rows[0]['perMillion'] if rows else None
 
 
 def lookup_bcc(connection, word):
@@ -126,13 +138,24 @@ def lookup_bcc(connection, word):
 
 
 def comparison_signal(front, behind):
-    """Return comparable positive evidence, or defer to the legacy signals."""
+    """Return comparable modern BCC evidence when both sides are attested."""
     if not all(item.get('available') and item.get('attested') for item in (front, behind)):
         return None
+    left_frequency, left_rank, _ = bcc_daily_value(front)
+    right_frequency, right_rank, _ = bcc_daily_value(behind)
+    primary = [left_frequency or 0, right_frequency or 0]
     cross_type = front['tokenType'] != behind['tokenType']
+    if not all(primary):
+        if any(primary):
+            return (*primary, 'bcc_primary_one_sided')
+        if cross_type:
+            return None
+        secondary = [bcc_secondary_value(item) for item in (front, behind)]
+        if all(value is not None and value > 0 for value in secondary):
+            return (*secondary, 'bcc_secondary_channels')
+        return None
     key = 'rankFraction' if cross_type else 'perMillion'
-    values = [rank if cross_type else frequency
-              for frequency, rank, _ in map(bcc_daily_value, (front, behind))]
+    values = [left_rank, right_rank] if cross_type else primary
     if any(value is None or value <= 0 for value in values):
         return None
     # A smaller relative rank is stronger; invert it to retain the ratio rule.

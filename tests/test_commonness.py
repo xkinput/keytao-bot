@@ -512,7 +512,7 @@ class CommonnessEvidenceTests(unittest.TestCase):
         self.insert(("卡脖子", 6, "v", 3), ("这辈子", 3, "n", 0))
         front = review._query_commonness_reference("卡脖子")
         behind = review._query_commonness_reference("这辈子")
-        front["bcc"].update(available=True, attested=True, perMillion=2.63,
+        front["bcc"].update(available=True, attested=True, perMillion=None,
                             channels=[{"channel": "新闻", "count": 2442, "perMillion": 2.63}])
         behind["bcc"]["available"] = True
         for frequencies, expected in (
@@ -962,6 +962,8 @@ class BccCommonnessTests(unittest.TestCase):
         self.assertEqual(balanced['count'], 22900677)
         self.assertAlmostEqual(balanced['perMillion'], 35539.83070929854)
         self.assertNotEqual(balanced['count'], 22388585)
+        spoken = next(channel for channel in row['bcc']['channels'] if channel['channel'] == '口语')
+        self.assertEqual(row['bcc']['perMillion'], max(balanced['perMillion'], spoken['perMillion']))
         history = {item['channel']: item for item in row['bcc']['historicalChannels']}
         self.assertEqual(history['近代汉语']['count'], 5610065)
         self.assertNotEqual(history['近代汉语']['count'], 5230487)
@@ -1005,9 +1007,13 @@ class BccCommonnessTests(unittest.TestCase):
         char = review._query_commonness_reference('的')
         word = review._query_commonness_reference('五角星')
         for item, balanced in ((char, .5), (word, .1)):
-            item['bcc']['rankFraction'] = .1
             for row in item['bcc']['channels']:
-                row['rankFraction'] = balanced if row['channel'] == '多领域' else .1
+                if row['channel'] == '多领域':
+                    row.update(rankFraction=balanced)
+                elif row['channel'] == '口语':
+                    row.update(count=1, perMillion=1.0, rankFraction=.1)
+                else:
+                    row.update(rankFraction=.01)
         result = review._compare_reference_commonness('的', '五角星', char, word)
         self.assertEqual(result['verdict'], 'behind_more_common')
         self.assertIn('最高频道信号相同，采用多领域比较', result['summary'])
@@ -1077,7 +1083,9 @@ class BccCommonnessTests(unittest.TestCase):
         result = asyncio.run(review.compare_word_commonness('情报所', '敲不死'))
         self.assertEqual(result['verdict'], 'front_more_common')
         self.assertEqual(result['front']['weights'], {'corpus': 0.75, 'dictionary': 0.25})
-        self.assertAlmostEqual(result['front']['bcc']['perMillion'], 99 * 1000000 / 928179976)
+        self.assertEqual(result['decisionReason'], 'bcc_primary_one_sided')
+        self.assertAlmostEqual(result['front']['bcc']['perMillion'], 34 * 1000000 / 403819602)
+        self.assertIsNone(result['behind']['bcc']['perMillion'])
         self.assertNotIn('99999999', result['summary'])
         self.assertNotIn('jieba', result['summary'])
         self.assertNotIn('未收录 vs 未收录', result['summary'])
@@ -1191,8 +1199,14 @@ class BccIngestTests(unittest.TestCase):
             self.assertEqual(inverse['summary'], comparison['summary'])
             self.assertIn('表内排名', comparison['summary'])
             # Old optional snapshots without ranks must not compare unlike units.
-            char['bcc']['rankFraction'] = None
-            self.assertEqual(review._compare_reference_commonness('甲', '甲词', char, word)['verdict'], 'not_enough_evidence')
+            for row in char['bcc']['channels']:
+                row['rankFraction'] = None
+            char.update(corpusFrequency=1000, dictionaryPresenceCount=3)
+            word.update(corpusFrequency=10)
+            no_rank = review._compare_reference_commonness('甲', '甲词', char, word)
+            self.assertEqual(no_rank['verdict'], 'not_enough_evidence')
+            self.assertEqual(no_rank['decisionReason'], 'bcc_modern_signal_unavailable')
+            self.assertEqual(commonness_copy.render_commonness_comparison(no_rank), '')
 
     def test_low_disk_refuses_before_download_or_staging_and_keeps_db(self):
         from types import SimpleNamespace
@@ -1628,14 +1642,14 @@ class CommonnessRenderTests(unittest.TestCase):
                 {"channel": "新闻", "count": 12, "perMillion": 0.2},
             ]}},
         }
-        self.assertEqual("甲词 0.9 > 乙词 0.2", commonness_copy.render_commonness_comparison(assessment))
+        self.assertEqual("甲词 0.58 > 乙词 0.1", commonness_copy.render_commonness_comparison(assessment))
         assessment["decisionReason"] += "_balanced_tiebreak"
         self.assertEqual("甲词 0.58 > 乙词 0.1", commonness_copy.render_commonness_comparison(assessment))
         assessment["decisionReason"] = "bcc_relative_rank_ratio"
         for side, ranks in (("front", (0.25, 0.5)), ("behind", (0.5, 0.125))):
             for row, rank in zip(assessment[side]["bcc"]["channels"], ranks):
                 row["rankFraction"] = rank
-        self.assertEqual("乙词 8 > 甲词 4", commonness_copy.render_commonness_comparison(assessment))
+        self.assertEqual("甲词 4 > 乙词 2", commonness_copy.render_commonness_comparison(assessment))
         assessment["decisionReason"] += "_balanced_tiebreak"
         self.assertEqual("甲词 4 > 乙词 2", commonness_copy.render_commonness_comparison(assessment))
 
@@ -1647,22 +1661,22 @@ class CommonnessRenderTests(unittest.TestCase):
                 [("新词", 300, 2.0, "口语"), ("旧词", 900, 0.97, "新闻")],
             )
         for first, second, verdict, values in (
-            ("新词", "旧词", "front_more_common", ("2.0", "0.97")),
-            ("旧词", "新词", "behind_more_common", ("0.97", "2.0")),
+            ("新词", "旧词", "front_more_common", ("2.0", "")),
+            ("旧词", "新词", "behind_more_common", ("", "2.0")),
         ):
             with self.subTest(first=first):
                 comparison = self.local_comparison(first, second)
-                self.assertEqual("bcc_frequency_ratio", comparison["decisionReason"])
+                self.assertEqual("bcc_primary_one_sided", comparison["decisionReason"])
                 self.assertEqual(verdict, comparison["verdict"])
-                self.assertEqual("词频：新词 2 > 旧词 0.97",
+                self.assertEqual("词频：新词 2 > 旧词 无",
                                  commonness_copy.candidate_commonness_summary_copy(comparison))
                 assessment, _, _ = candidate_fixture(comparison)
                 self.assertEqual(values, (assessment["frontFrequency"], assessment["behindFrequency"]))
-                self.assertIn("词频：新词 2 > 旧词 0.97", self.assert_delivery(comparison))
+                self.assertIn("词频：新词 2 > 旧词 无", self.assert_delivery(comparison))
                 if verdict == "front_more_common":
                     recommendation = pending.front_insert_recommendation_copy(assessment, include_controls=False)
                     self.assertIn("推荐调序：「新词」占 qbs，「旧词」顺延", recommendation)
-                    self.assertIn("词频：新词 2 > 旧词 0.97", recommendation)
+                    self.assertIn("词频：新词 2 > 旧词 无", recommendation)
 
     def test_compact_dictionary_margin_uses_presence_instead_of_corpus_counts(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
@@ -1965,15 +1979,19 @@ class S67RankingTests(unittest.TestCase):
         for words in (("曰", "强"), ("强", "曰")):
             result = lookup_word_commonness(words)
             summary = result["comparisons"][0]["summary"]
-            self.assertIn("所用频次比 32.09×", summary)
+            self.assertIn("所用频次比 61.76×", summary)
             self.assertLessEqual(sum(channel in summary for channel in CHANNELS), 2)
             self.assertNotIn("975.6388", summary)
+            self.assertNotIn("新闻", summary)
+            self.assertNotIn("文学", summary)
             for count, rate in re.findall(r"([\d,]+)（每百万 ([\d.e+-]+)）", summary):
                 self.assertIn(f"{count}（每百万 {rate}）", "\n".join(
                     self.cells(commonness_query.render_commonness_table(result), word)[2] for word in words))
-            # The headline maximum of each word must remain visible, even in different channels.
+            # Show the strongest primary observation for each word.
             for row in result["words"]:
-                strongest = max((r for r in row["bcc"]["channels"] if r["count"] is not None), key=lambda r: r["perMillion"])
+                strongest = max((r for r in row["bcc"]["channels"]
+                                 if r["channel"] in ("口语", "多领域") and r["count"] is not None),
+                                key=lambda r: r["perMillion"])
                 self.assertIn(format_frequency(strongest["count"], strongest["perMillion"]), summary)
 
     def test_unavailable_bcc_and_other_legacy_sources_never_show_bare_number(self):
@@ -2014,12 +2032,11 @@ class S67RankingTests(unittest.TestCase):
 
     def test_balanced_tiebreak_and_tiny_rate_use_shared_precision(self):
         first, second = [review._query_commonness_reference(word) for word in ("咽", "嘢")]
-        # Synthetic equal maxima force the existing balanced-channel tiebreak.
+        # Equal primary maxima force the balanced-channel tiebreak.
         for reference, balanced in ((first, 0.004123456), (second, 0.00123456)):
-            bcc = reference["bcc"]
-            bcc["perMillion"] = 10.0
-            for row in bcc["channels"]:
-                row.update(count=1, perMillion=balanced if row["channel"] == "多领域" else 10.0)
+            for row in reference["bcc"]["channels"]:
+                rate = {"多领域": balanced, "口语": 10.0}.get(row["channel"], 100.0)
+                row.update(count=1, perMillion=rate)
         comparison = review._compare_reference_commonness("咽", "嘢", first, second)
         self.assertIn("balanced_tiebreak", comparison["decisionReason"])
         summary = comparison["summary"]

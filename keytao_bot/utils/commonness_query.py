@@ -103,7 +103,7 @@ def render_commonness_table(result):
     lines.append(result["orderingNote"] + "词频是语料内计数。")
     lines.append("数据收录仅说明该词的可用来源，不代表两词能否判定高低。")
     if any((row.get("bcc") or {}).get("available") for row in result["words"]):
-        lines.append("BCC 取四个现代频道的最高每百万频次；字与词按各自表内排名比较。未收录不代表实际零次，单边收录不决定高低。")
+        lines.append("BCC 优先比较口语、多领域的最高每百万频次，双方均有主频道数据的字词比较使用表内排名。未收录不代表实际零次，单边 BCC 收录不决定高低。")
         lines.append("古代汉语、近代汉语不计入现代频次；仅在双方现代四频道均未收录且词典与 jieba 无明确方向时破平。")
         if len(result["words"]) == 2:
             lines.extend(render_commonness_summary(item) for item in result["comparisons"])
