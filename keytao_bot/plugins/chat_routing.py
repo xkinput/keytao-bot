@@ -53,7 +53,9 @@ from ..harness.tools import (
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.candidate_inventory import protected_candidate_occupants
 from ..utils.conversational_reply import is_conversational_text
-from ..utils.explicit_code import parse_explicit_code_request, readings_match, validate_explicit_code
+from ..utils.explicit_code import (
+    normalize_glued_add_code, parse_explicit_code_request, readings_match, validate_explicit_code,
+)
 from ..utils.literal_phrase import parse_explicit_single_phrase_add, parse_literal_phrase_query
 from ..utils.reading_request import parse_parenthesised_readings
 from ..utils import reply_copy as _reply_copy
@@ -543,7 +545,8 @@ def _strip_command_message_prefixes(message_text: str) -> str:
         if stripped == text:
             break
         text = stripped
-    return strip_add_command_modifier(text)
+    source = strip_add_command_modifier(text)
+    return normalize_glued_add_code(source) or source
 
 
 _EXECUTION_QUESTION_SUFFIX_RE = re.compile(

@@ -84,6 +84,7 @@ from ..utils.candidate_inventory import select_candidate_inventory, protected_ca
 from ..utils.commonness_copy import candidate_commonness_comparisons_copy, render_commonness_summary
 from ..utils.explicit_code import (
     ExplicitEntryCodeRequest,
+    glued_add_code_operands,
     parse_explicit_code_request,
     parse_explicit_entry_code_request,
     validate_explicit_code,
@@ -14883,6 +14884,33 @@ async def prepare_fresh_entry_code_selection(
         request, message, platform, user_id, conv_key, space_key, owner_label,
         prepare_only=prepare_only,
     )
+
+
+async def resolve_glued_add_code(source: str, platform: str, user_id: str) -> tuple[str, str]:
+    operands = glued_add_code_operands(source)
+    if operands is None:
+        return source, ""
+    full_word, rest, code, submit = operands
+
+    async def matches(word: str) -> bool | None:
+        try:
+            data = json.loads(await call_tool_function(
+                "keytao_encode", {"word": word, "requested_code": code}, platform, user_id,
+            ))
+        except Exception:
+            return None
+        if not isinstance(data, dict) or data.get("success") is not True:
+            return None
+        codes = data.get("candidateCodes")
+        if not isinstance(codes, list) or not all(isinstance(value, str) for value in codes):
+            return None
+        return code in codes
+
+    full_matches, rest_matches = await asyncio.gather(matches(full_word), matches(rest))
+    if full_matches is None or rest_matches is None or full_matches == rest_matches:
+        return source, f"你要加的是「{full_word}」还是「{rest}」？"
+    word = full_word if full_matches else rest
+    return f"加词 {word} {code}{submit}", ""
 
 
 async def try_handle_explicit_entry_code_command(

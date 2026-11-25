@@ -67,7 +67,8 @@ from ..utils.draft_mutation_store import (
     get_default_draft_mutation_claim_store,
 )
 from ..utils.draft_reminder import (
-    DraftReminderStore, draft_snapshot_is_current, reminder_confirmation_is_current, reminder_group_cutoff,
+    DraftReminderCursor, DraftReminderPage, DraftReminderStore, draft_snapshot_is_current,
+    reminder_confirmation_is_current, reminder_group_cutoff,
 )
 from ..utils.completed_draft_undo import (
     _operation_rows,
@@ -3560,7 +3561,8 @@ def _draft_reminder_store() -> DraftReminderStore:
 
 async def _list_web_reminder_candidates(
     idle_minutes: int, modified_after: float, exclude_ids: list[str], now: float,
-) -> AsyncIterator[tuple[list[Dict], Optional[float]]]:
+    *, resume_cursor: Optional[DraftReminderCursor] = None,
+) -> AsyncIterator[DraftReminderPage]:
     from ..utils import http_client
 
     page_size, max_pages = 100, 5
@@ -3568,9 +3570,14 @@ async def _list_web_reminder_candidates(
               "modifiedAfter": datetime.fromtimestamp(modified_after, timezone.utc).isoformat()}
     if exclude_ids:
         params["excludeIds"] = ",".join(exclude_ids)
+    cursor = resume_cursor
     groups = {}
     group_after = reminder_group_cutoff(now)
     for page in range(max_pages):
+        boundary = None
+        if cursor is not None:
+            params = {**params, "modifiedAfter": cursor.modified_at, "afterId": cursor.batch_id}
+            boundary = (datetime.fromisoformat(cursor.modified_at), cursor.batch_id)
         try:
             payload = await http_client.keytao_json(
                 "GET", "/api/bot/drafts/idle", params=params, timeout=5.0, retries=1,
@@ -3584,8 +3591,8 @@ async def _list_web_reminder_candidates(
             return
         candidates = []
         invalid_rows = False
-        next_after = None
-        for index, row in enumerate(rows[:page_size]):
+        next_cursor = None
+        for row in rows[:page_size]:
             if not isinstance(row, dict):
                 invalid_rows = True
                 continue
@@ -3599,22 +3606,23 @@ async def _list_web_reminder_candidates(
                 invalid_rows = True
                 continue
             last_write = modified.timestamp()
-            if index == page_size - 1 and page + 1 < max_pages and last_write > modified_after:
-                next_after = last_write
-                next_cursor = modified_at
             batch_id = row.get("batchId")
+            if not isinstance(batch_id, str) or not batch_id:
+                invalid_rows = True
+                continue
+            # Legacy servers ignore afterId and return only newer timestamps.
+            if last_write < modified_after or (boundary is not None and (modified, batch_id) <= boundary):
+                continue
             actor = str(row.get("creatorQqId") or "")
             version, count = row.get("contentVersion"), row.get("itemCount")
             if (
-                not isinstance(batch_id, str) or not batch_id
-                or not actor.isascii() or not actor.isdecimal()
+                not actor.isascii() or not actor.isdecimal()
                 or type(version) is not int or version < 0
                 or type(count) is not int or count <= 0
             ):
                 invalid_rows = True
                 continue
-            if last_write < modified_after:
-                continue
+            next_cursor = DraftReminderCursor(modified_at, batch_id)
             if actor not in groups:
                 groups[actor] = history_store.latest_group_for_actor("qq", actor, after=group_after, now=now)
             if groups[actor]:
@@ -3625,11 +3633,14 @@ async def _list_web_reminder_candidates(
                 })
         if invalid_rows:
             logger.warning("[draft_reminder_error] web_list_malformed_rows")
-        yield candidates, next_after
-        if next_after is None:
+        if len(rows) < page_size:
+            yield DraftReminderPage(candidates)
             return
-        modified_after = next_after
-        params = {**params, "modifiedAfter": next_cursor}
+        if next_cursor is None or page + 1 == max_pages:
+            yield DraftReminderPage(candidates, resume_cursor=next_cursor or resume_cursor)
+            return
+        yield DraftReminderPage(candidates, page_end=next_cursor)
+        cursor = next_cursor
 
 
 async def _read_reminder_draft(candidate: Dict) -> Dict:
@@ -5449,7 +5460,14 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
             if await stage(ctx):
                 return True
         return True
-    direct_reply = _ambiguous_draft_cancel_reply(ctx.normalized_message_text) or (
+    source, clarification = await _chat_commands.resolve_glued_add_code(
+        ctx.normalized_message_text, ctx.platform, ctx.user_id,
+    )
+    if source != ctx.normalized_message_text:
+        ctx.normalized_message_text = source
+        _current_turn_message.set(source)
+        ctx.command_intent_cache, ctx.command_intent_for = command_intent_memoizer(ctx.message_text, source)
+    direct_reply = clarification or _ambiguous_draft_cancel_reply(ctx.normalized_message_text) or (
         _chat_routing.explicit_add_sentence_rejection(ctx.normalized_message_text)
     )
     if direct_reply:

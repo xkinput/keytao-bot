@@ -221,22 +221,74 @@ class DraftReminderTests(DraftReminderFixture):
         self.assertEqual(["old-2", BATCH], [call.args[0]["batch_id"] for call in self.read.await_args_list])
         first, second = [call.kwargs["params"] for call in web.await_args_list]
         self.assertEqual((100, "already-asked"), (first["limit"], first["excludeIds"]))
-        self.assertEqual({**first, "modifiedAfter": rows[99]["lastModifiedAt"]}, second)
+        self.assertEqual({**first, "modifiedAfter": rows[99]["lastModifiedAt"],
+                          "afterId": rows[99]["batchId"]}, second)
 
-    async def test_web_stops_after_five_full_pages_or_an_askable_page(self):
+    async def test_web_pagination_uses_last_valid_row_before_malformed_tail(self):
+        history = self.group_history(chat.ConversationAddress.group("qq", GROUP, ACTOR))
+        rows = [self.web_row(batchId=f"draft-{i:03d}", creatorQqId="67890") for i in range(98)]
+        malformed = [self.web_row(batchId="draft-098", creatorQqId="bad"), None]
+        web = AsyncMock(side_effect=[
+            {"success": True, "drafts": rows + malformed},
+            {"success": True, "drafts": malformed + [self.web_row()]},
+        ])
+
+        self.assertEqual(1, await self.scan_with_web(web, history))
+        self.assertEqual(BATCH, self.send.await_args.args[0]["batch_id"])
+        second = web.await_args_list[1].kwargs["params"]
+        self.assertEqual((rows[-1]["lastModifiedAt"], rows[-1]["batchId"]),
+                         (second["modifiedAfter"], second["afterId"]))
+
+    async def test_web_resumes_after_five_full_pages_at_the_same_timestamp_and_resets_at_end(self):
         history = self.group_history(chat.ConversationAddress.group("qq", GROUP, ACTOR))
         rows = [self.web_row(
-            batchId=f"old-{i}", creatorQqId="67890",
-            lastModifiedAt=(NOW - timedelta(seconds=3600 - i)).isoformat(),
-        ) for i in range(600)]
-        pages = [{"success": True, "drafts": rows[i:i + 100]} for i in range(0, 600, 100)]
-        web = AsyncMock(side_effect=pages)
+            batchId=f"draft-{i:04d}", creatorQqId="67890" if i < 500 else ACTOR,
+        ) for i in range(501)]
+
+        async def list_page(*args, params, **kwargs):
+            after = datetime.fromisoformat(params["modifiedAfter"])
+            after_id = params.get("afterId")
+            matching = [
+                row for row in rows
+                if datetime.fromisoformat(row["lastModifiedAt"]) > after
+                or (datetime.fromisoformat(row["lastModifiedAt"]) == after
+                    and after_id is not None and row["batchId"] > after_id)
+            ]
+            return {"success": True, "drafts": matching[:params["limit"]]}
+
+        web = AsyncMock(side_effect=list_page)
         self.assertEqual(0, await self.scan_with_web(web, history))
         self.assertEqual(5, web.await_count)
         self.read.assert_not_awaited()
+        self.assertEqual([None, *(row["batchId"] for row in rows[99:499:100])],
+                         [call.kwargs["params"].get("afterId") for call in web.await_args_list])
 
-        pages[0]["drafts"][0]["creatorQqId"] = ACTOR
-        web = AsyncMock(side_effect=pages)
+        self.store = draft_reminder.DraftReminderStore(self.store.db_path)
+        self.enterContext(patch.object(chat, "_draft_reminder_store", return_value=self.store))
+        web.reset_mock()
+        self.assertEqual(1, await self.scan_with_web(web, history))
+        web.assert_awaited_once()
+        self.assertEqual(rows[499]["batchId"], web.await_args.kwargs["params"]["afterId"])
+        self.assertEqual(rows[500]["batchId"], self.send.await_args.args[0]["batch_id"])
+
+        web.reset_mock()
+        self.assertEqual(0, await self.scan_with_web(web, history))
+        self.assertEqual(5, web.await_count)
+        self.assertNotIn("afterId", web.await_args_list[0].kwargs["params"])
+
+        self.clock += 8 * draft_reminder.DAY_SECONDS
+        web.reset_mock()
+        self.assertEqual(0, await self.scan_with_web(web, history))
+        web.assert_awaited_once()
+        self.assertNotIn("afterId", web.await_args.kwargs["params"])
+        self.assertEqual((NOW + timedelta(days=1)).astimezone(timezone.utc).isoformat(),
+                         web.await_args.kwargs["params"]["modifiedAfter"])
+
+    async def test_web_stops_after_an_askable_full_page(self):
+        history = self.group_history(chat.ConversationAddress.group("qq", GROUP, ACTOR))
+        rows = [self.web_row(batchId=f"draft-{i:04d}", creatorQqId=ACTOR if i == 0 else "67890")
+                for i in range(100)]
+        web = AsyncMock(return_value={"success": True, "drafts": rows})
         self.assertEqual(1, await self.scan_with_web(web, history))
         web.assert_awaited_once()
 

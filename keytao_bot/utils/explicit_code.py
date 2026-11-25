@@ -7,6 +7,17 @@ import unicodedata
 
 from .candidate_inventory import select_candidate_inventory
 from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code, scheme_phonetic_bases
+from .pending_confirmation import ADD_OPERATION_VERB_PATTERN
+from .pinyin_reference import PinyinReferenceUnavailable, query_reference_readings
+
+
+_HAN_WORD = r'[\u3400-\u9fff\U00020000-\U0003134f]{1,32}'
+_GLUED_ADD_CODE_RE = re.compile(
+    rf"(?P<verb>{ADD_OPERATION_VERB_PATTERN})(?P<space>[ \t]*)"
+    rf"(?!{_HAN_WORD}(?:的)?编码(?:改为|[为是])[a-zA-Z])"
+    rf"(?:(?P<label>编码)[ \t]*|(?P<word>{_HAN_WORD}))?"
+    r"(?P<code>[a-zA-Z][a-zA-Z0-9]*)(?P<submit>\s*并提交)?"
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +35,37 @@ class ExplicitEntryCodeRequest:
     pinyin: str = ""
 
 
+def normalize_glued_add_code(source: str) -> str | None:
+    """Normalize spaced commands and keep unresolved operands out of mutation parsing."""
+    match = _GLUED_ADD_CODE_RE.fullmatch(source)
+    if match is None:
+        return source
+    _, space, label, word, code, submit = match.groups()
+    if label or not space:
+        return None
+    if not word:
+        return source
+    return f"加词 {word} {code}{submit or ''}"
+
+
+def glued_add_code_operands(source: str) -> tuple[str, str, str, str] | None:
+    """Return both interpretations of an unseparated add verb and word."""
+    text = unicodedata.normalize("NFKC", source).strip().rstrip("。.!！").strip()
+    match = _GLUED_ADD_CODE_RE.fullmatch(text)
+    if match is None:
+        return None
+    verb, space, _, word, code, submit = match.groups()
+    if space or not word:
+        return None
+    full_word = verb + word
+    try:
+        if query_reference_readings(full_word):
+            return None
+    except PinyinReferenceUnavailable:
+        pass
+    return full_word, word, code.lower(), submit or ""
+
+
 def parse_explicit_entry_code_request(message: str):
     """Bind a complete add-code command to its explicitly named item."""
     from ..harness.authorization_grammar import (
@@ -34,10 +76,10 @@ def parse_explicit_entry_code_request(message: str):
     )
 
     source = unicodedata.normalize("NFKC", message).strip().rstrip("。.!！").strip()
-    source = strip_add_command_modifier(source)
-    if re.match(r"加入\s*编码", source):
+    source = normalize_glued_add_code(strip_add_command_modifier(source))
+    if source is None or re.match(r"加入\s*编码", source):
         return None
-    word = r'[\u3400-\u9fff\U00020000-\U0003134f]{1,32}'
+    word = _HAN_WORD
     code = r'[^\s，,、；;。？?：:「」『』“”\"\']+?'
 
     def operand(pattern):

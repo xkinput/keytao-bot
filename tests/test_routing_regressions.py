@@ -58,6 +58,8 @@ from tests.helpers import (
     ExitStack,
     FakeClient,
     FreshSelectionTests_runtime,
+    FreshSelectionTests_setUp,
+    FreshSelectionTests_tool,
     GeneralReplyTests_reply,
     MODEL_REPLY,
     MemoryConversationStateStore,
@@ -2384,6 +2386,128 @@ class SmallTalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(enforce_conversational_reply("新界面怎么样", "用户体验挺顺手的喵。"), "用户体验挺顺手的喵。")
 
 # Source: test_s70b_query_precedence.py
+class GluedAddCodeTests(unittest.IsolatedAsyncioTestCase):
+    setUp = FreshSelectionTests_setUp
+    runtime = FreshSelectionTests_runtime
+    tool = FreshSelectionTests_tool
+
+    async def turn(self, message):
+        chat = harness.openai_chat_module
+        ctx = chat.TurnContext(
+            bot=object(), event=object(), platform="qq", user_id=self.key.actor_id,
+            message_text=message, conv_key=self.key, space_key=self.key.space_key,
+            memory_context=self.memory, history=[], reply_reference=harness.ReplyReferenceInfo(),
+        )
+        await chat._stage_normalize_message_text(ctx)
+        ctx.command_intent_cache, ctx.command_intent_for = chat.command_intent_memoizer(
+            message, ctx.normalized_message_text,
+        )
+        start = chat.STAGES.index(chat._stage_understand_operation_early)
+        end = chat.STAGES.index(chat._stage_generate_ai_response)
+        for stage in chat.STAGES[start:end + 1]:
+            if await stage(ctx):
+                break
+        return ctx.response
+
+    def test_spaced_operands_keep_existing_emphasis_syntax(self):
+        from keytao_bot.utils.explicit_code import parse_explicit_entry_code_request
+
+        for message in ("强制添加 苕皮ezpk", "加词 苕皮ezpk", "添加 苕皮 ezpk"):
+            with self.subTest(message=message):
+                request = parse_explicit_entry_code_request(message)
+                self.assertEqual(("苕皮", "ezpk"), (request.word, request.code))
+
+    def test_reserved_encoding_operand_is_not_an_entry(self):
+        from keytao_bot.harness.authorization_grammar import explicit_complete_add_item
+        from keytao_bot.utils.explicit_code import parse_explicit_entry_code_request
+
+        for verb in ("添加", "新增", "补", "加入"):
+            for source in (f"{verb}编码ezpk", f"{verb} 编码ezpk", f"{verb}编码 ezpk"):
+                with self.subTest(source=source):
+                    self.assertIsNone(parse_explicit_entry_code_request(source))
+                    self.assertIsNone(explicit_complete_add_item(source))
+
+    async def test_routing_preserves_dictionary_words_and_empty_remainders(self):
+        from keytao_bot.harness.authorization_grammar import explicit_complete_add_item
+
+        chat = harness.openai_chat_module
+        commands = chat._chat_commands
+        for word in ("添加剂", "添加"):
+            with self.subTest(word=word):
+                message = word + "ezpk"
+                with (
+                    self.runtime(),
+                    patch("keytao_bot.utils.explicit_code.query_reference_readings", return_value=["fixture"]),
+                    patch.object(chat, "_classify_message_command_intent", AsyncMock(return_value=chat.MessageCommandIntent())),
+                    patch.object(commands, "call_tool_function", AsyncMock()) as tool,
+                    patch.object(commands, "prepare_fresh_entry_code_selection", AsyncMock(return_value="preview")) as prepare,
+                ):
+                    self.assertEqual("preview", await self.turn(message))
+                tool.assert_not_awaited()
+                prepare.assert_awaited_once()
+                request = prepare.await_args.args[0]
+                self.assertEqual((word, "ezpk"), (request.word, request.code))
+                self.assertIsNone(explicit_complete_add_item(message))
+        self.assertEqual("添加剂", b17_rest_recommended_routing._strip_command_message_prefixes("添加剂"))
+
+    def test_mention_normalizes_to_the_spaced_add_route(self):
+        from keytao_bot.harness.operation_request import understand_message
+
+        normalize = b17_rest_recommended_routing._strip_command_message_prefixes
+        spaced = understand_message(normalize("加词 苕皮ezpk"))
+        for message in ("@喵喵 添加 苕皮ezpk", "强制添加 苕皮ezpk"):
+            with self.subTest(message=message):
+                actual = understand_message(normalize(message))
+                self.assertEqual(("add", ("苕皮",), ("ezpk",)), (actual.op, actual.operands, actual.codes))
+                self.assertEqual(spaced, actual)
+
+    async def test_glued_commands_dispatch_only_the_matching_review_target(self):
+        for message, full, rest, code, target in (
+            ("新增长点xzcd", "新增长点", "长点", "xzcd", "新增长点"),
+            ("补充说明bcsm", "补充说明", "说明", "bcsm", "补充说明"),
+            ("加入书签jrsq", "加入书签", "书签", "jrsq", "加入书签"),
+            ("补钙bg", "补钙", "钙", "bg", "补钙"),
+            ("添加苕皮ezpk", "添加苕皮", "苕皮", "ezpk", "苕皮"),
+            ("@喵喵 强制添加苕皮ezpk", "添加苕皮", "苕皮", "ezpk", "苕皮"),
+        ):
+            with self.subTest(message=message):
+                await self.assert_glued_route(message, full, rest, code, {target: [code]}, target)
+
+    async def test_glued_commands_ask_when_both_neither_or_encoder_unavailable(self):
+        for candidates in ({"补钙": ["bg"], "钙": ["bg"]}, {}, {"补钙": ["bg"], "钙": None}):
+            with self.subTest(candidates=candidates):
+                await self.assert_glued_route("补钙bg", "补钙", "钙", "bg", candidates, None)
+
+    async def assert_glued_route(self, message, full, rest, code, candidates, target):
+        chat = harness.openai_chat_module
+        commands = chat._chat_commands
+        async def encode(name, args, platform, user_id):
+            self.assertEqual("keytao_encode", name)
+            self.assertEqual(("qq", self.key.actor_id), (platform, user_id))
+            codes = candidates.get(args["word"], ["other"])
+            return json.dumps({"success": codes is not None, "candidateCodes": codes})
+
+        with (
+            self.runtime(),
+            patch("keytao_bot.utils.explicit_code.query_reference_readings", return_value=[]),
+            patch.object(chat, "_classify_message_command_intent", AsyncMock(return_value=chat.MessageCommandIntent())) as classifier,
+            patch.object(commands, "call_tool_function", AsyncMock(side_effect=encode)) as tool,
+            patch.object(commands, "_execute_explicit_entry_code_request", AsyncMock(return_value="reviewed")) as execute,
+        ):
+            response = await self.turn(message)
+            if target is None:
+                self.assertEqual(f"你要加的是「{full}」还是「{rest}」？", response)
+                execute.assert_not_awaited()
+                classifier.assert_not_awaited()
+                self.assertIsNone(self.store.get_record(self.key))
+            else:
+                self.assertEqual("reviewed", response)
+                execute.assert_awaited_once()
+                request = execute.await_args.args[0]
+                self.assertEqual((target, code), (request.word, request.code))
+            self.assertCountEqual([full, rest], [call.args[1]["word"] for call in tool.await_args_list])
+
+
 class QueryPrecedenceTests(unittest.IsolatedAsyncioTestCase):
     setUp = SmallTalkTests_setUp
     runtime = FreshSelectionTests_runtime
@@ -2948,6 +3072,7 @@ def load_tests(loader, standard_tests, pattern):
             S57RigEvidenceReviewTests,
             GeneralReplyTests,
             SmallTalkTests,
+            GluedAddCodeTests,
             QueryPrecedenceTests,
             StaleTicketReleaseTests,
             B5DeleteTests,

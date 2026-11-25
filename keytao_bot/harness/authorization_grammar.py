@@ -487,12 +487,14 @@ class _MultiAddAuthorization:
 
 def _parse_complete_add_clause(clause: str) -> Optional[_AuthorizedAddClause]:
     """Parse one closed add command without deriving either target or code."""
+    from ..utils.explicit_code import normalize_glued_add_code
+
     candidate = re.sub(r"\s+", " ", str(clause or "")).strip()
     verb = _MULTI_ADD_VERB_RE.match(candidate)
     if verb is None:
         candidate = _COMMAND_PREFIX_RE.sub("", candidate, count=1).strip()
         verb = _MULTI_ADD_VERB_RE.match(candidate)
-    if verb is None:
+    if verb is None or normalize_glued_add_code(candidate) is None:
         return None
     remainder = candidate[verb.end():].strip()
     remainder = re.sub(

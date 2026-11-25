@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterator, Optional
+from typing import Callable, Dict, Iterator, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 
 
@@ -17,6 +17,20 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 CONFIRMATION_SECONDS = 2 * 60 * 60
 READ_RETRY_SECONDS = 60 * 60
 RECEIPT_COLUMNS = "platform,actor,batch_id,group_id,content_version,status,result_at"
+
+
+class DraftReminderCursor(NamedTuple):
+    modified_at: str
+    batch_id: str
+
+    def timestamp(self) -> float:
+        return datetime.fromisoformat(self.modified_at).timestamp()
+
+
+class DraftReminderPage(NamedTuple):
+    candidates: list[Dict]
+    page_end: Optional[DraftReminderCursor] = None
+    resume_cursor: Optional[DraftReminderCursor] = None
 
 
 def reminder_idle_minutes() -> int:
@@ -109,6 +123,10 @@ def initialize_reminder_schema(connection: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS draft_reminder_account_day ("
         "account_id TEXT NOT NULL, day_start REAL NOT NULL, PRIMARY KEY (day_start, account_id))"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS draft_reminder_web_cursor ("
+        "id INTEGER PRIMARY KEY CHECK (id=1), modified_at TEXT NOT NULL, batch_id TEXT NOT NULL)"
+    )
 
 
 def record_draft_write(
@@ -197,6 +215,33 @@ class DraftReminderStore:
                 "SELECT batch_id FROM draft_reminder_attempt GROUP BY batch_id "
                 "ORDER BY MAX(intended_at) DESC, batch_id DESC LIMIT 200"
             )]
+
+    def _web_cursor(self, modified_after: float) -> Optional[DraftReminderCursor]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT modified_at, batch_id FROM draft_reminder_web_cursor WHERE id=1"
+            ).fetchone()
+        cursor = DraftReminderCursor(*row) if row is not None else None
+        if cursor is not None and cursor.timestamp() < modified_after:
+            self._save_web_cursor(cursor, None)
+            return None
+        return cursor
+
+    def _save_web_cursor(
+        self, previous: Optional[DraftReminderCursor], cursor: Optional[DraftReminderCursor],
+    ) -> None:
+        with self._connect() as connection:
+            if cursor is not None:
+                connection.execute(
+                    "INSERT INTO draft_reminder_web_cursor VALUES (1,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET modified_at=excluded.modified_at, batch_id=excluded.batch_id "
+                    "WHERE modified_at=? AND batch_id=?",
+                    (*cursor, *(previous or ("", ""))),
+                )
+            elif previous is not None:
+                connection.execute(
+                    "DELETE FROM draft_reminder_web_cursor WHERE id=1 AND modified_at=? AND batch_id=?", previous,
+                )
 
     def _bootstrap_existing_writes(self, modified_after: float) -> None:
         """Import at most twenty pre-feature journal records per scan."""
@@ -326,20 +371,29 @@ class DraftReminderStore:
         self._bootstrap_existing_writes(modified_after)
         idle_minutes = reminder_idle_minutes()
         exclude_ids = self._prepare_scan_history(now)
-        pages = list_web_candidates(idle_minutes, modified_after, exclude_ids, now) if list_web_candidates else None
-        web_candidates, page_end = await anext(pages, ([], None)) if pages is not None else ([], None)
+        saved_cursor = self._web_cursor(modified_after) if list_web_candidates else None
+        pages = (
+            list_web_candidates(idle_minutes, modified_after, exclude_ids, now, resume_cursor=saved_cursor)
+            if list_web_candidates else None
+        )
+        page = await anext(pages, None) if pages is not None else None
         accounts = {}
         sent = 0
         checked_batches = set()
         check_limit = 20
         while True:
             web_asked = False
+            web_candidates = page.candidates if page is not None else []
+            page_end = (
+                (page.page_end.timestamp(), page.page_end.batch_id)
+                if page is not None and page.page_end is not None else None
+            )
             check_limit += len(web_candidates)
             for candidate in self._candidates(now, idle_minutes, modified_after, web_candidates):
                 if len(checked_batches) >= check_limit:
                     break
                 # Leave newer local drafts for the next merge to keep oldest-first ordering.
-                if page_end is not None and candidate["last_write"] > page_end:
+                if page_end is not None and (candidate["last_write"], candidate["batch_id"]) > page_end:
                     break
                 batch_id = candidate["batch_id"]
                 if batch_id in checked_batches:
@@ -398,6 +452,11 @@ class DraftReminderStore:
                          *key, candidate["content_version"]),
                     )
             if page_end is None:
+                if (
+                    page is not None and page.resume_cursor != saved_cursor
+                    and (not web_asked or page.resume_cursor is None)
+                ):
+                    self._save_web_cursor(saved_cursor, page.resume_cursor)
                 break
-            web_candidates, page_end = await anext(pages, ([], None)) if not web_asked else ([], None)
+            page = await anext(pages, None) if not web_asked else None
         return sent
