@@ -4170,7 +4170,7 @@ def test_candidate_cards_keep_one_commonness_metric_snapshot():
     assessments = [
         {
             "newWord": "海东青", "occupantWord": "很多钱", "occupantCode": "hdq",
-            "verdict": "behind_more_common", "decisionReason": "dictionary_presence_margin",
+            "verdict": "behind_more_common", "decisionReason": "authority_margin",
             "front": {"reference": {"dictionaryPresenceCount": 6}}, "behind": {},
         },
         {
@@ -9216,12 +9216,12 @@ def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
             "comparisons": [{
                 "success": True,
                 "verdict": "behind_more_common",
-                "decisionReason": "modern_semantic_vs_dictionary_dominated",
-                "summary": "冒菜：现代常用饮食词（语义判断）；茂才：古语，词典收录但语料频次低",
+                "decisionReason": "authority_margin",
+                "summary": "「冒菜」较「茂才」更常用：收录：HSK 3级 vs 无",
             }],
             "evidenceLines": [
                 "「茂才」：词典收录 2，整词语料频次无",
-                "「冒菜」：现代常用饮食词（语义判断）",
+                "「冒菜」：权威收录",
             ],
         }
 
@@ -9320,7 +9320,7 @@ def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
                 prompt is not None
                 and "「冒菜」：权重 101 → 100" in prompt
                 and "「茂才」：权重 100 → 101" in prompt
-                and "现代常用饮食词" in prompt,
+                and "收录：HSK 3级 vs 无" in prompt,
             )
             check(
                 "plan asks for exactly one shared confirmation",
@@ -9969,52 +9969,31 @@ def test_word_list_commonness_uses_list_order_only_for_evidence_ties():
     asyncio.run(_run())
 
 
-def test_word_list_order_never_overrides_conflicting_semantic_evidence():
-    """The user's listed order is not authority when semantic signals conflict."""
-    print("\n🧪 word-list order does not override conflicting semantic evidence")
+def test_word_list_order_never_overrides_conflicting_commonness_evidence():
+    """The user's listed order cannot resolve a cycle of strict comparisons."""
+    print("\n🧪 word-list order does not override conflicting commonness evidence")
 
     async def _run():
         entries = [
             {"word": "甲词", "code": "abcd", "type": "Phrase", "weight": 100},
-            {"word": "乙词", "code": "abcdo", "type": "Phrase", "weight": 100},
+            {"word": "乙词", "code": "abcdo", "type": "Phrase", "weight": 101},
+            {"word": "丙词", "code": "abcdp", "type": "Phrase", "weight": 102},
         ]
-        comparison = {
-            "success": True,
-            "verdict": "close",
-            "front": {"reference": {"attested": True, "dictionaryPresenceCount": 1}},
-            "behind": {"reference": {"attested": True, "dictionaryPresenceCount": 1}},
-        }
-
-        def semantic_override(_review, pair, current):
-            return {
-                **current,
-                "success": True,
-                "verdict": "front_more_common",
-                "decisionReason": "modern_semantic_vs_dictionary_dominated",
-                "frontWord": pair["newWord"],
-                "behindWord": pair["occupantWord"],
-            }
-
-        with (
-            patch.object(
-                keytao_review_module,
-                "compare_word_commonness",
-                AsyncMock(return_value=comparison),
-            ),
-            patch.object(
-                keytao_review_module,
-                "_modern_semantic_commonness_override",
-                side_effect=semantic_override,
-            ),
+        with patch.object(
+            keytao_review_module, "compare_word_commonness",
+            AsyncMock(side_effect=[
+                {"success": True, "verdict": "front_more_common", "decisionReason": "authority_margin"},
+                {"success": True, "verdict": "behind_more_common", "decisionReason": "frequency_ratio"},
+                {"success": True, "verdict": "front_more_common", "decisionReason": "bcc_frequency_ratio"},
+            ]),
         ):
             ranking = await keytao_review_module.rank_code_chain_by_commonness(
                 entries,
-                semantic_review_loader=AsyncMock(return_value={"success": True}),
-                tie_break_words=("甲词", "乙词"),
+                tie_break_words=("甲词", "乙词", "丙词"),
             )
 
         check(
-            "conflicting semantic evidence still asks with a listed order",
+            "conflicting commonness evidence still asks with a listed order",
             ranking.get("status") == "ask"
             and ranking.get("reason") == "conflicting_evidence",
         )
@@ -23802,7 +23781,7 @@ if __name__ == "__main__":
     test_ranked_reorder_planner_accepts_divergent_current_tails()
     test_ranked_reorder_planner_preserves_legacy_code_for_priority_swap()
     test_ranked_reorder_planner_applies_draft_deletes_to_chain_occupancy()
-    test_word_list_order_never_overrides_conflicting_semantic_evidence()
+    test_word_list_order_never_overrides_conflicting_commonness_evidence()
     test_code_chain_reorder_asks_or_noops_without_a_unique_change()
     test_referenced_word_presence_query_uses_referenced_message_not_history()
     test_referenced_word_presence_query_explains_missing_quote_text()

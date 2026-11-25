@@ -5602,9 +5602,9 @@ def test_candidate_commonness_wiring_and_timeout():
     asyncio.run(_run())
 
 
-def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
-    """Only the confident-modern/weak-classical asymmetry overrides baseline."""
-    print("\n🧪 modern semantic vs dictionary-dominated commonness matrix")
+def test_candidate_commonness_protects_occupants_from_authority_alone():
+    """A semantic audit and authority alone cannot take an occupied slot."""
+    print("\n🧪 candidate commonness protects occupants from authority alone")
 
     def review(*, modern=True):
         semantic_items = []
@@ -5657,12 +5657,14 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
         candidate_presence=0,
         occupant_frequency=None,
         occupant_presence=2,
+        reason="baseline",
+        summary="baseline comparison",
     ):
         return {
             "success": True,
             "verdict": verdict,
-            "summary": "baseline comparison",
-            "decisionReason": "baseline",
+            "summary": summary,
+            "decisionReason": reason,
             "front": {"reference": {
                 "available": True,
                 "attested": candidate_frequency is not None or candidate_presence > 0,
@@ -5686,10 +5688,18 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
             return (await review_module.assess_candidate_chain_commonness(subject))[0]
 
     async def _run():
-        archaic_asymmetry = await assess(
-            review(),
-            comparison("behind_more_common", occupant_frequency=None),
+        subject = review()
+        incumbent_summary = "「茂才」较「冒菜」更常用：收录：词典 2 vs 词典 0"
+        incumbent_authority = await assess(
+            subject,
+            comparison("behind_more_common", reason="authority_margin", summary=incumbent_summary),
         )
+        candidate_authority = await assess(
+            subject,
+            comparison("front_more_common", candidate_presence=3, occupant_presence=1,
+                       reason="authority_margin"),
+        )
+        review_module.apply_candidate_ordering_recommendation(subject, [candidate_authority])
         equal_modern = await assess(
             review(),
             comparison(
@@ -5718,13 +5728,18 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
         )
 
         check(
-            "modern food word outranks dictionary-dominated archaic incumbent",
-            archaic_asymmetry.get("verdict") == "front_more_common"
-            and archaic_asymmetry.get("newCode") == "mzch"
-            and archaic_asymmetry.get("decisionReason")
-            == "modern_semantic_vs_dictionary_dominated"
-            and archaic_asymmetry.get("summary")
-            == "冒菜：现代常用饮食词（语义判断）；茂才：古语，词典收录但语料频次低",
+            "semantic evidence keeps the authority-backed incumbent ahead",
+            incumbent_authority.get("verdict") == "behind_more_common"
+            and incumbent_authority.get("newCode") == "mzchi"
+            and incumbent_authority.get("decisionReason") == "authority_margin"
+            and incumbent_authority.get("summary") == incumbent_summary,
+        )
+        check(
+            "authority-backed candidate keeps its free code",
+            candidate_authority.get("verdict") == "not_enough_evidence"
+            and candidate_authority.get("decisionReason") == "modern_frequency_insufficient"
+            and candidate_authority.get("newCode") == "mzchi"
+            and subject.get("recommendedCode") == "mzchi",
         )
         check(
             "equal-modern comparison keeps baseline thresholds",
@@ -5745,71 +5760,49 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
         import keytao_bot.plugins.openai_chat as chat
 
         rendered = chat._format_candidate_ordering_assessment(
-            archaic_asymmetry,
+            incumbent_authority,
             {"mzch": 1, "mzchi": 2},
         )
         admin_note = review_module.build_review_note({"commonnessComparisons": [{
-            "frontWord": "冒菜", "behindWord": "茂才", "code": "mzch", "result": archaic_asymmetry,
+            "frontWord": "冒菜", "behindWord": "茂才", "code": "mzch", "result": incumbent_authority,
         }]})
         check(
-            "ordering controls retain the complete semantic evidence for admins",
-            "冒菜：现代常用饮食词（语义判断）" in admin_note
-            and "茂才：古语，词典收录但语料频次低" in admin_note
-            and "推荐调序：「冒菜」占 mzch，「茂才」顺延" in rendered
-            and "不调序备选编码：mzchi" in rendered,
+            "admin note retains the authority evidence and the candidate has no eviction controls",
+            incumbent_summary in admin_note
+            and "推荐调序" not in (rendered or ""),
         )
 
     asyncio.run(_run())
 
 
-def test_existing_code_chain_commonness_ranking_uses_modern_override_and_asks_on_unknown():
+def test_existing_code_chain_commonness_ranking_uses_authority_and_asks_on_unknown():
     """Existing-chain ranking shares the comparator and fails closed on no evidence."""
     print("\n🧪 existing code-chain commonness ranking")
 
     entries = [
-        {"word": "茂才", "code": "mkdr", "type": "Phrase", "weight": 100},
-        {"word": "冒菜", "code": "mkdr", "type": "Phrase", "weight": 101},
+        {"word": "冒菜", "code": "mkdr", "type": "Phrase", "weight": 100},
+        {"word": "茂才", "code": "mkdr", "type": "Phrase", "weight": 101},
     ]
     baseline = {
         "success": True,
-        "verdict": "front_more_common",
-        "summary": "「茂才」较「冒菜」更常用：词典信号",
-        "decisionReason": "dictionary_presence_margin",
+        "verdict": "behind_more_common",
+        "summary": "「茂才」较「冒菜」更常用：收录：词典 2 vs 词典 0",
+        "decisionReason": "authority_margin",
         "front": {"reference": {
-            "available": True,
-            "attested": True,
-            "corpusFrequency": None,
-            "dictionaryPresenceCount": 2,
-        }},
-        "behind": {"reference": {
             "available": True,
             "attested": False,
             "corpusFrequency": None,
             "dictionaryPresenceCount": 0,
         }},
+        "behind": {"reference": {
+            "available": True,
+            "attested": True,
+            "corpusFrequency": None,
+            "dictionaryPresenceCount": 2,
+        }},
     }
-    modern_review = {
-        "preSubmitAudit": {
-            "semanticContextAutoPassItems": [{
-                "word": "冒菜",
-                "assessment": {
-                    "accepted": True,
-                    "confidence": 0.96,
-                    "meaning": "现代常用饮食词",
-                    "nonObscurity": {
-                        "route": "common_characters_and_llm",
-                        "characterReferences": [
-                            {"corpusFrequency": 5231},
-                            {"corpusFrequency": 8544},
-                        ],
-                    },
-                },
-            }],
-        },
-    }
-
     async def _run():
-        semantic_loader = AsyncMock(return_value=modern_review)
+        semantic_loader = AsyncMock()
         with patch.object(
             review_module,
             "compare_word_commonness",
@@ -5820,20 +5813,19 @@ def test_existing_code_chain_commonness_ranking_uses_modern_override_and_asks_on
                 semantic_review_loader=semantic_loader,
             )
         check(
-            "modern word moves ahead of dictionary-dominated archaic word",
+            "authority-backed entry moves ahead in the existing chain",
             ranked.get("status") == "reorder"
             and [item["word"] for item in ranked.get("proposedOrder", [])]
-            == ["冒菜", "茂才"],
+            == ["茂才", "冒菜"],
         )
         check(
-            "modern override evidence is retained",
+            "authority evidence is retained",
             ranked.get("comparisons", [{}])[0].get("decisionReason")
-            == "modern_semantic_vs_dictionary_dominated",
+            == "authority_margin",
         )
         check(
-            "semantic evidence is loaded only for the possible modern side",
-            semantic_loader.await_count == 1
-            and semantic_loader.await_args.args == ("冒菜",),
+            "semantic reviews are not loaded",
+            semantic_loader.call_count == 0,
         )
 
         with patch.object(
@@ -6670,8 +6662,8 @@ def main():
     test_every_add_branch_carries_the_verdict()
     test_batch_add_uses_structured_verdict_not_prose()
     test_candidate_commonness_wiring_and_timeout()
-    test_modern_semantic_vs_dictionary_dominated_commonness_matrix()
-    test_existing_code_chain_commonness_ranking_uses_modern_override_and_asks_on_unknown()
+    test_candidate_commonness_protects_occupants_from_authority_alone()
+    test_existing_code_chain_commonness_ranking_uses_authority_and_asks_on_unknown()
     test_audit_budget_nesting_and_timeout_retains_review()
     test_multi_sense_agreeing_evidence_recommends_authoritative_reading()
     test_multi_sense_conflicting_evidence_asks_for_clarification()

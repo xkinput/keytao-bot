@@ -47,10 +47,16 @@ def lookup_word_commonness(words: Sequence[str]) -> dict[str, Any]:
     references = {
         word: review._query_commonness_reference(word) for word in normalized
     }
+    standard_words = {
+        word for word in normalized
+        if references[word].get("available") is True
+        and review._authority_standard_level(word, references[word]) is not None
+    }
     known_words = [
         word for word in normalized
         if references[word].get("available") is True
         and (references[word].get("attested") is True
+             or word in standard_words
              or historical_attested(references[word].get('bcc') or {}))
     ]
     comparisons: list[dict[str, Any]] = []
@@ -102,6 +108,7 @@ def lookup_word_commonness(words: Sequence[str]) -> dict[str, Any]:
             "bcc": reference.get("bcc", {}),
             "corpusSource": estimate.get("corpusSource"),
             "dictionaryPresenceCount": reference.get("dictionaryPresenceCount") if known else None,
+            "standardAttested": word in standard_words,
             "partOfSpeech": reference.get("partOfSpeech") if known else None,
             "known": known,
             "referenceAvailable": reference.get("available") is True,

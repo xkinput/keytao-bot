@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
 from . import http_client
-from .commonness_copy import render_commonness_summary, uses_dictionary_presence_frequency
+from .commonness_copy import render_commonness_summary
 from .bcc_reference import (HISTORICAL_CHANNELS, bcc_daily_value, bcc_deciding_channels, bcc_secondary_value,
                             comparison_signal, format_bcc, format_frequency, format_historical,
                             historical_attested, historical_comparison_signal, lookup_bcc)
@@ -101,6 +101,7 @@ COMMONNESS_AUTO_APPROVE_REASONS = (
     "bcc_secondary_channels",
     "frequency_ratio",
     "corpus_attested_with_no_presence_deficit",
+    "authority_margin",  # Chat auto-approval may use authority evidence.
 )
 
 # A context/meaning-backed reading may clear a missing-whole-word-page seal
@@ -5669,6 +5670,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
             "bcc": bcc,
+            "standards": standards,
         }
     else:
         try:
@@ -5949,6 +5951,16 @@ def _commonness_signal_votes(front: Dict, behind: Dict) -> Dict[str, str]:
     return votes
 
 
+def _authority_standard_level(word: str, reference: Dict[str, Any]) -> Optional[int]:
+    standards = reference.get("standards") or {}
+    if standards.get("available") is True:
+        single_char = len(word) == 1
+        level = standards.get("generalLevel" if single_char else "hskLevel")
+        if type(level) is int and 1 <= level <= (3 if single_char else 7):
+            return level
+    return None
+
+
 def _reference_comparison_summary(
     verdict: str,
     front_word: str,
@@ -5956,6 +5968,7 @@ def _reference_comparison_summary(
     front_reference: Dict[str, Any],
     behind_reference: Dict[str, Any],
     reason: str = "",
+    authority_level: Optional[int] = None,
 ) -> str:
     if verdict == "behind_more_common":
         front_reference, behind_reference = behind_reference, front_reference
@@ -5966,11 +5979,9 @@ def _reference_comparison_summary(
         f"{front_frequency if front_frequency is not None else '无'} vs "
         f"{behind_frequency if behind_frequency is not None else '无'}"
     )
-    presence_basis = (
-        f"{int(front_reference.get('dictionaryPresenceCount') or 0)} vs "
-        f"{int(behind_reference.get('dictionaryPresenceCount') or 0)}"
-    )
-    basis = f"语料频次 {frequency_basis}，词典收录 {presence_basis}"
+    front_presence = int(front_reference.get("dictionaryPresenceCount") or 0)
+    behind_presence = int(behind_reference.get("dictionaryPresenceCount") or 0)
+    basis = f"语料频次 {frequency_basis}，词典收录 {front_presence} vs {behind_presence}"
     front_bcc = front_reference.get("bcc") or {}
     behind_bcc = behind_reference.get("bcc") or {}
     # Keep each word's strongest decision channel, then fill the second slot.
@@ -6038,10 +6049,16 @@ def _reference_comparison_summary(
             left, right, _ = comparison_signal(front_bcc, behind_bcc)
             basis += f"；所用频次比 {left / right:.2f}×"
     else:
-        # Display only the legacy evidence that contributed to this verdict.
-        if uses_dictionary_presence_frequency(reason):
-            basis = f"词典收录 {presence_basis}"
-        elif verdict in {'front_more_common', 'behind_more_common'} and int(front_reference.get('dictionaryPresenceCount') or 0) < int(behind_reference.get('dictionaryPresenceCount') or 0):
+        if reason == "authority_margin":
+            if authority_level is None:
+                basis = f"收录：词典 {front_presence} vs 词典 {behind_presence}"
+            else:
+                standard = (
+                    f"通用规范{'一二三'[authority_level - 1]}级"
+                    if len(first_word) == 1 else f"HSK {authority_level}级"
+                )
+                basis = f"收录：{standard} vs 无"
+        elif verdict in {'front_more_common', 'behind_more_common'} and front_presence < behind_presence:
             basis = f"语料频次 {frequency_basis}"
         if front_bcc.get('available') and behind_bcc.get('available'):
             if verdict == 'not_enough_evidence':
@@ -6081,6 +6098,7 @@ def _compare_reference_commonness(
     behind_attested = behind_frequency is not None or behind_presence > 0
     verdict = "not_enough_evidence"
     reason = "local_signal_insufficient"
+    authority_level = None
 
     front_bcc = front_reference.get("bcc") or {}
     behind_bcc = behind_reference.get("bcc") or {}
@@ -6132,18 +6150,24 @@ def _compare_reference_commonness(
             verdict = frequency_verdict
             reason = "corpus_attested_with_no_presence_deficit"
 
-    if verdict == "not_enough_evidence" and not both_bcc_attested and reason != "frequency_below_minimum":
+    elif not (front_bcc.get("attested") or behind_bcc.get("attested")):
+        front_level = behind_level = None
+        if ((len(front_word) == 1) == (len(behind_word) == 1)
+                and all((item.get("standards") or {}).get("available") is True
+                        for item in (front_reference, behind_reference))):
+            front_level = _authority_standard_level(front_word, front_reference)
+            behind_level = _authority_standard_level(behind_word, behind_reference)
         presence_delta = front_presence - behind_presence
-        if presence_delta >= COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
-            verdict = "front_more_common"
-            reason = "dictionary_presence_margin"
-        elif presence_delta <= -COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
-            verdict = "behind_more_common"
-            reason = "dictionary_presence_margin"
+        if (front_level is None) != (behind_level is None):
+            authority_level = front_level if front_level is not None else behind_level
+            verdict = "front_more_common" if front_level is not None else "behind_more_common"
+        elif abs(presence_delta) >= COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
+            verdict = "front_more_common" if presence_delta > 0 else "behind_more_common"
+        if verdict != "not_enough_evidence":
+            reason = "authority_margin"
 
     if (verdict in {'not_enough_evidence', 'close'}
-            and front_reference.get('available') and behind_reference.get('available')
-            and abs(front_presence - behind_presence) < COMMONNESS_DICTIONARY_PRESENCE_MARGIN):
+            and front_reference.get('available') and behind_reference.get('available')):
         historical_signal = historical_comparison_signal(front_bcc, behind_bcc)
         if historical_signal is not None:
             left, right, historical_reason = historical_signal
@@ -6154,6 +6178,9 @@ def _compare_reference_commonness(
 
     front = _reference_commonness_result(front_word, front_reference)
     behind = _reference_commonness_result(behind_word, behind_reference)
+    if authority_level is not None:
+        front["authorityFrequency"] = int(verdict == "front_more_common")
+        behind["authorityFrequency"] = int(verdict == "behind_more_common")
     return {
         "success": True,
         "verdict": verdict,
@@ -6166,6 +6193,7 @@ def _compare_reference_commonness(
             front_reference,
             behind_reference,
             reason,
+            authority_level,
         ),
         "scoreDelta": float(front.get("score") or 0) - float(behind.get("score") or 0),
         "decisionReason": reason,
@@ -6304,6 +6332,8 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
             behind_reference,
         )
         if (front_reference.get('attested') or behind_reference.get('attested')
+                or _authority_standard_level(front_word, front_reference) is not None
+                or _authority_standard_level(behind_word, behind_reference) is not None
                 or any(historical_attested(item.get('bcc') or {})
                        for item in (front_reference, behind_reference))
                 or comparison['decisionReason'].startswith('bcc_historical_')):
@@ -6521,108 +6551,21 @@ def apply_candidate_ordering_recommendation(
     return review
 
 
-def _confident_modern_semantic_label(review: Dict, word: str) -> str:
-    """Return a narrow modern-use label from the already-computed audit."""
-    audit = review.get("preSubmitAudit") if isinstance(review, dict) else None
-    if not isinstance(audit, dict):
-        return ""
-    for item in audit.get("semanticContextAutoPassItems") or []:
-        if (
-            not isinstance(item, dict)
-            or str(item.get("word") or "").strip() != word
-        ):
-            continue
-        assessment = item.get("assessment")
-        if not isinstance(assessment, dict):
-            continue
-        non_obscurity = assessment.get("nonObscurity")
-        if not isinstance(non_obscurity, dict):
-            continue
-        references = non_obscurity.get("characterReferences")
-        if (
-            assessment.get("accepted") is not True
-            or float(assessment.get("confidence") or 0.0)
-            < ENTITY_PRONUNCIATION_MIN_CONFIDENCE
-            or non_obscurity.get("route") != "common_characters_and_llm"
-            or not isinstance(references, list)
-            or len(references) != len(word)
-            or not all(
-                isinstance(reference, dict)
-                and isinstance(reference.get("corpusFrequency"), int)
-                and not isinstance(reference.get("corpusFrequency"), bool)
-                and reference["corpusFrequency"]
-                >= SEMANTIC_CONTEXT_CHARACTER_FREQUENCY_MIN_COUNT
-                for reference in references
-            )
-        ):
-            continue
-        meaning = str(assessment.get("meaning") or "").strip()
-        food_markers = ("饮食", "菜品", "小吃", "食物", "餐饮", "火锅")
-        return (
-            "现代常用饮食词"
-            if any(marker in meaning for marker in food_markers)
-            else "现代常用词"
-        )
-    return ""
-
-
-def _side_is_dictionary_dominated(side: Any) -> bool:
-    reference = (
-        side.get("reference")
-        if isinstance(side, dict) and isinstance(side.get("reference"), dict)
-        else {}
-    )
-    frequency = reference.get("corpusFrequency")
-    return bool(
-        int(reference.get("dictionaryPresenceCount") or 0) > 0
-        and (
-            frequency is None
-            or (
-                isinstance(frequency, int)
-                and not isinstance(frequency, bool)
-                and frequency < COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT
-            )
-        )
-    )
-
-
-def _modern_semantic_commonness_override(
-    review: Dict,
-    pair: Dict[str, str],
-    comparison: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Correct only confident-modern vs dictionary-dominated asymmetry.
-
-    Equal-class comparisons and any incumbent with a modern corpus frequency
-    at or above the established single-word floor stay on the existing
-    comparator unchanged.
-    """
-    label = _confident_modern_semantic_label(review, pair["newWord"])
-    dictionary_dominated = _side_is_dictionary_dominated(comparison.get("behind"))
-    if not label or not dictionary_dominated:
-        return comparison
-    return {
-        **comparison,
-        "success": True,
-        "verdict": "front_more_common",
-        "summary": (
-            f"{pair['newWord']}：{label}（语义判断）；"
-            f"{pair['occupantWord']}：古语，词典收录但语料频次低"
-        ),
-        "decisionReason": "modern_semantic_vs_dictionary_dominated",
-    }
-
-
 def _assessment_reason_policy(comparison: Dict, references: Sequence[Any]) -> bool:
     return (
         (comparison.get("verdict") == "not_enough_evidence"
-         or comparison.get("decisionReason") == "dictionary_presence_margin")
+         or comparison.get("decisionReason") == "authority_margin")
         and all(isinstance(item, dict) for item in references)
     )
 
 
 def _assessment_neutralizes_front_win(comparison: Dict, references: Sequence[Any]) -> bool:
-    if comparison.get("verdict") != "front_more_common" or not (
+    if comparison.get("verdict") != "front_more_common":
+        return False
+    # Authority alone cannot take an occupant's slot.
+    if comparison.get("decisionReason") == "authority_margin":
+        return True
+    if not (
         all(isinstance(item, dict) for item in references) or comparison.get("webFallback") is True
     ):
         return False
@@ -6727,14 +6670,7 @@ async def assess_candidate_chain_commonness(
                         ) + "；现代语料频次不足以支持重排，维持现有排序"
                     ),
                 }
-            assessments.append(_candidate_commonness_assessment(
-                pair,
-                _modern_semantic_commonness_override(
-                    review,
-                    pair,
-                    comparison,
-                ),
-            ))
+            assessments.append(_candidate_commonness_assessment(pair, comparison))
     record_commonness_evidence(assessments)
     return assessments
 
@@ -6764,24 +6700,6 @@ async def assess_explicit_code_commonness(
             "phrases": typed_occupants,
         }],
     })
-
-
-def _reverse_commonness_comparison(comparison: Dict[str, Any]) -> Dict[str, Any]:
-    """View one pair comparison from the opposite word order."""
-    verdict = str(comparison.get("verdict") or "not_enough_evidence")
-    reversed_verdict = {
-        "front_more_common": "behind_more_common",
-        "behind_more_common": "front_more_common",
-    }.get(verdict, verdict)
-    return {
-        **comparison,
-        "verdict": reversed_verdict,
-        "frontWord": comparison.get("behindWord"),
-        "behindWord": comparison.get("frontWord"),
-        "front": comparison.get("behind"),
-        "behind": comparison.get("front"),
-        "scoreDelta": -float(comparison.get("scoreDelta") or 0.0),
-    }
 
 
 def _comparison_evidence_line(word: str, value: Any) -> str:
@@ -6815,6 +6733,7 @@ def _commonness_comparison_has_evidence(comparison: Dict[str, Any]) -> bool:
         )
         if (
             reference.get("attested") is True
+            or _authority_standard_level(comparison.get(f"{side_name}Word") or "", reference) is not None
             or historical_attested(reference.get('bcc') or {})
             or reference.get("corpusFrequency") is not None
             or int(reference.get("dictionaryPresenceCount") or 0) > 0
@@ -6853,14 +6772,10 @@ def _stable_commonness_order(
     return ordered if len(ordered) == len(words) else None
 
 
-def _chain_rank_reason_policy(comparison: Dict) -> bool:
-    return comparison.get("decisionReason") == "dictionary_presence_margin"
-
-
 async def rank_code_chain_by_commonness(
     entries: Sequence[Dict[str, Any]],
     *,
-    semantic_review_loader: Optional[Any] = None,
+    semantic_review_loader: Optional[Any] = None,  # Compatibility with existing chat callers.
     tie_break_words: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Rank one server-resolved same-code/type chain conservatively.
@@ -6903,28 +6818,6 @@ async def rank_code_chain_by_commonness(
             "evidenceLines": [],
         }
 
-    review_cache: Dict[str, Dict[str, Any]] = {}
-
-    async def load_review(word: str) -> Dict[str, Any]:
-        if word in review_cache:
-            return review_cache[word]
-        if semantic_review_loader is None:
-            review_cache[word] = {}
-            return {}
-        try:
-            loaded = await semantic_review_loader(word)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.warning(
-                "Code-chain semantic review failed for %s: %s",
-                word,
-                error,
-            )
-            loaded = {}
-        review_cache[word] = loaded if isinstance(loaded, dict) else {}
-        return review_cache[word]
-
     comparisons: List[Dict[str, Any]] = []
     evidence_by_word: Dict[str, str] = {}
     edges: Dict[str, set[str]] = {word: set() for word in words}
@@ -6951,46 +6844,6 @@ async def rank_code_chain_by_commonness(
                 right_word,
                 _comparison_evidence_line(right_word, comparison.get("behind")),
             )
-
-            if _chain_rank_reason_policy(comparison):
-                comparison = {
-                    **comparison,
-                    "verdict": "not_enough_evidence",
-                    "decisionReason": "modern_frequency_insufficient",
-                    "summary": "词典收录数量不足以支持重排，维持现有排序",
-                }
-
-            possible_overrides: List[Dict[str, Any]] = []
-            if _side_is_dictionary_dominated(comparison.get("behind")):
-                left_review = await load_review(left_word)
-                overridden = _modern_semantic_commonness_override(
-                    left_review,
-                    {"newWord": left_word, "occupantWord": right_word},
-                    comparison,
-                )
-                if overridden.get("decisionReason") == "modern_semantic_vs_dictionary_dominated":
-                    possible_overrides.append(overridden)
-            if _side_is_dictionary_dominated(comparison.get("front")):
-                right_review = await load_review(right_word)
-                reversed_override = _modern_semantic_commonness_override(
-                    right_review,
-                    {"newWord": right_word, "occupantWord": left_word},
-                    _reverse_commonness_comparison(comparison),
-                )
-                if reversed_override.get("decisionReason") == "modern_semantic_vs_dictionary_dominated":
-                    possible_overrides.append(
-                        _reverse_commonness_comparison(reversed_override)
-                    )
-            if len(possible_overrides) > 1:
-                return {
-                    "status": "ask",
-                    "reason": "conflicting_evidence",
-                    "currentOrder": normalized,
-                    "comparisons": [*comparisons, *possible_overrides],
-                    "evidenceLines": [evidence_by_word[word] for word in words],
-                }
-            if len(possible_overrides) == 1:
-                comparison = possible_overrides[0]
 
             verdict = str(comparison.get("verdict") or "not_enough_evidence")
             if (
@@ -7028,6 +6881,7 @@ async def rank_code_chain_by_commonness(
                         "evidenceLines": [evidence_by_word[word] for word in words],
                     }
                 continue
+            # Chat can use authority evidence to reorder an existing chain.
             winner, loser = (
                 (left_word, right_word)
                 if verdict == "front_more_common"

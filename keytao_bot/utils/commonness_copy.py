@@ -8,7 +8,7 @@ from .bcc_reference import bcc_deciding_channels
 
 
 def render_commonness_summary(assessment: dict) -> str:
-    """The comparator's summary already carries BCC/legacy/semantic evidence."""
+    """The comparator's summary already carries the deciding evidence."""
     summary = str(assessment.get("summary") or "").strip()
     if summary:
         return summary
@@ -29,18 +29,16 @@ def _numeric_commonness_value(value: object):
     return None
 
 
-def uses_dictionary_presence_frequency(reason: str) -> bool:
-    return reason == "dictionary_presence_margin"
-
-
 def _comparison_frequency(commonness: dict, reason: str, web_fallback: bool):
     if web_fallback:
         return _numeric_commonness_value(commonness.get("score"))
     if reason == "bcc_modern_signal_unavailable":
         return None
     reference = commonness.get("reference") or {}
-    if uses_dictionary_presence_frequency(reason):
-        return _numeric_commonness_value(reference.get("dictionaryPresenceCount"))
+    if reason == "authority_margin":
+        return _numeric_commonness_value(
+            commonness.get("authorityFrequency", reference.get("dictionaryPresenceCount"))
+        )
     bcc = commonness.get("bcc") or reference.get("bcc") or {}
     historical = "historical" in reason
     rows = bcc.get("historicalChannels" if historical else "channels") or []
@@ -106,8 +104,6 @@ def _format_comparison_frequency(value: int | float) -> str:
 
 def render_commonness_comparison(assessment: dict) -> str:
     """Show only snapshot values, ordered numerically rather than by verdict."""
-    if assessment.get("decisionReason") == "modern_semantic_vs_dictionary_dominated":
-        return ""
     words = (
         str(assessment.get("newWord") or assessment.get("frontWord") or "").strip(),
         str(assessment.get("occupantWord") or assessment.get("behindWord") or "").strip(),

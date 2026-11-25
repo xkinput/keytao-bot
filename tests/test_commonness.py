@@ -118,7 +118,7 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("需重排", prompt)
         self.assertIn("1,952", assessment["summary"])
 
-    async def test_dictionary_counts_alone_never_reorder(self):
+    async def test_authority_counts_alone_never_displace_a_candidate_occupant(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute("DELETE FROM bcc_frequency")
         subject, assessment, prompt = await self.candidate_review()
@@ -132,7 +132,7 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
             connection.execute("INSERT INTO word_commonness VALUES ('用过', NULL, NULL, 0)")
         comparison = await review.compare_word_commonness("羽衣甘蓝", "用过")
         self.assertEqual(comparison["verdict"], "front_more_common")
-        self.assertEqual(comparison["decisionReason"], "dictionary_presence_margin")
+        self.assertEqual(comparison["decisionReason"], "authority_margin")
         result = lookup_word_commonness(["用过", "羽衣甘蓝"])
         self.assertEqual([row["word"] for row in result["words"]], ["羽衣甘蓝", "用过"])
         subject, assessment, prompt = await self.candidate_review()
@@ -140,7 +140,7 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assessment["verdict"], "not_enough_evidence")
         self.assertNotIn("需重排", prompt)
 
-    async def test_dictionary_counts_alone_cannot_reorder_current_chain(self):
+    async def test_authority_counts_can_reorder_current_chain(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute("DELETE FROM bcc_frequency")
             connection.execute("INSERT INTO word_commonness VALUES ('用过', NULL, NULL, 0)")
@@ -149,11 +149,12 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
             for index, word in enumerate(("用过", "羽衣甘蓝"))
         ]
         result = await review.rank_code_chain_by_commonness(entries)
-        self.assertEqual(result["status"], "ask", result)
+        self.assertEqual(result["status"], "reorder", result)
         self.assertEqual(result["currentOrder"], entries)
+        self.assertEqual(result["proposedOrder"], entries[::-1])
         self.web.assert_not_awaited()
 
-    async def test_dictionary_counts_alone_cannot_approve_css_change(self):
+    async def test_authority_counts_can_approve_css_change(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.executemany("INSERT INTO word_commonness VALUES (?, NULL, NULL, ?)",
                                    [("甲", 3), ("乙", 1)])
@@ -165,15 +166,14 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
             ])
         comparison = result["reviewedWords"]["甲@CSSSingle"]["commonnessComparison"]
         self.assertEqual(comparison["verdict"], "front_more_common")
-        self.assertEqual(comparison["decisionReason"], "dictionary_presence_margin")
-        self.assertFalse(result["autoApprove"], result)
-        self.assertIn("缺少足够的词库审查证据", result["issues"][0])
-        self.assertEqual(result["approvedItems"], [])
+        self.assertEqual(comparison["decisionReason"], "authority_margin")
+        self.assertTrue(result["autoApprove"], result)
+        self.assertIn("声笔笔改词：乙→甲@a", result["approvedItems"][0])
         self.assertEqual(http.errors, [])
         self.assertEqual(http.writes, [])
         self.web.assert_not_awaited()
 
-    async def test_dictionary_counts_alone_cannot_approve_advisory_priority(self):
+    async def test_authority_counts_can_approve_advisory_priority(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.executemany("INSERT INTO word_commonness VALUES (?, NULL, NULL, ?)",
                                    [("甲", 3), ("乙", 1)])
@@ -194,10 +194,8 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["commonnessComparisons"]), 1)
         comparison = result["commonnessComparisons"][0]["result"]
         self.assertEqual(comparison["verdict"], "front_more_common")
-        self.assertEqual(comparison["decisionReason"], "dictionary_presence_margin")
-        self.assertEqual(len(result["approvedItems"]), 2, result)
-        self.assertTrue(all(item.startswith("调码删除原位：") for item in result["approvedItems"]))
-        self.assertFalse(result["autoApprove"], result)
+        self.assertEqual(comparison["decisionReason"], "authority_margin")
+        self.assertTrue(any(item.startswith("顺序调整：") for item in result["approvedItems"]), result)
         self.assertEqual(http.errors, [])
         self.assertEqual(http.writes, [])
         self.web.assert_not_awaited()
@@ -286,7 +284,8 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
             for index, word in enumerate(("甲词", "乙词"))
         ]
         result = await review.rank_code_chain_by_commonness(entries)
-        self.assertEqual(result["status"], "ask", result)
+        self.assertEqual(result["status"], "already_ordered", result)
+        self.assertEqual(result["comparisons"][0]["decisionReason"], "authority_margin")
         self.assertEqual(result["currentOrder"], entries)
         self.web.assert_not_awaited()
 
@@ -596,7 +595,8 @@ class CommonnessEvidenceTests(unittest.TestCase):
         self.assertTrue(by_word["词典词"]["known"])
         self.assertIsNone(by_word["词典词"]["corpusFrequency"])
         self.assertIsNone(by_word["未知词"]["dictionaryPresenceCount"])
-        self.assertEqual(result["words"][0]["word"], "词典词")
+        self.assertEqual(result["words"][0]["word"], "语料词")
+        self.assertEqual(result["comparisons"][0]["decisionReason"], "local_signal_insufficient")
 
     def test_zero_frequency_is_invalid_reference_data_not_absence_coerced_to_zero(self):
         self.insert(("零频", 0, "n", 1))
@@ -643,9 +643,15 @@ class CommonnessEvidenceTests(unittest.TestCase):
     def test_conflicting_evidence_retains_all_rows_without_claiming_ranks(self):
         self.insert(("语料领先", 100, "n", 0), ("两类收录", 50, "n", 3),
                     ("词典领先", None, None, 3))
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            create_schema(connection)
+            connection.executemany("INSERT INTO bcc_dataset VALUES (?, ?, 'word', ?, ?, ?, 1, 1, 1000, 1000000)",
+                                   [(channel, channel, "fixture", "fixture", "fixture") for channel in CHANNELS])
+        seed_historical(self.path, counts={"语料领先": (1, 80), "词典领先": (50, 1)})
         words = ["语料领先", "两类收录", "词典领先", "未知词"]
         result = lookup_word_commonness(words)
         self.assertEqual(result["ordering"], "conflicting_evidence")
+        self.assertEqual(result["comparisons"][1]["decisionReason"], "bcc_historical_classical_frequency_ratio")
         self.assertEqual([row["word"] for row in result["words"]], words)
         self.assertTrue(all(row["rank"] is None for row in result["words"]))
         self.assertTrue(all(row["verdict"] == "unknown" for row in result["words"]))
@@ -682,7 +688,7 @@ class S59CommonnessRouteTests(unittest.TestCase):
     def test_s59_fixture_scenario_table_affordance_and_delivery_closure(self):
         async def run():
             reply, calls = await self.run_incident()
-            self.assertIn("名次 | 词 | 语料频次 | 词典收录 | 数据收录", reply)
+            self.assertIn("名次 | 词 | 语料频次 | 收录 | 数据收录", reply)
             self.assertIn("1 | 伊莎贝拉 | jieba 参考 1,000 | 3", reply)
             self.assertIn("2 | 夜泊 | jieba 参考 400 | 3", reply)
             self.assertIn("3 | 耶博 | jieba 参考 100 | 2", reply)
@@ -974,20 +980,20 @@ class BccCommonnessTests(unittest.TestCase):
         self.assertEqual(result['front']['bcc']['channels'][0]['count'], 6)
         self.assertEqual(result['front']['reference']['dictionaryPresenceCount'], 0)
 
-    def test_review_reproductions_preserve_dictionary_and_jieba_fallback(self):
+    def test_one_sided_bcc_blocks_authority_fallback(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.executemany('INSERT OR REPLACE INTO word_commonness VALUES (?, ?, ?, ?)',
                 [('户晨风', None, 'nr', 2), ('沃集鲜', 500, 'n', 0)])
-        for word, expected in (('户晨风', 'front_more_common'), ('沃集鲜', 'not_enough_evidence')):
+        for word in ('户晨风', '沃集鲜'):
             with self.subTest(word=word):
                 result = asyncio.run(review.compare_word_commonness(word, '一一化'))
-                self.assertEqual(result['verdict'], expected)
-                self.assertFalse(result['decisionReason'].startswith('bcc_'))
+                self.assertEqual(result['verdict'], 'not_enough_evidence')
+                self.assertEqual(result['decisionReason'], 'local_signal_insufficient')
                 inverse = asyncio.run(review.compare_word_commonness('一一化', word))
                 self.assertNotEqual(inverse['verdict'], 'front_more_common')
                 self.assertIsNone(result['front']['bcc']['perMillion'])
 
-    def test_one_sided_bcc_preserves_the_complete_legacy_decision(self):
+    def test_one_sided_bcc_preserves_jieba_decisions(self):
         hit = review._query_commonness_reference('一一化')['bcc']
         absent = review._query_commonness_reference('户晨风')['bcc']
         for frequencies, presences in product(product((None, 8, 10, 500), repeat=2), product(range(4), repeat=2)):
@@ -995,6 +1001,8 @@ class BccCommonnessTests(unittest.TestCase):
                            corpusFrequency=frequency, dictionaryPresenceCount=presence)
                       for frequency, presence in zip(frequencies, presences)]
             expected = review._compare_reference_commonness('甲词', '乙词', *legacy)
+            if expected['decisionReason'] == 'authority_margin':
+                expected = {'verdict': 'not_enough_evidence', 'decisionReason': 'local_signal_insufficient'}
             for bccs in ((hit, absent), (absent, hit)):
                 with self.subTest(frequencies=frequencies, presences=presences, hit=bccs[0]['attested']):
                     actual = review._compare_reference_commonness('甲词', '乙词', *[
@@ -1019,27 +1027,20 @@ class BccCommonnessTests(unittest.TestCase):
         self.assertIn('最高频道信号相同，采用多领域比较', result['summary'])
         self.assertIn('前 10.00% vs 前 50.00%', result['summary'])
 
-    def test_bcc_attestation_does_not_block_either_semantic_override_entry(self):
+    def test_chain_keeps_bcc_decisions_without_semantic_loading(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute("INSERT INTO word_commonness VALUES ('一一化', NULL, 'n', 2)")
-        semantic = {'preSubmitAudit': {'semanticContextAutoPassItems': [{
-            'word': '情报所', 'assessment': {'accepted': True, 'confidence': 0.99,
-                'meaning': 'fixture modern use', 'nonObscurity': {
-                    'route': 'common_characters_and_llm',
-                    'characterReferences': [{'corpusFrequency': 10000}] * 3}}}]}}
-        pair = {'newWord': '情报所', 'occupantWord': '一一化'}
-        comparison = asyncio.run(review.compare_word_commonness('情报所', '一一化'))
-        self.assertTrue(comparison['decisionReason'].startswith('bcc_'))
-        overridden = review._modern_semantic_commonness_override(semantic, pair, comparison)
-        self.assertEqual(overridden['decisionReason'], 'modern_semantic_vs_dictionary_dominated')
         for words in (('一一化', '情报所'), ('情报所', '一一化')):
-            loader = AsyncMock(side_effect=lambda word: semantic if word == '情报所' else {})
+            comparison = asyncio.run(review.compare_word_commonness(*words))
+            self.assertTrue(comparison['decisionReason'].startswith('bcc_'))
+            loader = AsyncMock()
             result = asyncio.run(review.rank_code_chain_by_commonness([
                 {'word': word, 'code': 'qbsi', 'type': 'Phrase', 'weight': index}
                 for index, word in enumerate(words)], semantic_review_loader=loader))
-            self.assertEqual(result['comparisons'][0]['decisionReason'], 'modern_semantic_vs_dictionary_dominated')
-            self.assertEqual(result['proposedOrder'][0]['word'], '情报所')
-            loader.assert_awaited_once_with('情报所')
+            self.assertEqual(result['comparisons'][0], comparison)
+            first = words[1] if comparison['verdict'] == 'behind_more_common' else words[0]
+            self.assertEqual(result['proposedOrder'][0]['word'], first)
+            loader.assert_not_called()
 
     def test_historical_channels_cannot_influence_a_modern_verdict(self):
         before = asyncio.run(review.compare_word_commonness('情报所', '敲不死'))
@@ -1116,26 +1117,21 @@ class BccCommonnessTests(unittest.TestCase):
             '情报所', 'qbsi', [{'word': '敲不死', 'type': 'Phrase'}]))
         self.assertEqual(result[0]['verdict'], 'not_enough_evidence')
 
-    def test_absent_coinage_can_override_bcc_attested_dictionary_occupant(self):
+    def test_absent_coinage_cannot_override_bcc_attested_occupant(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute("INSERT INTO word_commonness VALUES ('一一化', NULL, 'n', 2)")
-        semantic = {'preSubmitAudit': {'semanticContextAutoPassItems': [{
-            'word': '沃集鲜', 'assessment': {'accepted': True, 'confidence': .99,
-                'meaning': 'fixture modern use', 'nonObscurity': {
-                    'route': 'common_characters_and_llm',
-                    'characterReferences': [{'corpusFrequency': 10000}] * 3}}}]}}
         comparison = asyncio.run(review.compare_word_commonness('沃集鲜', '一一化'))
         self.assertFalse(comparison['front']['bcc']['attested'])
         self.assertTrue(comparison['behind']['bcc']['attested'])
-        self.assertEqual(comparison['verdict'], 'behind_more_common')
+        self.assertEqual(comparison['verdict'], 'not_enough_evidence')
         for words in (('沃集鲜', '一一化'), ('一一化', '沃集鲜')):
-            loader = AsyncMock(side_effect=lambda word: semantic if word == '沃集鲜' else {})
+            loader = AsyncMock()
             result = asyncio.run(review.rank_code_chain_by_commonness([
                 {'word': word, 'code': 'wjx', 'type': 'Phrase', 'weight': index}
                 for index, word in enumerate(words)], semantic_review_loader=loader))
-            self.assertEqual(result['proposedOrder'][0]['word'], '沃集鲜')
-            self.assertEqual(result['comparisons'][0]['decisionReason'], 'modern_semantic_vs_dictionary_dominated')
-            loader.assert_awaited_once_with('沃集鲜')
+            self.assertEqual(result['status'], 'ask')
+            self.assertEqual(result['comparisons'][0]['decisionReason'], 'local_signal_insufficient')
+            loader.assert_not_called()
 
 # Source: test_s63_bcc_delivery.py
 class BccDeliveryTests(unittest.TestCase):
@@ -1580,44 +1576,20 @@ class CommonnessRenderTests(unittest.TestCase):
                     }),
                 )
 
-    def test_modern_semantic_override_omits_contradictory_frequency_comparison(self):
+    def test_standard_authority_keeps_numeric_comparison_and_textual_summary(self):
         pair = {
             "newWord": "新词", "occupantWord": "旧词",
             "occupantCode": "qbs", "freeCode": "qbso",
         }
-        semantic = {"preSubmitAudit": {"semanticContextAutoPassItems": [{
-            "word": "新词", "assessment": {
-                "accepted": True, "confidence": 0.99, "meaning": "现代用语",
-                "nonObscurity": {
-                    "route": "common_characters_and_llm",
-                    "characterReferences": [{"corpusFrequency": 10000}] * 2,
-                },
-            },
-        }]}}
-        comparison = review._modern_semantic_commonness_override(semantic, pair, {
-            "frontWord": "新词", "behindWord": "旧词",
-            "front": {"reference": {"corpusFrequency": None}},
-            "behind": {
-                "reference": {"dictionaryPresenceCount": 2, "corpusFrequency": None},
-                "bcc": {"channels": [{"channel": "文学", "count": 50, "perMillion": 1}]},
-            },
-        })
+        known = {"standards": {"available": True, "hskLevel": 3}, "dictionaryPresenceCount": 0}
+        other = {"standards": {"available": True, "hskLevel": None}, "dictionaryPresenceCount": 3}
+        comparison = review._compare_reference_commonness("新词", "旧词", other, known)
         assessment = review._candidate_commonness_assessment(pair, comparison)
-        self.assertEqual("front_more_common", assessment["verdict"])
-        self.assertEqual("modern_semantic_vs_dictionary_dominated", assessment["decisionReason"])
-        self.assertEqual(("", "50"), (assessment["frontFrequency"], assessment["behindFrequency"]))
-        self.assertIn("（语义判断）", assessment["summary"])
-        for include_controls in (False, True):
-            with self.subTest(include_controls=include_controls):
-                rendered = pending.front_insert_recommendation_copy(
-                    assessment, include_controls=include_controls,
-                )
-                self.assertIn("「新词」占 qbs", rendered)
-                self.assertIn("「旧词」顺延", rendered)
-                self.assertNotIn("词频：", rendered)
+        self.assertEqual("authority_margin", assessment["decisionReason"])
+        self.assertEqual(("0", "1"), (assessment["frontFrequency"], assessment["behindFrequency"]))
+        self.assertIn("收录：HSK 3级 vs 无", assessment["summary"])
         for snapshot in (comparison, assessment):
-            self.assertEqual("", commonness_copy.render_commonness_comparison(snapshot))
-            self.assertEqual("", commonness_copy.candidate_commonness_summary_copy(snapshot))
+            self.assertEqual("旧词 1 > 新词 0", commonness_copy.render_commonness_comparison(snapshot))
 
     def test_compact_absence_equal_values_and_invalid_numbers(self):
         assessment = {"newWord": "甲词", "occupantWord": "乙词", "webFallback": True}
@@ -1678,21 +1650,17 @@ class CommonnessRenderTests(unittest.TestCase):
                     self.assertIn("推荐调序：「新词」占 qbs，「旧词」顺延", recommendation)
                     self.assertIn("词频：新词 2 > 旧词 无", recommendation)
 
-    def test_compact_dictionary_margin_uses_presence_instead_of_corpus_counts(self):
+    def test_compact_authority_margin_uses_numeric_dictionary_counts(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.executemany("INSERT INTO word_commonness VALUES (?, ?, NULL, ?)",
-                                   [("新词", None, 3), ("旧词", 40, 0)])
-            connection.execute(
-                "INSERT INTO bcc_frequency SELECT filename, '新词', 3, 0.02, 1 "
-                "FROM bcc_dataset WHERE channel='口语' AND token_type='word'",
-            )
+                                   [("新词", None, 3), ("旧词", None, 0)])
         for first, second, verdict, values in (
             ("新词", "旧词", "front_more_common", ("3", "0")),
             ("旧词", "新词", "behind_more_common", ("0", "3")),
         ):
             with self.subTest(first=first):
                 comparison = self.local_comparison(first, second)
-                self.assertEqual("dictionary_presence_margin", comparison["decisionReason"])
+                self.assertEqual("authority_margin", comparison["decisionReason"])
                 self.assertEqual(verdict, comparison["verdict"])
                 self.assertEqual("词频：新词 3 > 旧词 0",
                                  commonness_copy.candidate_commonness_summary_copy(comparison))
@@ -1956,7 +1924,7 @@ class S67RankingTests(unittest.TestCase):
         for words in (("咽", "嘢"), ("咽", "鎗"), ("之乎", "鎗"), ("敲不死", "空例词")):
             with self.subTest(words=words):
                 text = commonness_query.render_commonness_table(lookup_word_commonness(words))
-                self.assertIn("词典收录 | 数据收录 | 历史补充", text)
+                self.assertIn("收录 | 数据收录 | 历史补充", text)
                 for word in words:
                     status = self.cells(text, word)[4]
                     if word in ("咽", "嘢"):

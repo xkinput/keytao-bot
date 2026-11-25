@@ -73,7 +73,7 @@ def parse_commonness_query(message):
 
 
 def render_commonness_table(result):
-    lines = ["常用度排序（本地语料与词典）", "名次 | 词 | 语料频次 | 词典收录 | 数据收录 | 历史补充"]
+    lines = ["常用度排序（本地语料与词典）", "名次 | 词 | 语料频次 | 收录 | 数据收录 | 历史补充"]
     for row in result["words"]:
         known = row["known"]
         rank = row["rank"] if known and row["rank"] is not None else "—"
@@ -93,6 +93,8 @@ def render_commonness_table(result):
         presence = row["dictionaryPresenceCount"]
         if presence:
             sources.append("词典")
+        if row.get("standardAttested"):
+            sources.append("标准")
         if historical_attested(bcc):
             sources.append("历史 BCC")
         status = "现代 BCC 收录" if modern else (
@@ -102,11 +104,13 @@ def render_commonness_table(result):
         lines.append(f"{rank} | {row['word']} | {frequency} | {presence if presence is not None else '—'} | {status} | {format_historical(bcc)}")
     lines.append(result["orderingNote"] + "词频是语料内计数。")
     lines.append("数据收录仅说明该词的可用来源，不代表两词能否判定高低。")
-    if any((row.get("bcc") or {}).get("available") for row in result["words"]):
+    has_bcc = any((row.get("bcc") or {}).get("available") for row in result["words"])
+    if has_bcc:
         lines.append("BCC 优先比较口语、多领域的最高每百万频次，双方均有主频道数据的字词比较使用表内排名。未收录不代表实际零次，单边 BCC 收录不决定高低。")
-        lines.append("古代汉语、近代汉语不计入现代频次；仅在双方现代四频道均未收录且词典与 jieba 无明确方向时破平。")
-        if len(result["words"]) == 2:
-            lines.extend(render_commonness_summary(item) for item in result["comparisons"])
+    lines.append("双方均无现代 BCC 收录和可用 jieba 频次时比较权威收录；历史 BCC 仅在双方现代四频道均未收录且前述证据未判定时破平。")
+    if len(result["words"]) == 2:
+        lines.extend(render_commonness_summary(item) for item in result["comparisons"]
+                     if has_bcc or item.get("decisionReason") == "authority_margin")
     return "\n".join(lines)
 
 
@@ -154,6 +158,9 @@ async def _placement_commands(words, comparisons, read):
         first, second = comparison["frontWord"], comparison["behindWord"]
         if verdict == "behind_more_common":
             first, second = second, first
+        # Authority alone cannot suggest a new word take an occupied slot.
+        if comparison.get("decisionReason") == "authority_margin" and not slots.get(first):
+            continue
         if first in slots and second in slots:
             shared = {(row["type"], row["code"]) for row in slots[first]} & {
                 (row["type"], row["code"]) for row in slots[second]

@@ -3545,8 +3545,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             server_ordering_assessments=[{
                 "newWord": "载具", "occupantWord": "在距", "occupantCode": "zhjl",
                 "freeCode": "zhjlu", "newCode": "zhjl", "recommendedCode": "zhjl",
-                "verdict": "front_more_common", "decisionReason": "dictionary_presence_margin",
-                "summary": "「载具」较「在距」更常用：语料频次 无 vs 无，词典收录 2 vs 0",
+                "verdict": "front_more_common", "decisionReason": "frequency_ratio",
+                "summary": "「载具」较「在距」更常用：语料频次 12 vs 6，词典收录 2 vs 0",
             }],
             needs_manual_review=False,
         )

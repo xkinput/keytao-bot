@@ -1,0 +1,1205 @@
+{
+  "modern_semantic": {
+    "compare": {
+      "verdict": "behind_more_common",
+      "decisionReason": "corpus_and_dictionary_vs_absent",
+      "summary": "「茂才」较「脆肚」更常用：语料频次 2 vs 无，词典收录 1 vs 0；「茂才」BCC 四个现代频道均未收录；「脆肚」BCC 口语 4（每百万 4）；单边 BCC 收录不决定高低",
+      "comparisonCopy": "茂才 2 > 脆肚 无"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "corpus_and_dictionary_vs_absent",
+      "summary": "「茂才」较「脆肚」更常用：语料频次 2 vs 无，词典收录 1 vs 0；「茂才」BCC 四个现代频道均未收录；「脆肚」BCC 口语 4（每百万 4）；单边 BCC 收录不决定高低",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "茂才 2 > 脆肚 无"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "behind_more_common",
+      "decisionReason": "corpus_and_dictionary_vs_absent",
+      "summary": "「茂才」较「脆肚」更常用：语料频次 2 vs 无，词典收录 1 vs 0；「茂才」BCC 四个现代频道均未收录；「脆肚」BCC 口语 4（每百万 4）；单边 BCC 收录不决定高低",
+      "status": "reorder",
+      "proposedOrder": [
+        "茂才",
+        "脆肚"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "behind_more_common",
+      "decisionReason": "corpus_and_dictionary_vs_absent",
+      "summary": "「茂才」较「脆肚」更常用：语料频次 2 vs 无，词典收录 1 vs 0；「茂才」BCC 四个现代频道均未收录；「脆肚」BCC 口语 4（每百万 4）；单边 BCC 收录不决定高低",
+      "status": "reorder",
+      "proposedOrder": [
+        "茂才",
+        "脆肚"
+      ]
+    },
+    "cssChange": {
+      "verdict": "behind_more_common",
+      "decisionReason": "corpus_and_dictionary_vs_absent",
+      "summary": "「茂才」较「脆肚」更常用：语料频次 2 vs 无，词典收录 1 vs 0；「茂才」BCC 四个现代频道均未收录；「脆肚」BCC 口语 4（每百万 4）；单边 BCC 收录不决定高低",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "behind_more_common",
+      "decisionReason": "corpus_and_dictionary_vs_absent",
+      "summary": "「茂才」较「脆肚」更常用：语料频次 2 vs 无，词典收录 1 vs 0；「茂才」BCC 四个现代频道均未收录；「脆肚」BCC 口语 4（每百万 4）；单边 BCC 收录不决定高低",
+      "status": "without_priority_approval"
+    }
+  },
+  "dictionary_margin_front": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "词典甲 3 > 词典乙 1"
+    },
+    "assessment": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "modern_frequency_insufficient",
+      "summary": "常用度信号不足：「词典甲」BCC 四个现代频道均未收录；「词典乙」BCC 四个现代频道均未收录；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）；现代语料频次不足以支持重排，维持现有排序",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": ""
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "词典甲",
+        "词典乙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "词典甲",
+        "词典乙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "pass"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "approved"
+    }
+  },
+  "dictionary_margin_behind": {
+    "compare": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "词典甲 3 > 词典乙 1"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "词典甲 3 > 词典乙 1"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "词典甲",
+        "词典乙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "词典甲",
+        "词典乙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「词典甲」较「词典乙」更常用：收录：词典 3 vs 词典 1；历史补充：「词典甲」暂无可用历史记录；「词典乙」暂无可用历史记录（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "dictionary_margin_incumbent": {
+    "compare": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「词典甲」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「词典甲」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "低频旧词 9 > 词典甲 无"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "incumbent_frequency_vs_absent",
+      "summary": "「低频旧词」较「词典甲」更常用：「词典甲」无语料频次；「低频旧词」语料频次 9；保留现有排序；历史补充：「低频旧词」暂无可用历史记录；「词典甲」暂无可用历史记录（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "低频旧词 9 > 词典甲 无"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「词典甲」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「词典甲」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "status": "ask",
+      "proposedOrder": []
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "listed_order_tiebreak",
+      "summary": "常用度信号不足：「词典甲」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「词典甲」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）；证据未拉开差距，保留你列出的相对顺序",
+      "status": "reorder",
+      "proposedOrder": [
+        "低频旧词",
+        "词典甲"
+      ]
+    },
+    "cssChange": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「词典甲」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「词典甲」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「词典甲」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「词典甲」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "incumbent_frequency": {
+    "compare": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「无频新词」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「无频新词」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "低频旧词 9 > 无频新词 无"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "incumbent_frequency_vs_absent",
+      "summary": "「低频旧词」较「无频新词」更常用：「无频新词」无语料频次；「低频旧词」语料频次 9；保留现有排序；历史补充：「低频旧词」暂无可用历史记录；「无频新词」暂无可用历史记录（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "低频旧词 9 > 无频新词 无"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「无频新词」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「无频新词」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "status": "ask",
+      "proposedOrder": []
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "listed_order_tiebreak",
+      "summary": "常用度信号不足：「无频新词」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「无频新词」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）；证据未拉开差距，保留你列出的相对顺序",
+      "status": "reorder",
+      "proposedOrder": [
+        "低频旧词",
+        "无频新词"
+      ]
+    },
+    "cssChange": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「无频新词」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「无频新词」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「无频新词」BCC 四个现代频道均未收录；「低频旧词」BCC 四个现代频道均未收录；历史补充：「无频新词」暂无可用历史记录；「低频旧词」暂无可用历史记录（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "historical": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_historical_classical_frequency_ratio",
+      "summary": "「古词甲」较「古词乙」更常用：现代四频道均未收录，词典与 jieba 无明确方向，按古代汉语频次：「古词甲」80（每百万 8000） vs 「古词乙」5（每百万 500）；仅作历史语料末级破平",
+      "comparisonCopy": "古词甲 8000 > 古词乙 500"
+    },
+    "assessment": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "modern_frequency_insufficient",
+      "summary": "常用度信号不足：「古词甲」BCC 四个现代频道均未收录；「古词乙」BCC 四个现代频道均未收录；历史补充：「古词甲」古代汉语 80（每百万 8000）；「古词乙」古代汉语 5（每百万 500）（未参与判定）；现代语料频次不足以支持重排，维持现有排序",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": ""
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_historical_classical_frequency_ratio",
+      "summary": "「古词甲」较「古词乙」更常用：现代四频道均未收录，词典与 jieba 无明确方向，按古代汉语频次：「古词甲」80（每百万 8000） vs 「古词乙」5（每百万 500）；仅作历史语料末级破平",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "古词甲",
+        "古词乙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_historical_classical_frequency_ratio",
+      "summary": "「古词甲」较「古词乙」更常用：现代四频道均未收录，词典与 jieba 无明确方向，按古代汉语频次：「古词甲」80（每百万 8000） vs 「古词乙」5（每百万 500）；仅作历史语料末级破平",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "古词甲",
+        "古词乙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_historical_classical_frequency_ratio",
+      "summary": "「古词甲」较「古词乙」更常用：现代四频道均未收录，词典与 jieba 无明确方向，按古代汉语频次：「古词甲」80（每百万 8000） vs 「古词乙」5（每百万 500）；仅作历史语料末级破平",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_historical_classical_frequency_ratio",
+      "summary": "「古词甲」较「古词乙」更常用：现代四频道均未收录，词典与 jieba 无明确方向，按古代汉语频次：「古词甲」80（每百万 8000） vs 「古词乙」5（每百万 500）；仅作历史语料末级破平",
+      "status": "without_priority_approval"
+    }
+  },
+  "news_over_spoken_and_balanced": {
+    "compare": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「文学乙」较「新闻甲」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；所用频次比 1.29×",
+      "comparisonCopy": "文学乙 9 > 新闻甲 7"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「文学乙」较「新闻甲」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；所用频次比 1.29×",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "文学乙 9 > 新闻甲 7"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「文学乙」较「新闻甲」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；所用频次比 1.29×",
+      "status": "reorder",
+      "proposedOrder": [
+        "文学乙",
+        "新闻甲"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「文学乙」较「新闻甲」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；所用频次比 1.29×",
+      "status": "reorder",
+      "proposedOrder": [
+        "文学乙",
+        "新闻甲"
+      ]
+    },
+    "cssChange": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「文学乙」较「新闻甲」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；所用频次比 1.29×",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「文学乙」较「新闻甲」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；所用频次比 1.29×",
+      "status": "without_priority_approval"
+    }
+  },
+  "literature_only": {
+    "compare": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「文学乙」较「文学丙」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "comparisonCopy": "文学乙 9 > 文学丙 无"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「文学乙」较「文学丙」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "文学乙 9 > 文学丙 无"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「文学乙」较「文学丙」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "reorder",
+      "proposedOrder": [
+        "文学乙",
+        "文学丙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「文学乙」较「文学丙」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "reorder",
+      "proposedOrder": [
+        "文学乙",
+        "文学丙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「文学乙」较「文学丙」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "behind_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「文学乙」较「文学丙」更常用：「文学乙」BCC 多领域 8（每百万 8）；口语 9（每百万 9）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "without_priority_approval"
+    }
+  },
+  "char_vs_word": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_relative_rank_ratio",
+      "summary": "「语」较「新闻甲」更常用：「语」BCC 多领域 2（每百万 2）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；按各自字/词表内排名比较：前 0.80% vs 前 12.00%（越小越靠前）",
+      "comparisonCopy": "语 125 > 新闻甲 8.3334"
+    },
+    "assessment": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_relative_rank_ratio",
+      "summary": "「语」较「新闻甲」更常用：「语」BCC 多领域 2（每百万 2）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；按各自字/词表内排名比较：前 0.80% vs 前 12.00%（越小越靠前）",
+      "recommendedCode": "abcd",
+      "comparisonCopy": "语 125 > 新闻甲 8.3334"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcd",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_relative_rank_ratio",
+      "summary": "「语」较「新闻甲」更常用：「语」BCC 多领域 2（每百万 2）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；按各自字/词表内排名比较：前 0.80% vs 前 12.00%（越小越靠前）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "语",
+        "新闻甲"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_relative_rank_ratio",
+      "summary": "「语」较「新闻甲」更常用：「语」BCC 多领域 2（每百万 2）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；按各自字/词表内排名比较：前 0.80% vs 前 12.00%（越小越靠前）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "语",
+        "新闻甲"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_relative_rank_ratio",
+      "summary": "「语」较「新闻甲」更常用：「语」BCC 多领域 2（每百万 2）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；按各自字/词表内排名比较：前 0.80% vs 前 12.00%（越小越靠前）",
+      "status": "pass"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_relative_rank_ratio",
+      "summary": "「语」较「新闻甲」更常用：「语」BCC 多领域 2（每百万 2）；「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；按各自字/词表内排名比较：前 0.80% vs 前 12.00%（越小越靠前）",
+      "status": "approved"
+    }
+  },
+  "unattested_both_with_historical_supplement": {
+    "compare": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「注甲」BCC 四个现代频道均未收录；「注乙」BCC 四个现代频道均未收录；历史补充：「注甲」古代汉语 1（每百万 100）；「注乙」古代汉语 未收录（未参与判定）",
+      "comparisonCopy": ""
+    },
+    "assessment": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「注甲」BCC 四个现代频道均未收录；「注乙」BCC 四个现代频道均未收录；历史补充：「注甲」古代汉语 1（每百万 100）；「注乙」古代汉语 未收录（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": ""
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「注甲」BCC 四个现代频道均未收录；「注乙」BCC 四个现代频道均未收录；历史补充：「注甲」古代汉语 1（每百万 100）；「注乙」古代汉语 未收录（未参与判定）",
+      "status": "ask",
+      "proposedOrder": []
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "listed_order_tiebreak",
+      "summary": "常用度信号不足：「注甲」BCC 四个现代频道均未收录；「注乙」BCC 四个现代频道均未收录；历史补充：「注甲」古代汉语 1（每百万 100）；「注乙」古代汉语 未收录（未参与判定）；证据未拉开差距，保留你列出的相对顺序",
+      "status": "reorder",
+      "proposedOrder": [
+        "注乙",
+        "注甲"
+      ]
+    },
+    "cssChange": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「注甲」BCC 四个现代频道均未收录；「注乙」BCC 四个现代频道均未收录；历史补充：「注甲」古代汉语 1（每百万 100）；「注乙」古代汉语 未收录（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「注甲」BCC 四个现代频道均未收录；「注乙」BCC 四个现代频道均未收录；历史补充：「注甲」古代汉语 1（每百万 100）；「注乙」古代汉语 未收录（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "balanced_exact_tie": {
+    "compare": {
+      "verdict": "close",
+      "decisionReason": "bcc_frequency_ratio_below_threshold",
+      "summary": "「平词甲」与「平词乙」常用度接近：「平词甲」BCC 多领域 7（每百万 7）；「平词乙」BCC 多领域 7（每百万 7）；所用频次比 1.00×",
+      "comparisonCopy": "平词甲 7 = 平词乙 7"
+    },
+    "assessment": {
+      "verdict": "close",
+      "decisionReason": "bcc_frequency_ratio_below_threshold",
+      "summary": "「平词甲」与「平词乙」常用度接近：「平词甲」BCC 多领域 7（每百万 7）；「平词乙」BCC 多领域 7（每百万 7）；所用频次比 1.00×",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "平词甲 7 = 平词乙 7"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "close",
+      "decisionReason": "bcc_frequency_ratio_below_threshold",
+      "summary": "「平词甲」与「平词乙」常用度接近：「平词甲」BCC 多领域 7（每百万 7）；「平词乙」BCC 多领域 7（每百万 7）；所用频次比 1.00×",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "平词甲",
+        "平词乙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "bcc_frequency_ratio_below_threshold",
+      "summary": "「平词甲」与「平词乙」常用度接近：「平词甲」BCC 多领域 7（每百万 7）；「平词乙」BCC 多领域 7（每百万 7）；所用频次比 1.00×",
+      "status": "reorder",
+      "proposedOrder": [
+        "平词乙",
+        "平词甲"
+      ]
+    },
+    "cssChange": {
+      "verdict": "close",
+      "decisionReason": "bcc_frequency_ratio_below_threshold",
+      "summary": "「平词甲」与「平词乙」常用度接近：「平词甲」BCC 多领域 7（每百万 7）；「平词乙」BCC 多领域 7（每百万 7）；所用频次比 1.00×",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "close",
+      "decisionReason": "bcc_frequency_ratio_below_threshold",
+      "summary": "「平词甲」与「平词乙」常用度接近：「平词甲」BCC 多领域 7（每百万 7）；「平词乙」BCC 多领域 7（每百万 7）；所用频次比 1.00×",
+      "status": "without_priority_approval"
+    }
+  },
+  "balanced_breaks_peak_tie": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「平词甲」较「平词丙」更常用：「平词甲」BCC 多领域 7（每百万 7）；「平词丙」BCC 多领域 2（每百万 2）；所用频次比 3.50×",
+      "comparisonCopy": "平词甲 7 > 平词丙 2"
+    },
+    "assessment": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「平词甲」较「平词丙」更常用：「平词甲」BCC 多领域 7（每百万 7）；「平词丙」BCC 多领域 2（每百万 2）；所用频次比 3.50×",
+      "recommendedCode": "abcd",
+      "comparisonCopy": "平词甲 7 > 平词丙 2"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcd",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「平词甲」较「平词丙」更常用：「平词甲」BCC 多领域 7（每百万 7）；「平词丙」BCC 多领域 2（每百万 2）；所用频次比 3.50×",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "平词甲",
+        "平词丙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「平词甲」较「平词丙」更常用：「平词甲」BCC 多领域 7（每百万 7）；「平词丙」BCC 多领域 2（每百万 2）；所用频次比 3.50×",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "平词甲",
+        "平词丙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「平词甲」较「平词丙」更常用：「平词甲」BCC 多领域 7（每百万 7）；「平词丙」BCC 多领域 2（每百万 2）；所用频次比 3.50×",
+      "status": "pass"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_frequency_ratio",
+      "summary": "「平词甲」较「平词丙」更常用：「平词甲」BCC 多领域 7（每百万 7）；「平词丙」BCC 多领域 2（每百万 2）；所用频次比 3.50×",
+      "status": "approved"
+    }
+  },
+  "primary_one_sided": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「新闻甲」较「文学丙」更常用：「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "comparisonCopy": "新闻甲 7 > 文学丙 无"
+    },
+    "assessment": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「新闻甲」较「文学丙」更常用：「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "recommendedCode": "abcd",
+      "comparisonCopy": "新闻甲 7 > 文学丙 无"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcd",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「新闻甲」较「文学丙」更常用：「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "新闻甲",
+        "文学丙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「新闻甲」较「文学丙」更常用：「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "新闻甲",
+        "文学丙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「新闻甲」较「文学丙」更常用：「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "pass"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_primary_one_sided",
+      "summary": "「新闻甲」较「文学丙」更常用：「新闻甲」BCC 多领域 5（每百万 5）；口语 7（每百万 7）；「文学丙」仅见于新闻或文学，优先按口语和多领域判定",
+      "status": "approved"
+    }
+  },
+  "secondary_only_pair": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_secondary_channels",
+      "summary": "「副词甲」较「副词乙」更常用：「副词甲」BCC 新闻 40（每百万 40）；文学 2（每百万 2）；「副词乙」BCC 新闻 5（每百万 5）；文学 20（每百万 20）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 2.00×",
+      "comparisonCopy": "副词甲 40 > 副词乙 20"
+    },
+    "assessment": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_secondary_channels",
+      "summary": "「副词甲」较「副词乙」更常用：「副词甲」BCC 新闻 40（每百万 40）；文学 2（每百万 2）；「副词乙」BCC 新闻 5（每百万 5）；文学 20（每百万 20）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 2.00×",
+      "recommendedCode": "abcd",
+      "comparisonCopy": "副词甲 40 > 副词乙 20"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcd",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_secondary_channels",
+      "summary": "「副词甲」较「副词乙」更常用：「副词甲」BCC 新闻 40（每百万 40）；文学 2（每百万 2）；「副词乙」BCC 新闻 5（每百万 5）；文学 20（每百万 20）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 2.00×",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "副词甲",
+        "副词乙"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_secondary_channels",
+      "summary": "「副词甲」较「副词乙」更常用：「副词甲」BCC 新闻 40（每百万 40）；文学 2（每百万 2）；「副词乙」BCC 新闻 5（每百万 5）；文学 20（每百万 20）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 2.00×",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "副词甲",
+        "副词乙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_secondary_channels",
+      "summary": "「副词甲」较「副词乙」更常用：「副词甲」BCC 新闻 40（每百万 40）；文学 2（每百万 2）；「副词乙」BCC 新闻 5（每百万 5）；文学 20（每百万 20）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 2.00×",
+      "status": "pass"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "bcc_secondary_channels",
+      "summary": "「副词甲」较「副词乙」更常用：「副词甲」BCC 新闻 40（每百万 40）；文学 2（每百万 2）；「副词乙」BCC 新闻 5（每百万 5）；文学 20（每百万 20）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 2.00×",
+      "status": "approved"
+    }
+  },
+  "secondary_only_cross_type": {
+    "compare": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "bcc_modern_signal_unavailable",
+      "summary": "常用度信号不足：现代 BCC 双方均有收录，缺少可比较的频道频次或字／词表内排名",
+      "comparisonCopy": ""
+    },
+    "assessment": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "bcc_modern_signal_unavailable",
+      "summary": "常用度信号不足：现代 BCC 双方均有收录，缺少可比较的频道频次或字／词表内排名",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": ""
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "bcc_modern_signal_unavailable",
+      "summary": "常用度信号不足：现代 BCC 双方均有收录，缺少可比较的频道频次或字／词表内排名",
+      "status": "ask",
+      "proposedOrder": []
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "listed_order_tiebreak",
+      "summary": "常用度信号不足：现代 BCC 双方均有收录，缺少可比较的频道频次或字／词表内排名；证据未拉开差距，保留你列出的相对顺序",
+      "status": "reorder",
+      "proposedOrder": [
+        "副词丙",
+        "副"
+      ]
+    },
+    "cssChange": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "bcc_modern_signal_unavailable",
+      "summary": "常用度信号不足：现代 BCC 双方均有收录，缺少可比较的频道频次或字／词表内排名",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "bcc_modern_signal_unavailable",
+      "summary": "常用度信号不足：现代 BCC 双方均有收录，缺少可比较的频道频次或字／词表内排名",
+      "status": "without_priority_approval"
+    }
+  },
+  "secondary_only_close": {
+    "compare": {
+      "verdict": "close",
+      "decisionReason": "bcc_secondary_channels_below_threshold",
+      "summary": "「副词丙」与「文学独词」常用度接近：「副词丙」BCC 文学 5（每百万 5）；「文学独词」BCC 文学 5（每百万 5）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 1.00×",
+      "comparisonCopy": "副词丙 5 = 文学独词 5"
+    },
+    "assessment": {
+      "verdict": "close",
+      "decisionReason": "bcc_secondary_channels_below_threshold",
+      "summary": "「副词丙」与「文学独词」常用度接近：「副词丙」BCC 文学 5（每百万 5）；「文学独词」BCC 文学 5（每百万 5）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 1.00×",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "副词丙 5 = 文学独词 5"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "close",
+      "decisionReason": "bcc_secondary_channels_below_threshold",
+      "summary": "「副词丙」与「文学独词」常用度接近：「副词丙」BCC 文学 5（每百万 5）；「文学独词」BCC 文学 5（每百万 5）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 1.00×",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "副词丙",
+        "文学独词"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "bcc_secondary_channels_below_threshold",
+      "summary": "「副词丙」与「文学独词」常用度接近：「副词丙」BCC 文学 5（每百万 5）；「文学独词」BCC 文学 5（每百万 5）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 1.00×",
+      "status": "reorder",
+      "proposedOrder": [
+        "文学独词",
+        "副词丙"
+      ]
+    },
+    "cssChange": {
+      "verdict": "close",
+      "decisionReason": "bcc_secondary_channels_below_threshold",
+      "summary": "「副词丙」与「文学独词」常用度接近：「副词丙」BCC 文学 5（每百万 5）；「文学独词」BCC 文学 5（每百万 5）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 1.00×",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "close",
+      "decisionReason": "bcc_secondary_channels_below_threshold",
+      "summary": "「副词丙」与「文学独词」常用度接近：「副词丙」BCC 文学 5（每百万 5）；「文学独词」BCC 文学 5（每百万 5）；双方在口语和多领域均未收录，采用新闻和文学比较；所用频次比 1.00×",
+      "status": "without_priority_approval"
+    }
+  },
+  "authority_tgscc": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱」较「龘」更常用：收录：通用规范一级 vs 无；历史补充：「爱」古代汉语 2（每百万 200）；「龘」古代汉语 80（每百万 8000）（未参与判定）",
+      "comparisonCopy": "爱 1 > 龘 0"
+    },
+    "assessment": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "modern_frequency_insufficient",
+      "summary": "常用度信号不足：「爱」BCC 四个现代频道均未收录；「龘」BCC 四个现代频道均未收录；历史补充：「爱」古代汉语 2（每百万 200）；「龘」古代汉语 80（每百万 8000）（未参与判定）；现代语料频次不足以支持重排，维持现有排序",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": ""
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱」较「龘」更常用：收录：通用规范一级 vs 无；历史补充：「爱」古代汉语 2（每百万 200）；「龘」古代汉语 80（每百万 8000）（未参与判定）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "爱",
+        "龘"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱」较「龘」更常用：收录：通用规范一级 vs 无；历史补充：「爱」古代汉语 2（每百万 200）；「龘」古代汉语 80（每百万 8000）（未参与判定）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "爱",
+        "龘"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱」较「龘」更常用：收录：通用规范一级 vs 无；历史补充：「爱」古代汉语 2（每百万 200）；「龘」古代汉语 80（每百万 8000）（未参与判定）",
+      "status": "pass"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱」较「龘」更常用：收录：通用规范一级 vs 无；历史补充：「爱」古代汉语 2（每百万 200）；「龘」古代汉语 80（每百万 8000）（未参与判定）",
+      "status": "approved"
+    }
+  },
+  "authority_hsk": {
+    "compare": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱心」较「空白词」更常用：收录：HSK 3级 vs 无；历史补充：「爱心」暂无可用历史记录；「空白词」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "爱心 1 > 空白词 0"
+    },
+    "assessment": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "modern_frequency_insufficient",
+      "summary": "常用度信号不足：「爱心」BCC 四个现代频道均未收录；「空白词」BCC 四个现代频道均未收录；历史补充：「爱心」暂无可用历史记录；「空白词」暂无可用历史记录（未参与判定）；现代语料频次不足以支持重排，维持现有排序",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": ""
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱心」较「空白词」更常用：收录：HSK 3级 vs 无；历史补充：「爱心」暂无可用历史记录；「空白词」暂无可用历史记录（未参与判定）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "爱心",
+        "空白词"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱心」较「空白词」更常用：收录：HSK 3级 vs 无；历史补充：「爱心」暂无可用历史记录；「空白词」暂无可用历史记录（未参与判定）",
+      "status": "already_ordered",
+      "proposedOrder": [
+        "爱心",
+        "空白词"
+      ]
+    },
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱心」较「空白词」更常用：收录：HSK 3级 vs 无；历史补充：「爱心」暂无可用历史记录；「空白词」暂无可用历史记录（未参与判定）",
+      "status": "pass"
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「爱心」较「空白词」更常用：收录：HSK 3级 vs 无；历史补充：「爱心」暂无可用历史记录；「空白词」暂无可用历史记录（未参与判定）",
+      "status": "approved"
+    }
+  },
+  "authority_cross_type": {
+    "compare": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「类词」较「爱」更常用：收录：词典 3 vs 词典 0；历史补充：「类词」古代汉语 未收录；「爱」古代汉语 2（每百万 200）（未参与判定）",
+      "comparisonCopy": "类词 3 > 爱 0"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「类词」较「爱」更常用：收录：词典 3 vs 词典 0；历史补充：「类词」古代汉语 未收录；「爱」古代汉语 2（每百万 200）（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "类词 3 > 爱 0"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「类词」较「爱」更常用：收录：词典 3 vs 词典 0；历史补充：「类词」古代汉语 未收录；「爱」古代汉语 2（每百万 200）（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "类词",
+        "爱"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「类词」较「爱」更常用：收录：词典 3 vs 词典 0；历史补充：「类词」古代汉语 未收录；「爱」古代汉语 2（每百万 200）（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "类词",
+        "爱"
+      ]
+    },
+    "cssChange": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「类词」较「爱」更常用：收录：词典 3 vs 词典 0；历史补充：「类词」古代汉语 未收录；「爱」古代汉语 2（每百万 200）（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「类词」较「爱」更常用：收录：词典 3 vs 词典 0；历史补充：「类词」古代汉语 未收录；「爱」古代汉语 2（每百万 200）（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "authority_standards_unavailable": {
+    "compare": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「缺标乙」较「缺标甲」更常用：收录：词典 3 vs 词典 0；历史补充：「缺标乙」暂无可用历史记录；「缺标甲」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "缺标乙 3 > 缺标甲 0"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「缺标乙」较「缺标甲」更常用：收录：词典 3 vs 词典 0；历史补充：「缺标乙」暂无可用历史记录；「缺标甲」暂无可用历史记录（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "缺标乙 3 > 缺标甲 0"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「缺标乙」较「缺标甲」更常用：收录：词典 3 vs 词典 0；历史补充：「缺标乙」暂无可用历史记录；「缺标甲」暂无可用历史记录（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "缺标乙",
+        "缺标甲"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「缺标乙」较「缺标甲」更常用：收录：词典 3 vs 词典 0；历史补充：「缺标乙」暂无可用历史记录；「缺标甲」暂无可用历史记录（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "缺标乙",
+        "缺标甲"
+      ]
+    },
+    "cssChange": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「缺标乙」较「缺标甲」更常用：收录：词典 3 vs 词典 0；历史补充：「缺标乙」暂无可用历史记录；「缺标甲」暂无可用历史记录（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「缺标乙」较「缺标甲」更常用：收录：词典 3 vs 词典 0；历史补充：「缺标乙」暂无可用历史记录；「缺标甲」暂无可用历史记录（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "authority_one_sided_bcc": {
+    "compare": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "「有标词」BCC 四个现代频道均未收录；「单边词」BCC 文学 2（每百万 2）；单边 BCC 收录不决定高低",
+      "comparisonCopy": "单边词 2 > 有标词 无"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "incumbent_frequency_vs_absent",
+      "summary": "「单边词」较「有标词」更常用：「有标词」无语料频次；「单边词」BCC 文学 2（每百万 2）；保留现有排序",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "单边词 2 > 有标词 无"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "「有标词」BCC 四个现代频道均未收录；「单边词」BCC 文学 2（每百万 2）；单边 BCC 收录不决定高低",
+      "status": "ask",
+      "proposedOrder": []
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "listed_order_tiebreak",
+      "summary": "「有标词」BCC 四个现代频道均未收录；「单边词」BCC 文学 2（每百万 2）；单边 BCC 收录不决定高低；证据未拉开差距，保留你列出的相对顺序",
+      "status": "reorder",
+      "proposedOrder": [
+        "单边词",
+        "有标词"
+      ]
+    },
+    "cssChange": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "「有标词」BCC 四个现代频道均未收录；「单边词」BCC 文学 2（每百万 2）；单边 BCC 收录不决定高低",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "「有标词」BCC 四个现代频道均未收录；「单边词」BCC 文学 2（每百万 2）；单边 BCC 收录不决定高低",
+      "status": "without_priority_approval"
+    }
+  },
+  "authority_one_sided_jieba": {
+    "compare": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「有标词」BCC 四个现代频道均未收录；「低频词」BCC 四个现代频道均未收录；历史补充：「有标词」暂无可用历史记录；「低频词」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "低频词 1 > 有标词 无"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "incumbent_frequency_vs_absent",
+      "summary": "「低频词」较「有标词」更常用：「有标词」无语料频次；「低频词」语料频次 1；保留现有排序；历史补充：「低频词」暂无可用历史记录；「有标词」暂无可用历史记录（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "低频词 1 > 有标词 无"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「有标词」BCC 四个现代频道均未收录；「低频词」BCC 四个现代频道均未收录；历史补充：「有标词」暂无可用历史记录；「低频词」暂无可用历史记录（未参与判定）",
+      "status": "ask",
+      "proposedOrder": []
+    },
+    "chainListedOrder": {
+      "verdict": "close",
+      "decisionReason": "listed_order_tiebreak",
+      "summary": "常用度信号不足：「有标词」BCC 四个现代频道均未收录；「低频词」BCC 四个现代频道均未收录；历史补充：「有标词」暂无可用历史记录；「低频词」暂无可用历史记录（未参与判定）；证据未拉开差距，保留你列出的相对顺序",
+      "status": "reorder",
+      "proposedOrder": [
+        "低频词",
+        "有标词"
+      ]
+    },
+    "cssChange": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「有标词」BCC 四个现代频道均未收录；「低频词」BCC 四个现代频道均未收录；历史补充：「有标词」暂无可用历史记录；「低频词」暂无可用历史记录（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "not_enough_evidence",
+      "decisionReason": "local_signal_insufficient",
+      "summary": "常用度信号不足：「有标词」BCC 四个现代频道均未收录；「低频词」BCC 四个现代频道均未收录；历史补充：「有标词」暂无可用历史记录；「低频词」暂无可用历史记录（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "authority_both_in_hsk": {
+    "compare": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「双标乙」较「爱心」更常用：收录：词典 3 vs 词典 0；历史补充：「双标乙」暂无可用历史记录；「爱心」暂无可用历史记录（未参与判定）",
+      "comparisonCopy": "双标乙 3 > 爱心 0"
+    },
+    "assessment": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「双标乙」较「爱心」更常用：收录：词典 3 vs 词典 0；历史补充：「双标乙」暂无可用历史记录；「爱心」暂无可用历史记录（未参与判定）",
+      "recommendedCode": "abcdx",
+      "comparisonCopy": "双标乙 3 > 爱心 0"
+    },
+    "discovery": {
+      "status": "auto",
+      "recommendedCode": "abcdx",
+      "summary": ""
+    },
+    "chain": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「双标乙」较「爱心」更常用：收录：词典 3 vs 词典 0；历史补充：「双标乙」暂无可用历史记录；「爱心」暂无可用历史记录（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "双标乙",
+        "爱心"
+      ]
+    },
+    "chainListedOrder": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「双标乙」较「爱心」更常用：收录：词典 3 vs 词典 0；历史补充：「双标乙」暂无可用历史记录；「爱心」暂无可用历史记录（未参与判定）",
+      "status": "reorder",
+      "proposedOrder": [
+        "双标乙",
+        "爱心"
+      ]
+    },
+    "cssChange": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「双标乙」较「爱心」更常用：收录：词典 3 vs 词典 0；历史补充：「双标乙」暂无可用历史记录；「爱心」暂无可用历史记录（未参与判定）",
+      "status": "needs_admin"
+    },
+    "priorityMove": {
+      "verdict": "behind_more_common",
+      "decisionReason": "authority_margin",
+      "summary": "「双标乙」较「爱心」更常用：收录：词典 3 vs 词典 0；历史补充：「双标乙」暂无可用历史记录；「爱心」暂无可用历史记录（未参与判定）",
+      "status": "without_priority_approval"
+    }
+  },
+  "single_literature_only": {
+    "estimate": {
+      "attested": true,
+      "primaryPerMillion": null,
+      "corpusSource": "bcc",
+      "rawCorpusPerMillion": 5.0,
+      "score": 0.441389
+    }
+  },
+  "reasonless_web_shape": {
+    "cssChange": {
+      "verdict": "front_more_common",
+      "decisionReason": null,
+      "summary": "离线 fixture 中的网页回退结果",
+      "status": "needs_admin",
+      "webFallback": true
+    },
+    "priorityMove": {
+      "verdict": "front_more_common",
+      "decisionReason": null,
+      "summary": "离线 fixture 中的网页回退结果",
+      "status": "without_priority_approval",
+      "webFallback": true
+    }
+  }
+}
