@@ -256,6 +256,7 @@ PRONUNCIATION_WORD_BINDING_WINDOW_CHARS = 80
 PRONUNCIATION_WEB_RESOLUTION_TIMEOUT = 8.0
 PRONUNCIATION_UNKNOWN_RESOLUTION_TIMEOUT = 10.0
 SEMANTIC_PRONUNCIATION_HIGH_CONFIDENCE = 0.85
+SEMANTIC_PRONUNCIATION_POLICY_VERSION = "std-mandarin-v1"
 KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER = (10.0, 20.0, 30.0)
 KEYTAO_ENCODE_MAX_ATTEMPTS = len(KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER)
 KEYTAO_ENCODE_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -557,9 +558,12 @@ def get_llm_client(
     if client is None:
         client = client_factory(api_key=api_key, base_url=base_url, timeout=timeout)
         _llm_clients[key] = client
+    with_options = getattr(client, "with_options", None)
+    if not callable(with_options):
+        return client
     if max_retries is None:
-        return client.with_options(timeout=timeout)
-    return client.with_options(timeout=timeout, max_retries=max_retries)
+        return with_options(timeout=timeout)
+    return with_options(timeout=timeout, max_retries=max_retries)
 
 
 def _review_llm_config() -> Dict[str, Any]:
@@ -4194,29 +4198,31 @@ async def prepare_reviewed_word(
             requester=semantic_requester,
         )
 
+    requested_group_readings: List[str] = []
     if (
         requested_code
         and explicit_reading_choice is None
         and multi_sense_choice.get("status") != "ambiguous"
         and not punctuated_phrase
-        and (not pronunciation_resolution or pronunciation_resolution.get("status") == "encode_default")
-        and not any(
-            group.get("semanticPronunciation") or group.get("contextPronunciation")
-            for group in groups
-        )
     ):
         reviewed_sequences = {tuple(group.get("normalized") or ()) for group in groups}
-        groups.extend(
-            _review_group_from_returned(
-                returned, evidence_kind="own_character", requires_manual_review=True,
-            )
-            for returned in returned_groups
-            if tuple(returned.get("normalized") or ()) not in reviewed_sequences
-            and requested_code in (returned.get("codes") or [])
-            and not _pronunciation_sequence_rejection_reason(
-                word, returned.get("normalized") or (), encode_data,
-            )
-        )
+        if not any(requested_code in (
+            group.get("returnedCodes")
+            or returned_groups_by_sequence.get(tuple(group.get("normalized") or ()), {}).get("codes")
+            or []
+        ) for group in groups):
+            for returned in returned_groups:
+                sequence = tuple(returned.get("normalized") or ())
+                if (
+                    sequence in reviewed_sequences
+                    or requested_code not in (returned.get("codes") or [])
+                    or _pronunciation_sequence_rejection_reason(word, sequence, encode_data)
+                ):
+                    continue
+                requested_group_readings.append(returned["pinyin"])
+                groups.append(_review_group_from_returned(
+                    returned, evidence_kind="requested_encode_group", requires_manual_review=True,
+                ))
 
     baseline_sequence = _encode_default_pinyin_sequence(encode_data)
     non_default_sequences = {
@@ -4263,6 +4269,7 @@ async def prepare_reviewed_word(
         if (
             sequence == sole_unscoped_alternate_sequence
             and sole_unscoped_alternate_codes
+            and group.get("readingEvidenceKind") != "requested_encode_group"
         ):
             codes = sole_unscoped_alternate_codes
         if not codes:
@@ -4369,6 +4376,9 @@ async def prepare_reviewed_word(
         auto_review_reason = LOOKUP_FAILURE_REASON
     elif not evidence_lookup_complete:
         auto_review_reason = f"{evidence_failure_summary}，本轮仍需管理员审核"
+    elif requested_group_readings:
+        reading_labels = " / ".join(requested_group_readings)
+        auto_review_reason = f"指定编码 {requested_code} 对应候选读音 {reading_labels}，需管理员复核"
     elif has_web_model_agreement:
         auto_review_reason = "网络读音证据与独立语义判断一致"
     elif has_authority:
@@ -4485,6 +4495,8 @@ async def prepare_reviewed_word(
         return apply_review_disposition(result, "lookup_unavailable")
     if not evidence_lookup_complete:
         return apply_review_disposition(result, "pronunciation_lookup_incomplete")
+    if requested_group_readings:
+        return apply_review_disposition(result, "requested_encode_group")
     if (
         requested_code
         and has_semantic_pronunciation
@@ -5055,8 +5067,9 @@ async def _infer_semantic_pronunciation_proposal(
         "可清楚解释并足以确定逐字读音的用法。它不必是词典独立词条：动词加着、了、过等"
         "语法组合，只要整体含义和读音明确，也可以 accepted=true。meaning 必须具体解释"
         "整个表达的含义，不能只复述原词；characters 必须逐字返回原字和该字在当前词语"
-        "语境中的拼音。遇到多音字必须明确比较它在当前书面/复合词用法与口语/单独用法的"
-        "差异；rationale 用一行说明为何采用当前读音。"
+        "语境中的拼音。读音必须遵循普通话标准读音（以《现代汉语词典》《通用规范汉字表》及汉典所列标准音为准）；"
+        "方言音、俗读、口语变读或语境推测不得覆盖标准读音。遇到多音字，先确定该字在本词中的义项，"
+        "再给出该义项的普通话标准读音（如“苕”指红薯时读 sháo，指苕帚/凌霄时读 tiáo）；rationale 用一行写出所取义项与依据。"
         "commonTransparent 只在它是常见现代汉语词，或每个构词成分的组合关系透明、"
         "普通使用者无需专门背景也能稳定理解时为 true；临时拼接、罕见搭配、陌生专名、"
         "只是在语法上可解释但不常见的组合必须为 false。"
@@ -5196,11 +5209,12 @@ def _cache_semantic_pronunciation_result(
 
 
 def _semantic_pronunciation_cache_key(word: str, evidence_hint: str) -> str:
+    key = f"{SEMANTIC_PRONUNCIATION_POLICY_VERSION}\x1f{word}"
     hint = str(evidence_hint or "").strip()
     if not hint:
-        return word
+        return key
     digest = hashlib.sha256(hint.encode("utf-8")).hexdigest()
-    return f"{word}\x1f{digest}"
+    return f"{key}\x1f{digest}"
 
 
 def _finish_semantic_pronunciation_task(
@@ -7318,6 +7332,7 @@ class _ItemOutcome:
     __slots__ = (
         "issues",
         "sealed_issues",
+        "lookup_transient",
         "approved_items",
         "skipped_items",
         "common_known_items",
@@ -7336,6 +7351,7 @@ class _ItemOutcome:
         # overridable whitelist, so text matching alone would let an LLM
         # relitigate a decision that code already sealed.
         self.sealed_issues: List[str] = []
+        self.lookup_transient = False
         self.approved_items: List[str] = []
         self.skipped_items: List[str] = []
         self.common_known_items: List[Dict[str, Any]] = []
@@ -7536,6 +7552,11 @@ def _assess_semantic_context_auto_pass(
         or (concrete_meaning and meaning_confident and meaning_backed_method)
         for item in character_readings
     )
+    # Owner rule: use Standard Mandarin readings; without whole-word authority, LLM-only polyphones stay sealed.
+    polyphone_uncorroborated = any(
+        len({str(reading or "") for reading in item.get("knownReadings") or []} - {""}) > 1
+        for item in character_readings
+    )
     non_obscurity = _semantic_context_non_obscurity(word, pronunciation)
     multi_sense_status = str(
         (review.get("multiSenseChoice") or {}).get("status") or ""
@@ -7552,6 +7573,7 @@ def _assess_semantic_context_auto_pass(
         "concreteMeaning": concrete_meaning,
         "meaningConfidence": meaning_confident,
         "multiReadingMeaningBacked": multi_reading_meaning_backed,
+        "polyphoneStandardReading": not polyphone_uncorroborated,
         "notObscure": non_obscurity["accepted"],
     }
     failed_checks = [name for name, passed in checks.items() if not passed]
@@ -7578,6 +7600,7 @@ def _assess_semantic_context_auto_pass(
             "requiresEveryKnownCharacterReading": True,
             "requiresCompletedLookups": True,
             "requiresMeaningForMultiReadingCharacters": True,
+            "polyphoneRequiresStandardAuthority": True,
             "requiresResolvedMultiSenseChoice": True,
         },
     }
@@ -7680,6 +7703,7 @@ async def _audit_single_item(
             issue = f"「{word}」@{code} {LOOKUP_FAILURE_REASON}，需要管理员审核"
             outcome.issues.append(issue)
             outcome.sealed_issues.append(issue)
+            outcome.lookup_transient = not css_review.get("duplicate")
             return outcome
 
         # An exact same word@code@type row already exists: this is a duplicate,
@@ -7739,6 +7763,7 @@ async def _audit_single_item(
             issue = f"改词「{old_word}→{word}」{LOOKUP_FAILURE_REASON}，需要管理员审核"
             outcome.issues.append(issue)
             outcome.sealed_issues.append(issue)
+            outcome.lookup_transient = True
             return outcome
         incomplete_details = [
             f"「{review_word}」{reason}"
@@ -7755,6 +7780,14 @@ async def _audit_single_item(
             )
             if "管理员审核" not in issue:
                 issue += "，需要管理员审核"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
+            outcome.lookup_transient = True
+            return outcome
+        if new_review.get("success") and code not in _candidate_codes_from_review(
+            new_review, include_fallback=not bool(new_review.get("autoReviewable")),
+        ):
+            issue = f"「{word}」编码 {code} 不在读音候选链中"
             outcome.issues.append(issue)
             outcome.sealed_issues.append(issue)
             return outcome
@@ -7787,6 +7820,7 @@ async def _audit_single_item(
         )
         outcome.issues.append(issue)
         outcome.sealed_issues.append(issue)
+        outcome.lookup_transient = not _has_exact_existing_phrase(review.get("existing"), word, code, phrase_type)
         return outcome
 
     pronunciation_lookup_reason = _pronunciation_lookup_incomplete_reason(review)
@@ -7800,6 +7834,7 @@ async def _audit_single_item(
             issue += "，需要管理员审核"
         outcome.issues.append(issue)
         outcome.sealed_issues.append(issue)
+        outcome.lookup_transient = not _has_exact_existing_phrase(review.get("existing"), word, code, phrase_type)
         return outcome
 
     # Same word @ same code @ same type already in the dictionary is a
@@ -7827,15 +7862,14 @@ async def _audit_single_item(
         review,
         include_fallback=not bool(review.get("autoReviewable")),
     )
+    if code not in candidate_codes:
+        available = ", ".join(sorted(candidate_codes)[:8])
+        chain = "权威读音候选链" if review.get("autoReviewable") else "读音候选链"
+        issue = f"「{word}」编码 {code} 不在{chain}中，可选：{available or '无'}"
+        outcome.issues.append(issue)
+        outcome.sealed_issues.append(issue)
+        return outcome
     if not review.get("autoReviewable"):
-        if code not in candidate_codes:
-            available = ", ".join(sorted(candidate_codes)[:8])
-            issue = f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}"
-            outcome.issues.append(issue)
-            if review.get("requiresManualPronunciationReview"):
-                outcome.sealed_issues.append(issue)
-            return outcome
-
         if phrase_type == "Single" and review.get("type") == "Single":
             reason = str(review.get("manualReviewReason") or review.get("autoReviewReason") or "单字字形收录需复核").strip()
             issue = f"「{word}」@{code} {reason}，需要管理员审核"
@@ -7928,10 +7962,6 @@ async def _audit_single_item(
 
         return outcome
 
-    if code not in candidate_codes:
-        available = ", ".join(sorted(candidate_codes)[:8])
-        outcome.issues.append(f"「{word}」编码 {code} 不在权威读音候选链中，可选：{available or '无'}")
-        return outcome
     outcome.approved_items.append(f"{action}：{word}@{code}")
     priority_review = await progress.run_stage(
         "priority",
@@ -8050,15 +8080,18 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 task.cancel()
     approved_item_ids: List[int] = []
     sealed_item_ids: List[int] = []
+    transient_lookup_item_ids: List[int] = []
     sealed_item_reasons: Dict[int, str] = {}
     for item, outcome in zip(items, outcomes):
         issues.extend(outcome.issues)
         sealed_issues.extend(outcome.sealed_issues)
         approved_items.extend(outcome.approved_items)
         item_id = item.get("id")
-        if type(item_id) is int and item_id > 0 and outcome.sealed_issues:
+        if type(item_id) is int and item_id != 0 and outcome.sealed_issues:
             sealed_item_ids.append(item_id)
             sealed_item_reasons[item_id] = outcome.sealed_issues[0]
+            if outcome.lookup_transient:
+                transient_lookup_item_ids.append(item_id)
         if (
             type(item_id) is int and item_id > 0
             and outcome.approved_items and not (outcome.issues or outcome.sealed_issues or outcome.skipped_items)
@@ -8134,6 +8167,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         "structuredManualReviewIssues": sealed_issues,
         "sealedItemIds": sealed_item_ids,
         "sealedItemReasons": sealed_item_reasons,
+        "transientLookupItemIds": transient_lookup_item_ids,
         "approvedItems": approved_items,
         "approvedItemIds": approved_item_ids,
         "skippedItems": skipped_items,

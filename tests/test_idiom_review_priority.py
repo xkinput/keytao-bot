@@ -93,6 +93,7 @@ class IdiomReviewPriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("PASS", prepared["reviewDisposition"])
         self.assertFalse(prepared["needsManualReview"])
         self.assertTrue(prepared["commonSenseSources"][0].startswith("语言常识："))
+        self.assertIs(prepared["semanticContextAutoPass"]["checks"]["polyphoneStandardReading"], True)
 
         audit, (matching, mismatching) = await self.audit_and_review(CODE, "zzzz")
         self.assertEqual([1], audit["approvedItemIds"])
@@ -100,7 +101,7 @@ class IdiomReviewPriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(audit["semanticContextAutoPassItems"][0]["basisLine"].startswith("语言常识："))
         self.assertEqual(("pass", "medium", "仅凭语言常识"),
                          (matching["status"], matching["priority"], matching["priorityReason"]))
-        self.assertEqual(("manual_review", "high", audit["structuredManualReviewIssues"][0]),
+        self.assertEqual(("manual_review", "high", "编码未经候选链佐证"),
                          (mismatching["status"], mismatching["priority"], mismatching["priorityReason"]))
         self.assertEqual(prepared["commonSenseSources"], matching["reviewRecord"]["commonSenseSources"])
 

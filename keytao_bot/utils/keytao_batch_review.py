@@ -22,6 +22,7 @@ from .http_client import KeytaoApiError
 from .keytao_review import (
     LOOKUP_FAILURE_REASON,
     ReviewHttpConfig,
+    _pronunciation_lookup_incomplete_reason,
     _query_commonness_reference,
     audit_draft_items,
     fetch_keytao_encode,
@@ -46,6 +47,8 @@ from .observability import observe_model_call
 
 
 ReviewItem = Dict[str, Any]
+OUT_OF_CHAIN_REASON = "编码未经候选链佐证"
+TRANSIENT_LOOKUP_REVIEW_SOURCE = "bot-lookup-transient"
 
 
 def _config_value(name: str, env_name: str, default: Any = None) -> Any:
@@ -441,14 +444,17 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
                 all_codes.append(code)
 
     code_map: Dict[str, List[Dict[str, Any]]] = {}
+    fallback_lookup_failed = False
     try:
         code_map = await lookup_codes(config, all_codes)
     except KeytaoApiError as error:
         logger.warning(f"Fallback code occupancy lookup failed: {error}")
-        lookup_failed = True
+        fallback_lookup_failed = True
     except Exception as error:
         logger.warning(f"Fallback code occupancy lookup failed: {error}")
-        lookup_failed = True
+        fallback_lookup_failed = True
+
+    lookup_failed = lookup_failed or fallback_lookup_failed
 
     for word, encode_data in encode_by_word.items():
         candidate_codes = _encode_candidate_codes(encode_data)
@@ -456,16 +462,16 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
             {
                 "code": code,
                 # A failed lookup is unknown, not free.
-                "occupied": None if lookup_failed else bool(code_map.get(code)),
-                "label": "占位未知（词库查询失败）" if lookup_failed else _status_label(code_map.get(code, [])),
-                "phrases": [] if lookup_failed else code_map.get(code, []),
-                **({"lookupFailed": True} if lookup_failed else {}),
+                "occupied": None if fallback_lookup_failed else bool(code_map.get(code)),
+                "label": "占位未知（词库查询失败）" if fallback_lookup_failed else _status_label(code_map.get(code, [])),
+                "phrases": [] if fallback_lookup_failed else code_map.get(code, []),
+                **({"lookupFailed": True} if fallback_lookup_failed else {}),
             }
             for code in candidate_codes
         ]
         recommended = (
             ""
-            if lookup_failed
+            if fallback_lookup_failed
             else next(
                 (item["code"] for item in statuses if not item["occupied"]),
                 candidate_codes[0] if candidate_codes else "",
@@ -477,11 +483,11 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
             "autoReviewable": False,
             "autoReviewReason": (
                 LOOKUP_FAILURE_REASON
-                if lookup_failed
+                if fallback_lookup_failed
                 else "读音优先级复核失败，仅保留 keytao_encode 默认候选链供 LLM 复审"
             ),
             "encodeOnly": True,
-            "lookupFailed": lookup_failed,
+            "lookupFailed": fallback_lookup_failed,
             "keytaoEncode": {
                 "candidateCodes": candidate_codes,
                 "candidateStatuses": statuses[:12],
@@ -505,11 +511,13 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
             ] if candidate_codes else [],
         }, True, (
             LOOKUP_FAILURE_REASON
-            if lookup_failed
+            if fallback_lookup_failed
             else "降级候选链，只能交由管理员/LLM 复审"
         ))
 
     issues: List[str] = []
+    sealed_item_reasons: Dict[int, str] = {}
+    transient_lookup_item_ids: List[int] = []
     approved_items: List[str] = []
     for item in items:
         action = _string(item.get("action") or "Create") or "Create"
@@ -519,15 +527,27 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
         if not word or not code:
             issues.append("存在词或编码为空的草稿条目")
             continue
-        if action == "Delete" and (word, code) not in move_pairs:
-            issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
+        if action == "Delete":
+            if (word, code) in move_pairs:
+                approved_items.append(f"调码删除原位：{word}@{code}")
+            else:
+                issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
+            continue
+        review = reviewed_words.get(word, {})
+        lookup_reason = (
+            LOOKUP_FAILURE_REASON if review.get("lookupFailed")
+            else _pronunciation_lookup_incomplete_reason(review)
+        )
+        if lookup_reason:
+            issue = f"「{word}」@{code} {lookup_reason}"
+            issues.append(issue)
+            sealed_item_reasons[int(item["id"])] = issue
+            transient_lookup_item_ids.append(int(item["id"]))
             continue
         if phrase_type in {"CSS", "CSSSingle"}:
             approved_items.append(f"{action}：{word}@{code} 是声笔笔短码表条目，交由 LLM 按 CSS 优先级复审")
             continue
-        candidate_codes = _review_candidate_codes(reviewed_words.get(word, {}))
-        if code in candidate_codes:
-            review = reviewed_words.get(word, {})
+        if _audit_pronunciation_for_item_code(review, code):
             context_corrected = any(
                 isinstance(pronunciation, dict)
                 and isinstance(pronunciation.get("contextPronunciation"), dict)
@@ -537,10 +557,12 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
             basis = "读音优先级纠正后的候选链" if context_corrected else "审词候选链"
             approved_items.append(f"{action}：{word}@{code}，目标编码在{basis}中")
         else:
-            available = ", ".join(candidate_codes[:8])
-            issues.append(f"「{word}」编码 {code} 不在 keytao_encode 候选链中，可选：{available or '无'}")
+            available = ", ".join(_review_candidate_codes(review)[:8])
+            issue = f"「{word}」编码 {code} 不在 keytao_encode 候选链中，可选：{available or '无'}"
+            issues.append(issue)
+            sealed_item_reasons[int(item["id"])] = issue
 
-    sealed_issues: List[str] = []
+    sealed_issues = list(sealed_item_reasons.values())
     if lookup_failed:
         # "Unknown occupancy" is a sealed terminal state: an LLM pass must not
         # be able to reinterpret it as "the code is free".
@@ -557,6 +579,9 @@ async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Seq
         "summary": "完整来源审查超时，本喵已并行按读音优先级重建候选链并交由 LLM 继续复审",
         "issues": issues or [reason],
         "structuredManualReviewIssues": sealed_issues,
+        "sealedItemIds": list(sealed_item_reasons),
+        "sealedItemReasons": sealed_item_reasons,
+        "transientLookupItemIds": transient_lookup_item_ids,
         "approvedItems": approved_items,
         "commonKnownItems": [],
         "reviewedWords": reviewed_words,
@@ -713,8 +738,21 @@ def _item_seal_reasons(items: Sequence[ReviewItem], audit: Dict[str, Any]) -> Di
                     reason = issue
                     break
         word_review = _reviewed_word_entry(audit, word, _string(item.get("type")) or "Phrase") or {}
-        if not reason and word_review.get("lookupFailed") is True:
-            reason = _string(word_review.get("lookupFailureReason")) or "读音或编码查询未完成"
+        pronunciation_lookup_reason = _pronunciation_lookup_incomplete_reason(word_review)
+        if (
+            item.get("action") != "Delete"
+            and not _is_css_item(item)
+            and code
+            and word_review.get("pronunciations")
+            and not pronunciation_lookup_reason
+            and _audit_pronunciation_for_item_code(word_review, code) is None
+        ):
+            reason = OUT_OF_CHAIN_REASON
+        if not reason:
+            if word_review.get("lookupFailed") is True:
+                reason = _string(word_review.get("lookupFailureReason")) or "读音或编码查询未完成"
+            else:
+                reason = pronunciation_lookup_reason
         if reason or item_id in sealed_ids:
             reasons[item_id] = reason or "确定性审查标记为需管理员审核"
     return reasons
@@ -726,13 +764,19 @@ def _audit_pronunciation_for_item_code(
 ) -> Optional[Dict[str, Any]]:
     if not code:
         return None
-    for pronunciation in review.get("pronunciations", []):
+    pronunciations = review.get("pronunciations") or []
+    requires_source = review.get("autoReviewable") and not review.get("semanticContextAutoPass")
+    for pronunciation in pronunciations:
         if isinstance(pronunciation, dict):
+            if requires_source and not pronunciation.get("sources"):
+                continue
             candidate_codes: List[str] = []
             _collect_code_strings(pronunciation.get("codes"), candidate_codes)
             _collect_code_strings(pronunciation.get("candidateStatuses"), candidate_codes)
             if code in candidate_codes:
                 return pronunciation
+    if pronunciations:
+        return None
     keytao_encode = review.get("keytaoEncode") if isinstance(review.get("keytaoEncode"), dict) else {}
     candidate_sets = [
         review.get("candidateCodes"),
@@ -947,6 +991,7 @@ def _normalize_llm_review(
 
     move_pairs = _move_pairs(items)
     seal_reasons = _item_seal_reasons(items, audit or {})
+    transient_lookup_ids = set((audit or {}).get("transientLookupItemIds") or [])
     common_sense_basis = {
         (item.get("word"), item.get("code")): item["basisLine"]
         for item in (audit or {}).get("semanticContextAutoPassItems") or []
@@ -1086,8 +1131,6 @@ def _normalize_llm_review(
         elif status == "manual_review":
             if word_review.get("lookupFailed") or word_review.get("pronunciationEvidenceComplete") is False:
                 priority, priority_reason = "high", "读音或编码查询未完成"
-            elif not audit_pronunciation and word_review.get("pronunciations"):
-                priority, priority_reason = "high", "编码未经候选链佐证"
             else:
                 priority, priority_reason = "high", "条目需人工复核"
         elif status == "attention":
@@ -1100,6 +1143,17 @@ def _normalize_llm_review(
             priority = "medium"
             priority_reason = "仅凭语言常识" if common_sense_sources else "缺少独立来源佐证"
 
+        lookup_transient = (
+            pr_id in transient_lookup_ids
+            and bool(seal_reason)
+            and seal_reason != OUT_OF_CHAIN_REASON
+            and not (item_requires_manual_review(pr) or has_conflict or pure_delete)
+        )
+        record_source = _string(raw_item.get("source"))
+        if lookup_transient:
+            record_source = TRANSIENT_LOOKUP_REVIEW_SOURCE
+        elif record_source == TRANSIENT_LOOKUP_REVIEW_SOURCE:
+            record_source = "bot-llm"
         normalized_item = {
             "prId": pr_id,
             "status": status,
@@ -1111,7 +1165,7 @@ def _normalize_llm_review(
             "suggestions": list(dict.fromkeys(suggestions))[:6],
             "reviewRecord": {
                 "reviewedBy": "Miaomiao",
-                "source": _string(raw_item.get("source")) or "bot-llm",
+                "source": record_source or "bot-llm",
                 "summary": _summary_from_item(raw_item, reasons),
                 "pronunciation": pronunciation or None,
                 "sources": sources,

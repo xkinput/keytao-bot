@@ -282,7 +282,7 @@ BCC 现代频次只取多领域、新闻、文学、口语的最高每百万频�
 
 ⚠️ 关键规则：词条候选编码只能取 `candidateStatuses` / `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
 
-⚠️ 语境读音规则：当首次调用返回 `semanticPronunciationNeeded=true` 时，只能把用户给出的读音或具体含义映射到本次结果的 `alternatePhrasePronunciationCodes` / `candidateCodes` 读音组；不得按推测读音再次调用编码服务。没有唯一匹配时必须列出当前已有读音并请用户选择。若 `standardPronunciationStatus=unavailable`，必须保留“权威查询暂不可用”的说明，候选需管理员复核，禁止声称“没有标准读音”。只有终局 `absent` 且审词模块明确给出 `semantic_context_common_word=PASS` 时，才可依据完整语义、逐字读音和离线非生僻证据自动通过；lookup 未完成不可走该通道。
+⚠️ 语境读音遵循普通话标准读音。`semanticPronunciationNeeded=true` 时，将指定读音或含义映射到本次 `alternatePhrasePronunciationCodes` / `candidateCodes`，禁止按推测读音重查。匹配不唯一则列出读音请用户选择。`standardPronunciationStatus=unavailable` 时说明权威查询暂不可用，交管理员复核。语义或 LLM 可选择候选组，涉及多音字时保持封存。语义自动通过仅适用于逐字单音、查询完整且为 `absent`，并明确返回 `semantic_context_common_word=PASS` 的条目。
 
 ⚠️ 声笔笔/CSS 关键规则：`CSS` / `CSSSingle` 条目属于键道6扩展短码表。例如 `fa`、`fao` 在声笔笔表中是短码位置，不应按普通词组音码拆成 `f + ao` 去否定词条。审核这类条目时只按 CSS 表、同码链顺序和常用度判断。
 

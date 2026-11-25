@@ -177,6 +177,7 @@ def test_review_disposition_registry():
         "missing_authoritative_page": ReviewDisposition.SEAL,
         "pronunciation_lookup_incomplete": ReviewDisposition.SEAL,
         "entity_context_reading": ReviewDisposition.SEAL,
+        "requested_encode_group": ReviewDisposition.SEAL,
         "unvalidated_type": ReviewDisposition.SEAL,
         "pre_submit_judgement": ReviewDisposition.SEAL,
         "pre_submit_review_unavailable": ReviewDisposition.SEAL,
@@ -273,7 +274,7 @@ def _reference_row(
 
 
 def test_semantic_context_auto_pass_corpus_and_mutation_matrix():
-    """Every predicate leg has an observable corpus case that kills its mutant."""
+    """Semantic checks record both isolated failures and overlapping gates."""
     print("\n🧪 semantic context auto-pass corpus and mutation matrix")
 
     async def audit_case(review, references):
@@ -365,30 +366,7 @@ def test_semantic_context_auto_pass_corpus_and_mutation_matrix():
                 and "该词可自动通过" in str(assessment.get("basisLine") or ""),
             )
 
-        ambiguous_extra = {
-            **_semantic_context_review(
-                "重行",
-                "isxk",
-                chosen_pinyins=["zhong", "xing"],
-                known_readings=[["zhong", "chong"], ["xing", "hang"]],
-            )["pronunciations"][0],
-            "pinyin": "chong hang",
-            "normalized": ["chong", "hang"],
-            "characterReadings": [
-                {
-                    "char": "重",
-                    "chosenPinyin": "chong",
-                    "knownReadings": ["zhong", "chong"],
-                    "lookupStatus": "found",
-                },
-                {
-                    "char": "行",
-                    "chosenPinyin": "hang",
-                    "knownReadings": ["xing", "hang"],
-                    "lookupStatus": "found",
-                },
-            ],
-        }
+        duplicate_semantic = _semantic_context_review("产季", "ijjk")["pronunciations"][0]
         mutation_cases = [
             (
                 "lookup-completed condition",
@@ -407,11 +385,9 @@ def test_semantic_context_auto_pass_corpus_and_mutation_matrix():
             (
                 "single-unambiguous-reading condition",
                 _semantic_context_review(
-                    "重行",
-                    "isxk",
-                    chosen_pinyins=["zhong", "xing"],
-                    known_readings=[["zhong", "chong"], ["xing", "hang"]],
-                    extra_pronunciations=[ambiguous_extra],
+                    "产季",
+                    "ijjk",
+                    extra_pronunciations=[duplicate_semantic],
                 ),
                 "singleSemanticPronunciation",
             ),
@@ -472,11 +448,18 @@ def test_semantic_context_auto_pass_corpus_and_mutation_matrix():
                     )
                 ),
             )
-            check(
-                f"{name} has would-have-auto-passed proof",
-                assessment.get("failedChecks") == [failed_check]
-                and assessment.get("wouldPassWithout") == failed_check,
-            )
+            if failed_check == "multiReadingMeaningBacked":
+                check(
+                    "an unsupported sense fails both meaning binding and standard reading",
+                    assessment.get("failedChecks") == [failed_check, "polyphoneStandardReading"]
+                    and assessment.get("wouldPassWithout") == "",
+                )
+            else:
+                check(
+                    f"{name} has would-have-auto-passed proof",
+                    assessment.get("failedChecks") == [failed_check]
+                    and assessment.get("wouldPassWithout") == failed_check,
+                )
 
         non_obscurity_controls = [
             (
@@ -939,9 +922,9 @@ def test_semantic_context_pass_clears_prepare_seal_and_enters_autoapprove_chain(
     asyncio.run(_run())
 
 
-def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
+def test_chanji_semantic_prepare_revalidation_stays_sealed():
     """A 产季-style semantic re-encode must produce the evidence the new lane reads."""
-    print("\n🧪 产季 semantic revalidation reaches common-character PASS")
+    print("\n🧪 产季 semantic revalidation with multiple readings stays sealed")
 
     async def _run():
         word = "产季"
@@ -1054,7 +1037,7 @@ def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
             ],
         )
         check(
-            "prepare remains sealed until the non-obscurity predicate runs",
+            "prepare seals the semantic reading without whole-word authority",
             read_review_disposition(prepared) is ReviewDisposition.SEAL
             and read_manual_review_flag(prepared) is True,
         )
@@ -1093,9 +1076,11 @@ def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
                 "type": "Phrase",
             }])
         check(
-            "产季-style common characters plus semantic judgment auto-pass",
-            audit.get("autoApprove") is True
-            and read_review_disposition(audit) is ReviewDisposition.PASS,
+            "common characters cannot lift a polyphone seal",
+            audit.get("autoApprove") is False
+            and audit.get("reviewedWords", {}).get(f"{word}@Phrase", {}).get(
+                "semanticContextAutoPass", {}
+            ).get("failedChecks") == ["polyphoneStandardReading"],
         )
 
     asyncio.run(_run())
@@ -6601,7 +6586,7 @@ def main():
     test_rejected_offline_whole_word_reading_cannot_auto_pass_by_dictionary_presence()
     test_semantic_context_full_vendored_corpus_facts()
     test_semantic_context_pass_clears_prepare_seal_and_enters_autoapprove_chain()
-    test_chanji_semantic_prepare_revalidation_reaches_common_char_pass()
+    test_chanji_semantic_prepare_revalidation_stays_sealed()
     test_chanji_entity_context_reaches_common_char_pass()
     test_local_reference_import_is_deterministic_and_preserves_readings()
     test_polyphone_detection_and_compositional_resolution()

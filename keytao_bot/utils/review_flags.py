@@ -51,6 +51,7 @@ REVIEW_VERDICT_SITE_POLICIES = {
     "missing_authoritative_page": ReviewDisposition.SEAL,
     "pronunciation_lookup_incomplete": ReviewDisposition.SEAL,
     "entity_context_reading": ReviewDisposition.SEAL,
+    "requested_encode_group": ReviewDisposition.SEAL,
     "unvalidated_type": ReviewDisposition.SEAL,
     "pre_submit_judgement": ReviewDisposition.SEAL,
     "pre_submit_review_unavailable": ReviewDisposition.SEAL,
