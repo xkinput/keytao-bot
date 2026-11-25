@@ -259,6 +259,64 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.tool.assert_awaited_once()
         self.assertIsNone(self.store.get_record(self.author))
 
+    async def test_mixed_script_query_returns_an_exact_dictionary_entry(self):
+        word = "T恤"
+        self.tool.side_effect = None
+        for rows, expected in (
+            ([{"word": word, "code": "txlv", "type": "English"}], "「T恤」已在词库（txlv）。"),
+            ([], "「T恤」未在词库中找到。"),
+        ):
+            with self.subTest(rows=rows):
+                self.tool.reset_mock()
+                self.finish.reset_mock()
+                self.remember.reset_mock()
+                self.tool.return_value = json.dumps({"success": True, "phrases": rows})
+                ctx = self.context(word)
+                self.set_model(operands=(word,))
+                await self.assert_finished(ctx)
+                self.tool.assert_awaited_once_with(
+                    "keytao_lookup_by_word", {"word": word}, "qq", self.author.actor_id,
+                )
+                self.assertEqual(ctx.response, expected)
+        self.main.assert_not_awaited()
+        self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_mixed_script_query_keeps_dictionary_facts_with_an_existing_ticket(self):
+        record, original, _prompt = self.ticket(self.author)
+        self.entries["T恤"] = "txlv"
+        ctx = self.context("T恤 云翻")
+        self.set_model(operands=("T恤", "云翻"))
+        await self.assert_finished(ctx)
+        self.assertIn("「T恤」已在词库（txlv）。", ctx.response)
+        self.assertIn("云翻", ctx.response)
+        self.assert_preserved(self.author, record, original)
+
+    async def test_bare_code_query_returns_exact_code_occupants(self):
+        self.tool.side_effect = None
+        self.tool.return_value = json.dumps({
+            "success": True, "phrases": [
+                {"word": "实", "code": "eoo", "type": "CSSSingle", "weight": 10},
+                {"word": "事情", "code": "eoo", "type": "CSS", "weight": 100},
+            ],
+        })
+        ctx = self.context("键道 eoo")
+        ctx.normalized_message_text = self.chat._strip_command_message_prefixes(ctx.message_text)
+        self.set_model(operands=("eoo",))
+        await self.assert_finished(ctx)
+        self.tool.assert_awaited_once_with("keytao_lookup_by_code", {"code": "eoo"}, "qq", self.author.actor_id)
+        self.assertEqual(ctx.response, "编码 eoo 的词条有 实、事情。")
+        self.main.assert_not_awaited()
+        self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_query_without_eligible_operands_reaches_conversation_fallback(self):
+        message = "repository"
+        ctx = self.context(message)
+        self.set_model(operands=(message,))
+        await self.assert_finished(ctx)
+        self.tool.assert_not_awaited()
+        self.assert_main(message)
+        self.assertEqual(ctx.response, "这是离线解释。")
+
     async def test_single_character_lookup_renders_all_codes_without_main(self):
         self.tool.side_effect = None
         self.tool.return_value = json.dumps({

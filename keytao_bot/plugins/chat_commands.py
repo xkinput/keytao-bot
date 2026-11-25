@@ -11009,6 +11009,20 @@ def _validated_code_chain_entries(data: Dict[str, Any], code: str) -> Optional[L
     return entries
 
 
+async def _lookup_code_query_reply(code: str, platform: str, user_id: str) -> ServerBackedQueryReply:
+    set_turn_flow("word-query")
+    try:
+        data = json.loads(await call_tool_function("keytao_lookup_by_code", {"code": code}, platform, user_id))
+    except (TypeError, ValueError):
+        data = None
+    rows = _validated_code_chain_entries(data, code) if isinstance(data, dict) else None
+    if rows is None:
+        return ServerBackedQueryReply(f"暂时无法查询编码 {code}。")
+    ordered_rows = sorted(rows, key=lambda row: (row["weight"], row["word"]))
+    words = "、".join(dict.fromkeys(row["word"] for row in ordered_rows))
+    return ServerBackedQueryReply(f"编码 {code} 的词条有 {words}。" if words else f"词库未收录编码 {code}。")
+
+
 def _validated_draft_reorder_snapshot(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Validate the current draft CAS anchor and retain its full item projection."""
     items = data.get("items")

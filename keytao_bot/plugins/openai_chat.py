@@ -5632,34 +5632,47 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     else:
                         ctx.response = UnansweredChatReply("暂时没有更多信息。")
             if validated.op == "query":
-                operands = tuple(
+                reviewable_words = tuple(
                     word for word in validated.operands if _chat_routing._is_bare_word_query_target(word)
                 )
+                operands = tuple(
+                    word for word in validated.operands
+                    if word in reviewable_words or (
+                        re.fullmatch(r"[\u3400-\u9fffA-Za-z0-9]{2,30}", word)
+                        and re.search(r"[\u3400-\u9fff]", word)
+                        and re.search(r"[A-Za-z]", word)
+                    )
+                )
+                if validated.operands == (message,) and re.fullmatch(r"[a-z]{1,6}", message):
+                    ctx.response = await _chat_commands._lookup_code_query_reply(message, ctx.platform, ctx.user_id)
                 ctx.simple_word_query_words = operands
                 replies = []
                 missing_words = []
                 present_word_codes = {} if len(operands) > 1 else None
                 for word in operands:
+                    reviewable = word in reviewable_words
                     replies.append(await _try_handle_simple_single_word_query(
                         word, ctx.platform, ctx.user_id, ctx.conv_key,
                         ctx.space_key, ctx.owner_label,
                         preserve_pending=True, query_only=True,
-                        _missing_words=missing_words,
-                        _prepared_existing_words=present_word_codes,
+                        _missing_words=missing_words if reviewable else None,
+                        _prepared_existing_words=present_word_codes if reviewable else None,
                         _include_char_split=len(operands) == 1,
                     ))
                 if present_word_codes:
                     replies.append(already_existing_words_copy(present_word_codes))
-                missing_words = list(dict.fromkeys(
-                    word for word in missing_words if _chat_routing._is_bare_word_query_target(word)
-                ))
+                missing_words = list(dict.fromkeys(missing_words))
                 ctx.semantic_query_reply = "\n\n".join(reply for reply in replies if reply)
                 if missing_words:
                     if candidate_ticket and len(validated.operands) > 1:
                         ctx.response = await _chat_commands._prepare_multi_word_query(
-                            tuple(word for word in validated.operands if _chat_routing._is_bare_word_query_target(word)),
+                            reviewable_words,
                             ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
                             preserve_pending=True,
+                            query_other_blocks=tuple(
+                                reply for word, reply in zip(operands, replies)
+                                if reply and word not in reviewable_words
+                            ),
                         )
                         ctx.semantic_query_candidates_prepared = True
                         for stage in RESPONSE_STAGES:
@@ -5702,8 +5715,10 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     + r'(?:[\s，,、；;「」“”\"\']+' + word_pattern + r')*[\s。.!！「」“”\"\']*',
                     query_source,
                 )
-                if (missing_words or plain_lookup or message.strip() == " ".join(validated.operands)
-                        or ctx.simple_word_query_words and len(ctx.simple_word_query_words) < len(validated.operands)):
+                if ctx.semantic_query_reply and (
+                    missing_words or plain_lookup or message.strip() == " ".join(validated.operands)
+                    or operands and len(operands) < len(validated.operands)
+                ):
                     ctx.response = ServerBackedQueryReply(ctx.semantic_query_reply)
             for stage in RESPONSE_STAGES:
                 if await stage(ctx):
