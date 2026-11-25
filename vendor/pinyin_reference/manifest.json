@@ -42,6 +42,24 @@
       "format": "jieba",
       "import": true,
       "sha256": "7197c3211ddd98962b036cdf40324d1ea2bfaa12bd028e68faa70111a88e12a8"
+    },
+    {
+      "id": "tgscc",
+      "file": "tgscc_characters.txt.gz",
+      "format": "standard_char",
+      "import": true,
+      "sha256": "08d7a9be47515b1851182ee10d66b19c990f937a24cf7cc2d150a42c8758eebf",
+      "license": "MIT",
+      "source": "https://github.com/jaywcjlove/table-of-general-standard-chinese-characters"
+    },
+    {
+      "id": "hsk3",
+      "file": "hsk3_words.txt.gz",
+      "format": "hsk_word",
+      "import": true,
+      "sha256": "a975529af560c4961fa27ad5ec0ead5dffb579d38c341e19d2b31cc2e57d55ba",
+      "license": "MIT",
+      "source": "https://github.com/drkameleon/complete-hsk-vocabulary"
     }
   ]
 }

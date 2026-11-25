@@ -5614,6 +5614,7 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
 
 def _query_commonness_reference(word: str) -> Dict[str, Any]:
     key = str(word or "").strip()
+    standards = {"generalLevel": None, "hskLevel": None, "available": False}
     bcc = {"available": False, "attested": False, "perMillion": None,
            "tokenType": "char" if len(key) == 1 else "word", "channels": [],
            "historicalChannels": [{"channel": channel, "available": False,
@@ -5628,6 +5629,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
             "bcc": bcc,
+            "standards": standards,
         }
 
     path = reference_db_path().resolve()
@@ -5658,6 +5660,26 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "dictionaryPresenceCount": 0,
             "bcc": bcc,
         }
+    else:
+        try:
+            if connection.execute("""
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'standard_entry'
+            """).fetchone() and all(connection.execute("""
+                SELECT
+                    EXISTS (SELECT 1 FROM standard_entry WHERE source = 'tgscc'),
+                    EXISTS (SELECT 1 FROM standard_entry WHERE source = 'hsk3')
+            """).fetchone()):
+                levels = dict(connection.execute("""
+                    SELECT source, level FROM standard_entry
+                    WHERE word = ? AND typeof(level) = 'integer'
+                """, (key,)))
+                standards = {
+                    "generalLevel": levels.get("tgscc") if len(key) == 1 else None,
+                    "hskLevel": levels.get("hsk3"),
+                    "available": True,
+                }
+        except sqlite3.Error as error:
+            logger.warning(f"Standards reference unavailable for {key}: {error}")
     finally:
         if "connection" in locals():
             connection.close()
@@ -5671,6 +5693,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
             "bcc": bcc,
+            "standards": standards,
         }
 
     raw_frequency, raw_part_of_speech, raw_presence_count = row
@@ -5690,6 +5713,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
             "bcc": bcc,
+            "standards": standards,
         }
     return {
         "available": True,
@@ -5703,6 +5727,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
         ),
         "dictionaryPresenceCount": presence_count,
         "bcc": bcc,
+        "standards": standards,
     }
 
 

@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, TextIO
@@ -19,8 +20,8 @@ from .pinyin_reference import (
 )
 
 
-SCHEMA_VERSION = "2"
-BUILDER_VERSION = "3"
+SCHEMA_VERSION = "3"
+BUILDER_VERSION = "4"
 MANIFEST_FILENAME = "manifest.json"
 EXCLUSIONS_FILENAME = "excluded_words.txt"
 COMMONNESS_CORPUS_DATASET_ID = "jieba"
@@ -269,6 +270,24 @@ def parse_jieba_line(line: str) -> Optional[ParsedCorpusEntry]:
     )
 
 
+def _parse_standard_entry(line: str, pattern: str) -> Optional[tuple[str, int]]:
+    if line.startswith("#"):
+        return None
+    match = re.fullmatch(pattern, line.rstrip("\r\n"))
+    if not match:
+        raise ValueError(f"Malformed standard entry: {line!r}")
+    word, level = match.groups()
+    return word, int(level)
+
+
+def parse_standard_char(line: str) -> Optional[tuple[str, int]]:
+    return _parse_standard_entry(line, r"([^\s\x00])\t([1-3])")
+
+
+def parse_hsk_word(line: str) -> Optional[tuple[str, int]]:
+    return _parse_standard_entry(line, r"([^\s\x00]+)\t([1-7])")
+
+
 def _iter_parsed(
     source_path: Path,
     source_format: str,
@@ -372,7 +391,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         PRAGMA page_size = 4096;
         PRAGMA journal_mode = OFF;
         PRAGMA synchronous = OFF;
-        PRAGMA temp_store = MEMORY;
+        PRAGMA temp_store = FILE;
+        PRAGMA cache_size = -8192;
         CREATE TABLE metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -396,6 +416,12 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             dictionary_presence_count INTEGER NOT NULL DEFAULT 0 CHECK (
                 dictionary_presence_count BETWEEN 0 AND 3
             )
+        ) WITHOUT ROWID;
+        CREATE TABLE standard_entry (
+            word TEXT NOT NULL,
+            source TEXT NOT NULL,
+            level INTEGER NOT NULL,
+            PRIMARY KEY (word, source)
         ) WITHOUT ROWID;
     """)
     create_bcc_schema(connection)
@@ -443,6 +469,28 @@ def _batched_insert_corpus_entries(
         connection.executemany(statement, batch)
 
 
+def _previous_bcc_counts(db_path: Path) -> dict[str, int]:
+    if not db_path.is_file():
+        return {}
+    with closing(sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)) as previous:
+        try:
+            tables = [row[0] for row in previous.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name IN ('bcc_dataset', 'bcc_frequency')
+                ORDER BY name
+            """)]
+        except sqlite3.DatabaseError as error:
+            if error.sqlite_errorcode != sqlite3.SQLITE_NOTADB:
+                raise
+            return {}
+        if tables and len(tables) != 2:
+            raise RuntimeError("Cannot preserve BCC: the previous database is missing a BCC table")
+        return {
+            table: previous.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+
+
 def build_reference_database(source_dir: Path | str, db_path: Path | str) -> BuildResult:
     source_root = Path(source_dir).resolve()
     destination = Path(db_path).resolve()
@@ -469,6 +517,7 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
 
     connection = sqlite3.connect(temporary, uri=True)
     dataset_counts: dict[str, DatasetBuildCount] = {}
+    standard_metadata: dict[str, str] = {}
     try:
         _create_schema(connection)
         for source in sources:
@@ -511,6 +560,21 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
                     excluded=0,
                     skipped=skipped,
                 )
+                continue
+            standard_parser = {
+                "standard_char": parse_standard_char,
+                "hsk_word": parse_hsk_word,
+            }.get(source_format)
+            if standard_parser is not None:
+                with _open_text(source_path) as handle:
+                    entries = (standard_parser(line) for line in handle)
+                    imported = connection.executemany(
+                        "INSERT INTO standard_entry (word, source, level) VALUES (?, ?, ?)",
+                        ((entry[0], dataset, entry[1]) for entry in entries if entry is not None),
+                    ).rowcount
+                dataset_counts[dataset] = DatasetBuildCount(imported, imported, imported, 0, 0, 0)
+                standard_metadata[f"standard:{dataset}:sha256"] = str(source["sha256"])
+                standard_metadata[f"standard:{dataset}:count"] = str(imported)
                 continue
             if dataset not in REFERENCE_DATASET_POLICY_BY_ID:
                 raise ValueError(f"Unknown imported pronunciation dataset: {dataset}")
@@ -581,6 +645,7 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
             "SELECT COUNT(*) FROM word_commonness WHERE corpus_frequency IS NOT NULL"
         ).fetchone()[0])
         metadata = {
+            **standard_metadata,
             "schema_version": SCHEMA_VERSION,
             "builder_version": BUILDER_VERSION,
             "source_checksum": source_checksum,
@@ -603,9 +668,13 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
             "INSERT INTO metadata (key, value) VALUES (?, ?)",
             sorted(metadata.items()),
         )
+        previous_bcc_counts = _previous_bcc_counts(destination)
         preserve_bcc(destination, connection)
+        for table, expected in previous_bcc_counts.items():
+            actual = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if actual != expected:
+                raise RuntimeError(f"BCC preservation count mismatch for {table}: expected {expected}, got {actual}")
         connection.commit()
-        connection.execute("VACUUM")
         connection.close()
         temporary.replace(destination)
     except BaseException:

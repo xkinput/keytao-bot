@@ -16,6 +16,8 @@ The mozillazg phrase datasets are MIT licensed; see
 `LICENSE.phrase-pinyin-data`. CC-CEDICT is CC BY-SA 4.0; see
 `LICENSE.CC-CEDICT` and the preserved source header. The jieba corpus
 dictionary is MIT licensed; see `LICENSE.jieba`.
+The general standard character table (国发〔2013〕23号) uses the MIT-licensed jaywcjlove dataset (`LICENSE.tgscc`).
+The HSK vocabulary standard (GF0025-2021) uses the MIT-licensed drkameleon dataset (`LICENSE.hsk`).
 
 `excluded_words.txt` records owner-governed lookup exclusions without changing
 the original source files. It participates in the build fingerprint.
