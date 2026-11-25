@@ -4,17 +4,20 @@ Web API plugin — exposes HTTP endpoints for the Live2D chat frontend.
 Routes:
   POST /api/chat          — send a message, get AI reply
   POST /api/keytao/batches/review — run LLM-backed KeyTao batch review
+  POST /api/keytao/commonness-order — rank draft editor chains offline
   POST /api/keytao/pronunciation — infer a meaning-backed pronunciation
   DELETE /api/chat/history — clear session history
 
 Auth: Bearer token via WEB_API_KEY, plus a signed identity for logged-in users.
 """
+import asyncio
 import os
-from typing import Any, Dict, Optional
+from collections import Counter
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from nonebot import get_driver
 from nonebot.log import logger
 
@@ -35,10 +38,12 @@ from .openai_chat import (
     schedule_memory_compaction,
 )
 from ..harness.conversation import ConversationAddress
+from ..utils import keytao_batch_review as batch_review
 from ..utils.keytao_batch_review import review_keytao_batch_with_llm
 from ..utils.keytao_review import (
     SEMANTIC_PRONUNCIATION_GATE,
     infer_semantic_pronunciation,
+    rank_code_chain_by_commonness,
 )
 from ..utils.memory_store import ChatMemoryContext
 from ..utils.pending_confirmation import render_remediation_reply
@@ -91,6 +96,100 @@ class KeyTaoBatchReviewRequest(BaseModel):
     batch: Dict[str, Any]
     local_review: Optional[Dict[str, Any]] = None
     focus_pr_id: Optional[int] = None
+
+
+class CommonnessOrderEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    word: str = Field(min_length=1, max_length=30)
+    weight: int | None
+    source: Literal["current", "draft"]
+    prId: int | None = None
+
+    @field_validator("word")
+    @classmethod
+    def check_word(cls, word: str) -> str:
+        if not word.strip() or word.splitlines() != [word]:
+            raise ValueError("word must be non-empty and single-line")
+        return word
+
+    @field_validator("prId")
+    @classmethod
+    def check_pr_id(cls, pr_id: int | None) -> int:
+        if pr_id is None:
+            raise ValueError("prId must be an integer when provided")
+        return pr_id
+
+
+class CommonnessOrderChain(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    code: str = Field(max_length=16)
+    type: str = Field(max_length=16)
+    # shortcut: Cap chains at eight entries while pairwise ranking is O(n²).
+    entries: list[CommonnessOrderEntry] = Field(min_length=2, max_length=8)
+
+
+class CommonnessOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    chains: list[CommonnessOrderChain] = Field(min_length=1, max_length=20)
+
+
+async def _build_commonness_order(raw_body: bytes) -> dict:
+    try:
+        request = CommonnessOrderRequest.model_validate_json(raw_body)
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=error.errors(include_url=False, include_context=False, include_input=False),
+        ) from error
+
+    distinct_words = dict.fromkeys(entry.word for chain in request.chains for entry in chain.entries)
+    if len(distinct_words) > 120:
+        raise HTTPException(status_code=400, detail="At most 120 distinct words are allowed")
+
+    words = {}
+    failed_words = set()
+    for word in distinct_words:
+        try:
+            lines = batch_review.item_commonness(word)
+            if lines:
+                words[word] = lines
+        except Exception as error:
+            failed_words.add(word)
+            logger.warning("web_api: commonness line lookup failed ({})", type(error).__name__)
+
+    chains = []
+    for index, chain in enumerate(request.chains, 1):
+        entries = [
+            {**entry.model_dump(exclude_unset=True), "code": chain.code, "type": chain.type}
+            for entry in chain.entries
+        ]
+        current_words = [entry["word"] for entry in sorted(entries, key=lambda entry: (
+            entry["weight"] is None, entry["weight"], entry["word"],
+        ))]
+        status, ordered_words, evidence = "ask", current_words, []
+        if failed_words.isdisjoint(current_words):
+            try:
+                ranking = await rank_code_chain_by_commonness(entries, offline_only=True)
+                evidence = ranking.get("evidenceLines", [])
+                if ranking["status"] == "already_ordered":
+                    status = "keep"
+                elif ranking["status"] == "reorder":
+                    proposed_words = [entry["word"] for entry in ranking["proposedOrder"]]
+                    if Counter(proposed_words) == Counter(current_words):
+                        status = "keep" if proposed_words == current_words else "reorder"
+                        ordered_words = proposed_words
+            except Exception as error:
+                evidence = []
+                logger.warning("web_api: commonness ranking failed for chain {} ({})",
+                               index, type(error).__name__)
+        chains.append({
+            "code": chain.code, "type": chain.type, "status": status,
+            "orderedWords": ordered_words, "evidence": evidence,
+        })
+    return {"success": True, "chains": chains, "words": words}
 
 
 class KeyTaoPronunciationRequest(BaseModel):
@@ -274,6 +373,15 @@ try:
             raise HTTPException(status_code=502, detail=result.get("message") or "喵喵复审失败")
         return result
 
+    @_app.post("/api/keytao/commonness-order")
+    async def keytao_commonness_order(
+        http_request: Request,
+        authorization: Optional[str] = Header(None),
+    ) -> dict:
+        _check_auth(authorization)
+        raw_body = await http_request.body()
+        return await asyncio.to_thread(lambda: asyncio.run(_build_commonness_order(raw_body)))
+
     @_app.post("/api/keytao/pronunciation")
     async def keytao_pronunciation(
         request: KeyTaoPronunciationRequest,
@@ -344,7 +452,7 @@ try:
 
     logger.info(
         f"web_api: routes registered  POST /api/chat  POST /api/keytao/batches/review  "
-        f"POST /api/keytao/pronunciation  DELETE /api/chat/history  "
+        f"POST /api/keytao/commonness-order  POST /api/keytao/pronunciation  DELETE /api/chat/history  "
         f"(auth={'enabled' if WEB_API_KEY else 'disabled'})"
     )
 

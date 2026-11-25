@@ -744,7 +744,7 @@ def _is_css_item(pr: ReviewItem) -> bool:
     return _string(pr.get("type") or "Phrase") in {"CSS", "CSSSingle"}
 
 
-def _item_commonness(word: str) -> Dict[str, str]:
+def item_commonness(word: str) -> Dict[str, str]:
     reference = _query_commonness_reference(word)
     commonness = {}
     bcc = reference.get("bcc") or {}
@@ -1056,7 +1056,7 @@ def _normalize_llm_review(
         }
         if items_only:
             try:
-                normalized_item["reviewRecord"]["commonness"] = _item_commonness(word)
+                normalized_item["reviewRecord"]["commonness"] = item_commonness(word)
             except Exception as error:
                 logger.warning(f"KeyTao batch review commonness failed for PR {pr_id}: {error}")
             if suggested_orders and pr_id in suggested_orders:
