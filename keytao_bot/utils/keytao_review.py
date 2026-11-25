@@ -521,6 +521,10 @@ def llm_config() -> Dict[str, Any]:
             or DEFAULT_LLM_MODEL
         ),
         "max_tokens": max_tokens,
+        "review_min_max_tokens": _as_int(
+            _config_value("keytao_review_min_max_tokens", "KEYTAO_REVIEW_MIN_MAX_TOKENS", 6000),
+            6000,
+        ),
         "max_tokens_cap": min(
             max(
                 _as_int(
@@ -537,8 +541,11 @@ def llm_config() -> Dict[str, Any]:
     }
 
 
-def get_llm_client(client_factory: Any, base_url: str, api_key: str, timeout: float) -> Any:
-    """Return a lazily created, reused ``AsyncOpenAI`` keyed by (base_url, api_key).
+def get_llm_client(
+    client_factory: Any, base_url: str, api_key: str, timeout: float,
+    *, max_retries: Optional[int] = None,
+) -> Any:
+    """Reuse the connection pool while applying each operation's SDK options.
 
     ``client_factory`` identity is part of the key so that a patched constructor
     in tests never picks up a client built by the real one.
@@ -550,7 +557,9 @@ def get_llm_client(client_factory: Any, base_url: str, api_key: str, timeout: fl
     if client is None:
         client = client_factory(api_key=api_key, base_url=base_url, timeout=timeout)
         _llm_clients[key] = client
-    return client
+    if max_retries is None:
+        return client.with_options(timeout=timeout)
+    return client.with_options(timeout=timeout, max_retries=max_retries)
 
 
 def _review_llm_config() -> Dict[str, Any]:
@@ -5090,11 +5099,8 @@ async def _infer_semantic_pronunciation_proposal(
     }
 
     try:
-        client = AsyncOpenAI(
-            api_key=config["api_key"],
-            base_url=config["base_url"],
-            timeout=config["timeout"],
-            max_retries=1,
+        client = get_llm_client(
+            AsyncOpenAI, config["base_url"], config["api_key"], config["timeout"], max_retries=1,
         )
         response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
             {
@@ -8044,6 +8050,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 task.cancel()
     approved_item_ids: List[int] = []
     sealed_item_ids: List[int] = []
+    sealed_item_reasons: Dict[int, str] = {}
     for item, outcome in zip(items, outcomes):
         issues.extend(outcome.issues)
         sealed_issues.extend(outcome.sealed_issues)
@@ -8051,6 +8058,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         item_id = item.get("id")
         if type(item_id) is int and item_id > 0 and outcome.sealed_issues:
             sealed_item_ids.append(item_id)
+            sealed_item_reasons[item_id] = outcome.sealed_issues[0]
         if (
             type(item_id) is int and item_id > 0
             and outcome.approved_items and not (outcome.issues or outcome.sealed_issues or outcome.skipped_items)
@@ -8125,6 +8133,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         # Subset of ``issues`` that code has sealed: no LLM pass may reopen them.
         "structuredManualReviewIssues": sealed_issues,
         "sealedItemIds": sealed_item_ids,
+        "sealedItemReasons": sealed_item_reasons,
         "approvedItems": approved_items,
         "approvedItemIds": approved_item_ids,
         "skippedItems": skipped_items,

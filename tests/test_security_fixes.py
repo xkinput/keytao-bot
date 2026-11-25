@@ -1294,7 +1294,7 @@ def test_web_api_auth_surface():
 
 def test_batch_review_output_header_is_an_authenticated_opt_in():
     import importlib
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import ANY, AsyncMock, patch
 
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -1327,13 +1327,13 @@ def test_batch_review_output_header_is_an_authenticated_opt_in():
         items = client.post(path, json=body, headers={**auth, **item_headers})
         assert items.status_code == 200
         assert set(items.json()["aiReview"]) == {"generatedAt", "items"}
-        mock_review.assert_awaited_once_with(**body, items_only=True)
+        mock_review.assert_awaited_once_with(**body, items_only=True, deadline_ms=280_000, is_disconnected=ANY)
 
         for headers in (auth, {**auth, "X-KeyTao-Review-Output": "unknown"}):
             full = client.post(path, json=body, headers=headers)
             assert full.status_code == 200
             assert full.json()["aiReview"]["headline"] == "Full review"
-            mock_review.assert_awaited_with(**body, items_only=False)
+            mock_review.assert_awaited_with(**body, items_only=False, deadline_ms=170_000, is_disconnected=ANY)
 
 
 # ---------------------------------------------------------------------------

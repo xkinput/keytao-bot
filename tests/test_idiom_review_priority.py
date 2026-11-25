@@ -100,7 +100,7 @@ class IdiomReviewPriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(audit["semanticContextAutoPassItems"][0]["basisLine"].startswith("语言常识："))
         self.assertEqual(("pass", "medium", "仅凭语言常识"),
                          (matching["status"], matching["priority"], matching["priorityReason"]))
-        self.assertEqual(("manual_review", "high", "编码未经候选链佐证"),
+        self.assertEqual(("manual_review", "high", audit["structuredManualReviewIssues"][0]),
                          (mismatching["status"], mismatching["priority"], mismatching["priorityReason"]))
         self.assertEqual(prepared["commonSenseSources"], matching["reviewRecord"]["commonSenseSources"])
 
@@ -158,7 +158,7 @@ class IdiomReviewPriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("lookup_unavailable", prepared["reviewVerdictSite"])
         audit, (item,) = await self.audit_and_review(CODE)
         self.assertEqual([1], audit["sealedItemIds"])
-        self.assertEqual(("manual_review", "high", "读音或编码查询未完成"),
+        self.assertEqual(("manual_review", "high", audit["structuredManualReviewIssues"][0]),
                          (item["status"], item["priority"], item["priorityReason"]))
 
     async def test_weak_semantic_evidence_stays_sealed(self):

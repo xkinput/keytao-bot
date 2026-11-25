@@ -96,6 +96,7 @@ class KeyTaoBatchReviewRequest(BaseModel):
     batch: Dict[str, Any]
     local_review: Optional[Dict[str, Any]] = None
     focus_pr_id: Optional[int] = None
+    deadline_ms: Optional[int] = Field(default=None, strict=True, ge=10_000, le=290_000)
 
 
 class CommonnessOrderEntry(BaseModel):
@@ -358,16 +359,20 @@ try:
 
     @_app.post("/api/keytao/batches/review")
     async def keytao_batch_review(
+        http_request: Request,
         request: KeyTaoBatchReviewRequest,
         authorization: Optional[str] = Header(None),
         review_output: Optional[str] = Header(None, alias="X-KeyTao-Review-Output"),
     ) -> dict:
         _check_auth(authorization)
+        items_only = review_output == "items"
         result = await review_keytao_batch_with_llm(
             batch=request.batch,
             local_review=request.local_review,
             focus_pr_id=request.focus_pr_id,
-            items_only=review_output == "items",
+            items_only=items_only,
+            deadline_ms=request.deadline_ms or (280_000 if items_only else 170_000),
+            is_disconnected=http_request.is_disconnected,
         )
         if not result.get("success"):
             raise HTTPException(status_code=502, detail=result.get("message") or "喵喵复审失败")

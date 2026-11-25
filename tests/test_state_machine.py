@@ -16185,7 +16185,7 @@ def test_batch_review_chunks_large_batches_and_isolates_failures():
         ]
         calls = []
 
-        async def fake_call(_batch, chunk, _audit, _local_review, _focus, *, items_only):
+        async def fake_call(_batch, chunk, _audit, _local_review, _focus, *, items_only, deadline):
             assert not items_only
             ids = [item["id"] for item in chunk]
             calls.append(ids)
@@ -16275,7 +16275,7 @@ def test_batch_review_retries_length_with_more_output_tokens():
 
         budgets = [call.get("max_tokens") for call in client.completions.calls]
         check("length response with parseable content is retried", len(budgets) == 2)
-        check("retry doubles output budget", budgets == [2500, 5000])
+        check("retry doubles review-specific output budget", budgets == [6000, 12000])
         check("retry returns parsed review", raw.get("items", [{}])[0].get("prId") == 1)
         check(
             "all batch review attempts enable DeepSeek thinking",
@@ -16426,7 +16426,7 @@ def test_items_only_batch_review_preserves_review_evidence_through_retries_and_f
                 "suggestions": ["保持编码"],
                 "sources": ["汉典"],
                 "evidence": ["词典支持"],
-            } for item_id in (1, 2)],
+            } for item_id in (1,)],
             "headline": "Unexpected summary",
         })
         client = _FakeClient([
@@ -16448,11 +16448,11 @@ def test_items_only_batch_review_preserves_review_evidence_through_retries_and_f
             patch.object(module, "AsyncOpenAI", new=object()),
             patch.object(module, "get_llm_client", return_value=client),
             patch.object(module, "_llm_config", return_value=config),
-            patch.object(module, "_review_chunk_size", return_value=2),
+            patch.object(module, "_review_chunk_size", return_value=1),
             patch.object(module, "_review_chunk_concurrency", return_value=1),
         ):
             result = await module.review_keytao_batch_with_llm(
-                batch, local_review, focus_pr_id=2, precomputed_audit=audit, items_only=True,
+                batch, local_review, focus_pr_id=1, precomputed_audit=audit, items_only=True,
             )
 
         review = result["aiReview"]
@@ -16462,12 +16462,13 @@ def test_items_only_batch_review_preserves_review_evidence_through_retries_and_f
         assert result["warning"]
         assert [item["status"] for item in review["items"]] == ["pass", "manual_review", "attention"]
         assert review["items"][0]["reviewRecord"]["sources"] == ["汉典"]
+        assert review["items"][1]["reviewRecord"]["source"] == "bot-deterministic"
         assert review["items"][2]["reviewRecord"]["source"] == "bot-llm-fallback"
         payloads = [json.loads(call["messages"][1]["content"]) for call in client.completions.calls]
         assert len(payloads) == 5
         assert all(set(payload["requiredJsonShape"]) == {"items"} for payload in payloads)
         assert all(set(payload["localReview"]) == {"items", "codeChains"} for payload in payloads)
-        assert [payload["focusPrId"] for payload in payloads] == [2, 2, None, None, None]
+        assert [payload["focusPrId"] for payload in payloads] == [1, 1, None, None, None]
         assert payloads[0]["localReview"]["codeChains"][0]["before"] == [{"word": "同链词"}]
         assert payloads[0]["deterministicAudit"]["lookupFailed"] is True
 
@@ -16845,6 +16846,9 @@ class _FakeClient:
         completions = _FakeCompletions(responses)
         self.chat = types.SimpleNamespace(completions=completions)
         self.completions = completions
+
+    def with_options(self, **_kwargs):
+        return self
 
 
 class _FakeSkillsManager:
