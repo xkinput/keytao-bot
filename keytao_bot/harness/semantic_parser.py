@@ -24,7 +24,12 @@ from .authorization_grammar import (
 )
 from .operation_request import OperationRequest
 from .state import PendingAddWord
-from ..plugins.chat_routing import _load_json_object_from_model_text, _multi_word_candidate_scope_rows, _strip_command_message_prefixes
+from ..plugins.chat_routing import (
+    _load_json_object_from_model_text,
+    _multi_word_candidate_scope_rows,
+    _parse_explicit_order_reorder_command,
+    _strip_command_message_prefixes,
+)
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.observability import observe_model_call
 
@@ -88,7 +93,7 @@ recode: change an existing entry to a different code.
 Keep 为/是/改为/改成 out of operands; they connect each literal word to its target code.
 删除"X"编码，添加"X"为C and 删除"X"的编码C0，添加"X"的编码为C mean one same-word recode,
 not delete or add: operands [X], codes [C] or [C0, C] when the old code is explicit.
-reorder: change candidate order on a code or chain, including X 优先于 Y, 提到前面, or reordering one or more codes (e.g. 重新排序 jdt jdtv jdtvo 三个编码的词条 -> operands [], codes ["jdt", "jdtv", "jdtvo"]; never copy generic nouns like 词条/编码/顺序 into operands). For two-word priority, operands is the word to put first, then the word it goes ahead of.
+reorder: change candidate order on a code or chain, including X 优先于 Y, 提到前面, or reordering one or more codes (e.g. 重新排序 jdt jdtv jdtvo 三个编码的词条 -> operands [], codes ["jdt", "jdtv", "jdtvo"]; never copy generic nouns like 词条/编码/顺序 into operands). For an explicit user-specified target order (e.g. 重新排序为 A > B > C, 按 A > B > C 排序, A > B > C), set relation to explicit_order and operands to [A, B, C] in that exact order. For two-word priority, operands is the word to put first, then the word it goes ahead of.
 move: move/insert an entry at a specific code position, or replace the entry at a code.
 顺延X, 把X顺延, X顺延 and 顺延X一位 mean move only when X is quoted or exactly names a word in the quoted bot reply or OWN live ticket.
 Never infer X from conversational text beside 顺延 (确认顺延, 取消顺延, 先别顺延, 顺延就行).
@@ -327,9 +332,29 @@ def validate_operation(
                "frame": "direct", "relation": "", "refers_to_pending": False,
                "submit_after": False}
 
+    explicit_order = _parse_explicit_order_reorder_command(message)
+    if (
+        explicit_order is not None
+        and raw.get("frame") not in {"question", "negated", "reported"}
+        and _backstop_frame(message, "reorder") == "direct"
+    ):
+        op = "reorder"
+        raw = {
+            **raw,
+            "op": "reorder",
+            "operands": list(explicit_order.words),
+            "codes": [],
+            "frame": "direct",
+            "relation": "explicit_order",
+            "refers_to_pending": False,
+            "submit_after": False,
+        }
+
     violations = []
     relation = raw.get("relation", "")
-    if relation not in ("", "replace"):
+    if relation not in ("", "replace", "explicit_order") or (
+        relation == "explicit_order" and op != "reorder"
+    ):
         relation = ""
         violations.append("invalid_relation")
     submit_command = (

@@ -594,12 +594,297 @@ class CodeListReorderTests(unittest.IsolatedAsyncioTestCase):
             "依据：关键证据：基督徒 BCC 多领域 4.56/百万，超导体 BCC 多领域 0.44/百万，进度条 语料3/词典1（BCC未收录）",
             response,
         )
+        self.assertIn(
+            "如需手动排序，可引用本条回复「重新排序为 基督徒 > 超导体 > 进度条」（按你想要的顺序）。",
+            response,
+        )
         token = self.chat._current_turn_message.set("喵喵 重新排序 jdt jdtv jdtvo 三个编码的词条")
         try:
             guarded = self.chat._enforce_advertised_reply_contract(response, self.author)
         finally:
             self.chat._current_turn_message.reset(token)
         self.assertIn("• 进度条：jdtvo / 100（词库，保持不变）", guarded)
+        self.assertIn(
+            "如需手动排序，可引用本条回复「重新排序为 基督徒 > 超导体 > 进度条」（按你想要的顺序）。",
+            guarded,
+        )
+
+    def test_explicit_order_reorder_parser_accepts_natural_forms_and_rejects_unsafe_frames(self):
+        parse_explicit = self.routing._parse_explicit_order_reorder_command
+        parse_word_list = self.routing._parse_word_list_reorder_command
+
+        accepted = {
+            "重新排序为 进度条 > 基督徒 > 超导体": ("进度条", "基督徒", "超导体"),
+            "喵喵 重新排序为 进度条 > 基督徒 > 超导体": ("进度条", "基督徒", "超导体"),
+            "重新排序为：进度条 ＞ 基督徒 ＞ 超导体": ("进度条", "基督徒", "超导体"),
+            "重排为 进度条 → 基督徒 → 超导体": ("进度条", "基督徒", "超导体"),
+            "排序为 进度条 -> 基督徒 -> 超导体": ("进度条", "基督徒", "超导体"),
+            "顺序改为 进度条、基督徒、超导体": ("进度条", "基督徒", "超导体"),
+            "重新排序为 进度条 基督徒 超导体": ("进度条", "基督徒", "超导体"),
+            "改为 进度条 > 基督徒 > 超导体": ("进度条", "基督徒", "超导体"),
+            "按 进度条 > 基督徒 > 超导体 排序": ("进度条", "基督徒", "超导体"),
+            "按 进度条 → 基督徒 → 超导体 重排": ("进度条", "基督徒", "超导体"),
+            "进度条 > 基督徒 > 超导体": ("进度条", "基督徒", "超导体"),
+            "进度条 → 基督徒 → 超导体": ("进度条", "基督徒", "超导体"),
+            "进度条 > 超导体": ("进度条", "超导体"),
+            "请帮我重新排序为 进度条 > 基督徒 > 超导体。": ("进度条", "基督徒", "超导体"),
+        }
+        for message, expected in accepted.items():
+            with self.subTest(message=message):
+                parsed = parse_explicit(message)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.words, expected)
+                understood = understand_message(message)
+                self.assertEqual(understood.op, "reorder")
+                self.assertEqual(understood.operands, expected)
+                self.assertEqual(understood.codes, ())
+                self.assertEqual(understood.relation, "explicit_order")
+
+        # Commonness-ranked word-list reorder must NOT be hijacked as explicit order.
+        for commonness_msg in (
+            "重新排序 米等 幂等 迷瞪",
+            "重新排序下 米等 幂等 迷瞪",
+            "米等 幂等 迷瞪 排一下",
+        ):
+            with self.subTest(commonness_msg=commonness_msg):
+                self.assertIsNone(parse_explicit(commonness_msg))
+                self.assertIsNotNone(parse_word_list(commonness_msg))
+
+        for rejected in (
+            "不要重新排序为 进度条 > 基督徒 > 超导体",
+            "别改为 进度条 > 基督徒 > 超导体",
+            "重新排序为 进度条 > 基督徒 > 超导体 吗？",
+            "可以重新排序为 进度条 > 基督徒 > 超导体吗",
+            "他说重新排序为 进度条 > 基督徒 > 超导体",
+            "「重新排序为 进度条 > 基督徒 > 超导体」",
+            "重新排序为 进度条 > 进度条 > 超导体",
+            "重新排序为 进度条 > 基督徒 > 超导体 然后提交",
+            "重新排序为 jdt > jdtv > jdtvo",
+            "按 常用度 排序",
+            "超导体 → 基督徒",
+            "改为 春暖花开",
+        ):
+            with self.subTest(rejected=rejected):
+                self.assertIsNone(parse_explicit(rejected))
+
+        rendered = self.commands.render_understood_command(
+            OperationRequest(
+                op="reorder",
+                operands=("进度条", "基督徒", "超导体"),
+                relation="explicit_order",
+            ),
+        )
+        self.assertEqual(rendered, "重新排序为 进度条 > 基督徒 > 超导体")
+        self.assertEqual(
+            understand_message(rendered).relation,
+            "explicit_order",
+        )
+
+    async def test_quoted_live_plan_manual_reorder_auto_encodes_and_requires_reconfirmation(self):
+        # Exact production setup: 超导体 has both jdt and fly-key wdtv!
+        self.rows = [
+            {"word": "超导体", "code": "jdt", "type": "Phrase", "weight": 100},
+            {"word": "超导体", "code": "wdtv", "type": "Phrase", "weight": 100},
+            {"word": "基督徒", "code": "jdtv", "type": "Phrase", "weight": 100},
+            {"word": "进度条", "code": "jdtvo", "type": "Phrase", "weight": 100},
+        ]
+        self.candidates = {
+            "超导体": ["jdt", "jdtv", "jdtva", "jdtvai", "wdt", "wdtv", "wdtva", "wdtvai"],
+            "基督徒": ["jdt", "jdtv", "jdtvi", "jdtviu"],
+            "进度条": ["jdt", "jdtv", "jdtvo", "jdtvou"],
+        }
+        ranking = {
+            "status": "reorder",
+            "reason": "comparison_edges",
+            "currentOrder": [self.rows[0], self.rows[2], self.rows[3]],
+            "proposedOrder": [self.rows[2], self.rows[0], self.rows[3]],
+            "comparisons": [{"summary": "「基督徒」较「超导体」更常用"}],
+            "evidenceLines": [
+                "「基督徒」：BCC 多领域 1,842（每百万 4.56）；词典收录 2",
+                "「超导体」：BCC 多领域 176（每百万 0.44）；词典收录 3",
+                "「进度条」：语料频次 3，词典收录 1；现代四频道均未收录",
+            ],
+        }
+        with patch.object(
+            self.commands.keytao_review,
+            "rank_code_chain_by_commonness",
+            AsyncMock(return_value=ranking),
+        ):
+            handled, initial_plan = await self.run_semantic_stage(
+                "喵喵 重新排序 jdt jdtv jdtvo 三个编码的词条",
+                raw_operation(op="reorder", operands=[], codes=["jdt", "jdtv", "jdtvo"]),
+            )
+        self.assertTrue(handled)
+        self.assertIn("如需手动排序，可引用本条回复「重新排序为 基督徒 > 超导体 > 进度条」", initial_plan)
+        self.assertEqual(self.writes, [])
+
+        # Step 2: User quotes the live plan and specifies manual order.
+        # Even if the semantic model omits relation="explicit_order", validator promotes it!
+        self.client.create.return_value.choices[0].message.content = json.dumps(
+            raw_operation(
+                op="reorder",
+                operands=["进度条", "基督徒", "超导体"],
+                codes=[],
+                relation="",
+            ),
+            ensure_ascii=False,
+        )
+        ctx = self.chat.TurnContext(
+            bot=None, event=None, platform="qq", user_id=self.author.actor_id,
+            normalized_message_text="重新排序为 进度条 > 基督徒 > 超导体",
+            conv_key=self.author,
+            space_key=self.author.space_key, owner_label="Rea",
+            reply_reference=self.chat.ReplyReferenceInfo(
+                is_reply=True, is_to_bot=True, text=initial_plan, message_id="msg-plan-1",
+            ),
+        )
+        with patch.dict(os.environ, {
+            "KEYTAO_SEMANTIC_ROUTE_OPS": "reorder,direct_exec,pending_release,pending_answer",
+            "KEYTAO_SEMANTIC_SHADOW": "0",
+        }):
+            handled = await self.chat._stage_understand_operation_early(ctx)
+        self.assertTrue(handled)
+        manual_plan = ctx.response
+        self.assertEqual(self.writes, [], "manual reorder must ALWAYS ask for confirmation first")
+        self.assertIn("• 进度条：jdtvo / 100（词库）→ jdt / 100", manual_plan)
+        self.assertIn("• 基督徒：jdtv / 100（词库，保持不变）", manual_plan)
+        self.assertIn("• 超导体：jdt / 100（词库）→ jdtva / 100", manual_plan)
+        self.assertIn("依据：按你指定的顺序：进度条 > 基督徒 > 超导体", manual_plan)
+        self.assertIn("回复「确认」执行，或「取消」。", manual_plan)
+
+        # Delivery guard must accept the new plan AND its manual-order hint verbatim.
+        token = self.chat._current_turn_message.set("重新排序为 进度条 > 基督徒 > 超导体")
+        try:
+            guarded = self.chat._enforce_advertised_reply_contract(manual_plan, self.author)
+        finally:
+            self.chat._current_turn_message.reset(token)
+        self.assertIn("• 超导体：jdt / 100（词库）→ jdtva / 100", guarded)
+        self.assertIn("回复「确认」执行，或「取消」。", guarded)
+
+        # Step 3: User replies 确认 -> exact auto-encoded write executes, wdtv untouched!
+        confirmed = await self.answer("确认")
+        self.assertEqual(len(self.writes), 1, confirmed)
+        self.assertIn("✅ 操作已完成", confirmed)
+        self.assertEqual(
+            {(item["action"], item["word"], item["code"]) for item in self.writes[0]},
+            {
+                ("Delete", "进度条", "jdtvo"), ("Create", "进度条", "jdt"),
+                ("Delete", "超导体", "jdt"), ("Create", "超导体", "jdtva"),
+            },
+        )
+        self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_quoted_expired_plan_and_occupied_destination_auto_encode_and_shift(self):
+        # Ticket already expired (store is empty), AND jdtva is occupied by 占位词!
+        self.rows = [
+            {"word": "超导体", "code": "jdt", "type": "Phrase", "weight": 100},
+            {"word": "超导体", "code": "wdtv", "type": "Phrase", "weight": 100},
+            {"word": "基督徒", "code": "jdtv", "type": "Phrase", "weight": 100},
+            {"word": "进度条", "code": "jdtvo", "type": "Phrase", "weight": 100},
+            {"word": "占位词", "code": "jdtva", "type": "Phrase", "weight": 100},
+        ]
+        self.candidates = {
+            "超导体": ["jdt", "jdtv", "jdtva", "jdtvai", "wdt", "wdtv"],
+            "基督徒": ["jdt", "jdtv", "jdtvi", "jdtviu"],
+            "进度条": ["jdt", "jdtv", "jdtvo", "jdtvou"],
+            "占位词": ["jdt", "jdtv", "jdtva", "jdtvai"],
+        }
+        expired_quote = (
+            "🔁 调整计划：\n"
+            "• 基督徒：jdtv / 100（词库）→ jdt / 100\n"
+            "• 超导体：jdt / 100（词库）→ jdtv / 100\n"
+            "• 进度条：jdtvo / 100（词库，保持不变）\n"
+            "回复「确认」执行，或「取消」。"
+        )
+        self.client.create.return_value.choices[0].message.content = json.dumps(
+            raw_operation(
+                op="reorder",
+                operands=["进度条", "基督徒", "超导体"],
+                codes=[],
+                relation="explicit_order",
+            ),
+            ensure_ascii=False,
+        )
+        ctx = self.chat.TurnContext(
+            bot=None, event=None, platform="qq", user_id=self.author.actor_id,
+            normalized_message_text="重新排序为 进度条 > 基督徒 > 超导体",
+            conv_key=self.author,
+            space_key=self.author.space_key, owner_label="Rea",
+            reply_reference=self.chat.ReplyReferenceInfo(
+                is_reply=True, is_to_bot=True, text=expired_quote, message_id="expired-msg",
+            ),
+        )
+        with patch.dict(os.environ, {
+            "KEYTAO_SEMANTIC_ROUTE_OPS": "reorder,direct_exec,pending_release,pending_answer",
+            "KEYTAO_SEMANTIC_SHADOW": "0",
+        }):
+            handled = await self.chat._stage_understand_operation_early(ctx)
+        self.assertTrue(handled)
+        self.assertEqual(self.writes, [])
+        self.assertIn("• 进度条：jdtvo / 100（词库）→ jdt / 100", ctx.response)
+        self.assertIn("• 超导体：jdt / 100（词库）→ jdtva / 100", ctx.response)
+        self.assertIn("• 占位词：jdtva→jdtvai（顺延）", ctx.response)
+        self.assertIn("回复「确认」执行，或「取消」。", ctx.response)
+
+        confirmed = await self.answer("确认")
+        self.assertEqual(len(self.writes), 1, confirmed)
+        self.assertIn(("Delete", "占位词", "jdtva"), {(i["action"], i["word"], i["code"]) for i in self.writes[0]})
+        self.assertIn(("Create", "占位词", "jdtvai"), {(i["action"], i["word"], i["code"]) for i in self.writes[0]})
+
+    async def test_legacy_path_supersedes_live_reorder_ticket_and_handles_noop(self):
+        self.rows = [
+            {"word": "超导体", "code": "jdt", "type": "Phrase", "weight": 100},
+            {"word": "基督徒", "code": "jdtv", "type": "Phrase", "weight": 100},
+            {"word": "进度条", "code": "jdtvo", "type": "Phrase", "weight": 100},
+        ]
+        self.candidates = {
+            "超导体": ["jdt", "jdtv", "jdtva", "jdtvai"],
+            "基督徒": ["jdt", "jdtv", "jdtvi", "jdtviu"],
+            "进度条": ["jdt", "jdtv", "jdtvo", "jdtvou"],
+        }
+        # Seed a live PendingToolConfirm ticket.
+        self.store.set(
+            self.author,
+            PendingToolConfirm(
+                function_name="keytao_shift_phrase_code",
+                args={"word": "基督徒", "target_code": "jdt", "confirmed_plan_digest": "f" * 64, "expected_content_version": 0},
+                confirmation_source="server_warning",
+            ),
+            space_key=self.author.space_key,
+            owner_label="Rea",
+        )
+        msg = "重新排序为 进度条 > 基督徒 > 超导体"
+        intent = self.routing._structural_draft_management_intent(msg)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.intent, "explicit_order_reorder")
+
+        ctx = self.chat.TurnContext(
+            bot=None, event=None, platform="qq", user_id=self.author.actor_id,
+            message_text=msg, normalized_message_text=msg,
+            conv_key=self.author, space_key=self.author.space_key, owner_label="Rea",
+            current_pending_record=self.store.get_record(self.author),
+            generic_command_intent=intent,
+        )
+        with patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": ""}):
+            await self.chat._stage_arbitrate_active_operation(ctx)
+            self.assertTrue(ctx.generic_intent_is_fresh_command)
+            await self.chat._stage_execute_pending_state(ctx)
+            self.assertIsNone(ctx.response)
+            await self.chat._stage_handle_draft_management(ctx)
+        self.assertIsNotNone(ctx.response)
+        self.assertIn("• 进度条：jdtvo / 100（词库）→ jdt / 100", ctx.response)
+        self.assertIn("• 超导体：jdt / 100（词库）→ jdtva / 100", ctx.response)
+        self.assertEqual(self.writes, [])
+
+        # Already in requested order -> clean no-op, no ticket staged.
+        self.store.delete(self.author)
+        noop_msg = "重新排序为 超导体 > 基督徒 > 进度条"
+        noop_intent = self.routing._structural_draft_management_intent(noop_msg)
+        noop_reply = await self.commands._try_handle_draft_management_command(
+            noop_msg, "qq", self.author.actor_id, self.author.space_key, "Rea", command_intent=noop_intent,
+        )
+        self.assertIn("无需调整", noop_reply)
+        self.assertIsNone(self.store.get_record(self.author))
 
 
 if __name__ == "__main__":

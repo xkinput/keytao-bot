@@ -5595,7 +5595,11 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
 
 def _bare_lexical_query_words(message: str) -> Tuple[str, ...]:
     source = _strip_command_message_prefixes(message).strip()
-    if message_authorizes_mutation(source) or _authorization_grammar.looks_like_mutation_grammar_gap(source):
+    if (
+        message_authorizes_mutation(source)
+        or _authorization_grammar.looks_like_mutation_grammar_gap(source)
+        or _is_scheme_concept_question(source)
+    ):
         return ()
     words = _chat_commands._bare_multi_word_query_words(source)
     if words:
@@ -6594,6 +6598,14 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
         and isinstance(ctx.current_pending_record.state, PendingToolConfirm)
         and not ctx.literal_phrase_word
         and not ctx.released_pending_turn
+        and not (
+            ctx.generic_command_intent.intent == "explicit_order_reorder"
+            and _is_fresh_current_user_command_intent(
+                ctx.generic_command_intent,
+                ctx.normalized_message_text,
+            )
+            and not ctx.current_pending_record.execution_id
+        )
     ):
         ctx.generic_intent_is_fresh_command = False
     if (
@@ -7892,7 +7904,7 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
             )
             return True
     if getattr(ctx, "semantic_pending_released", False):
-        if ctx.response is None:
+        if ctx.response is None and not _is_scheme_concept_question(ctx.normalized_message_text):
             words = _bare_lexical_query_words(ctx.normalized_message_text)
             if words:
                 ctx.response = await _chat_commands._prepare_multi_word_query(
@@ -7984,7 +7996,7 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
                 ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
             )
             return True
-    if ctx.response is None:
+    if ctx.response is None and not _is_scheme_concept_question(ctx.normalized_message_text):
         ctx.response = await _try_handle_simple_single_word_query(
             ctx.normalized_message_text,
             ctx.platform,

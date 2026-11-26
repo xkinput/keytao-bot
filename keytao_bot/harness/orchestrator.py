@@ -216,11 +216,35 @@ def _command_suggestions_match_pending_batch(
     if suggestions and isinstance(state, PendingToolConfirm) and server_warning_ticket_is_complete(state):
         from keytao_bot.plugins import chat_routing
 
+        def _bound_manual_reorder(suggestion: str) -> bool:
+            if state.function_name != "keytao_shift_phrase_code":
+                return False
+            pending_display = state.args.get("_pending_display")
+            shift_plan = pending_display.get("shiftPlan") if isinstance(pending_display, dict) else None
+            proposed_state = shift_plan.get("proposedState") if isinstance(shift_plan, dict) else None
+            if not isinstance(proposed_state, list):
+                return False
+            proposed_words = [
+                str(entry.get("word") or "").strip()
+                for entry in proposed_state
+                if isinstance(entry, dict) and str(entry.get("word") or "").strip()
+            ]
+            parsed = chat_routing._parse_explicit_order_reorder_command(suggestion)
+            return bool(
+                parsed is not None
+                and len(proposed_words) >= 2
+                and len(parsed.words) == len(proposed_words)
+                and set(parsed.words) == set(proposed_words)
+            )
+
         # A draft view is read-only and needs no ticket of its own, so offering
         # it alongside a ticket control does not make the reply unbacked.
         if all(
-            (intent := chat_routing._pending_tool_assent_intent(state, suggestion)) is not None
-            and chat_routing._message_authorizes_pending_state_control(state, suggestion, intent)
+            _bound_manual_reorder(suggestion)
+            or (
+                (intent := chat_routing._pending_tool_assent_intent(state, suggestion)) is not None
+                and chat_routing._message_authorizes_pending_state_control(state, suggestion, intent)
+            )
             for suggestion in suggestions
             if chat_routing.parse_draft_view_command(suggestion) is None
         ):

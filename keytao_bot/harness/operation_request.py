@@ -27,12 +27,12 @@ def understand_message(
     message: str, pending_state: Optional[object] = None,
 ) -> OperationRequest:
     """Recognize a complete command before considering a live ticket answer."""
-    def matched(parser, op, operands=(), codes=(), submit_after=False, pending=False):
+    def matched(parser, op, operands=(), codes=(), submit_after=False, pending=False, relation=""):
         return OperationRequest(
             op=op, operands=tuple(value for value in operands if value),
             codes=tuple(value.lower() for value in codes if value),
             submit_after=submit_after, refers_to_pending=pending,
-            frame="direct", source=f"fast_path:{parser}",
+            frame="direct", source=f"fast_path:{parser}", relation=relation,
         )
 
     selection = grammar.parse_reviewed_selection_command(routing._strip_command_message_prefixes(message))
@@ -50,6 +50,14 @@ def understand_message(
     command = parse_same_code_reorder(message)
     if command is not None:
         return matched("parse_same_code_reorder", "reorder", (command.first_word, command.second_word), (command.first_code, command.second_code))
+    command = routing._parse_explicit_order_reorder_command(message)
+    if command is not None:
+        return matched(
+            "_parse_explicit_order_reorder_command",
+            "reorder",
+            command.words,
+            relation="explicit_order",
+        )
     command = routing._parse_word_list_reorder_command(message)
     if command is not None:
         return matched("_parse_word_list_reorder_command", "reorder", command.words)

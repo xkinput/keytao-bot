@@ -240,7 +240,9 @@ def _resolve_advertised_word_set_selection(
 
 
 _LEADING_COMMAND_PREFIX_RE = re.compile(
-    r"^(?:@\S+|键道|喵喵)[\s:：，,]*",
+    r"^(?:(?:@\S+|喵喵)[\s:：，,]*|"
+    r"键道(?:[\s:：，,]+|(?=(?:查词|查询|查一下|加词|添加|新增|删词|删除|改码|修改|"
+    r"重排|重新排序|排序|提交|撤回|清空|查看草稿|顺延|换码|顶替|替换|对调|调换))))",
     re.IGNORECASE,
 )
 
@@ -289,6 +291,136 @@ class WordListReorderCommand:
     """One explicit ordered list whose scope must be resolved server-side."""
 
     words: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExplicitOrderReorderCommand:
+    """One explicit user-specified target ordering (e.g. 重新排序为 A > B > C)."""
+
+    words: Tuple[str, ...]
+
+
+_EXPLICIT_ORDER_WORD_PATTERN = r"[\u3400-\u9fff]{1,30}"
+_EXPLICIT_ORDER_GT_SEP_PATTERN = r"\s*>\s*"
+_EXPLICIT_ORDER_ARROW_SEP_PATTERN = r"\s*(?:→|->)\s*"
+_EXPLICIT_ORDER_STRICT_SEP_PATTERN = r"\s*(?:>|→|->)\s*"
+_EXPLICIT_ORDER_LIST_SEP_PATTERN = r"(?:\s*(?:>|→|->|[、,，]+)\s*|\s+)"
+_EXPLICIT_ORDER_POLITE_PATTERN = (
+    r"(?:(?:请|请你|请帮我|帮我|帮忙|麻烦|麻烦你|劳驾|拜托|给我)\s*)?"
+)
+_EXPLICIT_ORDER_REORDER_TO_RE = re.compile(
+    rf"^{_EXPLICIT_ORDER_POLITE_PATTERN}"
+    r"(?:重新排序为|重新排为|重排为|排序为|改排为|顺序改为|顺序改成|顺序调整为|"
+    r"手动排序为|自定义排序为)\s*[:：]?\s*"
+    r"(?P<words>.+?)(?:\s*(?:一下|吧))?$"
+)
+_EXPLICIT_ORDER_BY_RE = re.compile(
+    rf"^{_EXPLICIT_ORDER_POLITE_PATTERN}"
+    r"按(?:照)?\s*(?P<words>.+?)\s*"
+    r"(?:重新排序|重新排|重排|排序|排(?:一下|下)?)(?:\s*(?:一下|吧))?$"
+)
+_EXPLICIT_ORDER_SHORT_TO_RE = re.compile(
+    rf"^{_EXPLICIT_ORDER_POLITE_PATTERN}"
+    r"(?:改为|改成|调整为|调为)\s*[:：]?\s*"
+    r"(?P<words>.+?)(?:\s*(?:一下|吧))?$"
+)
+_EXPLICIT_ORDER_FORBIDDEN_WORDS = frozenset({
+    "不要", "别", "确认", "取消", "提交", "查看草稿", "常用度", "优先级",
+})
+
+
+def _split_explicit_order_words(
+    raw_words: str,
+    *,
+    allow_list_sep: bool,
+    allow_two_word_arrow: bool,
+) -> Optional[Tuple[str, ...]]:
+    text = str(raw_words or "").strip()
+    if not text:
+        return None
+    has_arrow = ("→" in text) or ("->" in text)
+    has_gt = bool(re.search(r"(?<!-)>", text))
+    if has_gt and has_arrow:
+        return None
+    if has_gt:
+        tokens = [part.strip() for part in re.split(_EXPLICIT_ORDER_GT_SEP_PATTERN, text)]
+    elif has_arrow:
+        tokens = [part.strip() for part in re.split(_EXPLICIT_ORDER_ARROW_SEP_PATTERN, text)]
+        if len(tokens) < (2 if allow_two_word_arrow else 3):
+            return None
+    elif allow_list_sep:
+        tokens = [
+            part.strip()
+            for part in re.split(_EXPLICIT_ORDER_LIST_SEP_PATTERN, text)
+            if part.strip()
+        ]
+    else:
+        return None
+    if (
+        len(tokens) < 2
+        or len(tokens) > 20
+        or len(set(tokens)) != len(tokens)
+        or any(
+            re.fullmatch(_EXPLICIT_ORDER_WORD_PATTERN, token) is None
+            or token in _EXPLICIT_ORDER_FORBIDDEN_WORDS
+            for token in tokens
+        )
+    ):
+        return None
+    return tuple(tokens)
+
+
+def _parse_explicit_order_reorder_command(
+    message_text: str,
+) -> Optional[ExplicitOrderReorderCommand]:
+    """Parse a positive whole-message explicit target order (e.g. 重新排序为 A > B > C)."""
+    source = unicodedata.normalize(
+        "NFKC",
+        _strip_command_message_prefixes(message_text),
+    ).strip()
+    if (
+        not source
+        or "\n" in source
+        or "\r" in source
+        or re.search(r"[?？\"'“”‘’「」『』]", source)
+        or re.search(r"^(?:不要|别|无需|不用|不必|先不要|暂不|不要再)", source)
+        or re.search(r"^(?:他说|她说|他们说|有人说|引用|转述|例如|比如)[：:]?", source)
+        or _NEGATIVE_MODAL_RE.search(source)
+        or _POSITIONAL_REPORTED_CONTEXT_RE.search(source)
+        or re.search(r"(?:吗|嘛|么|呢|好不好|行不行|可以吗|行吗|好吗)[。.!！~～]?$", source)
+    ):
+        return None
+    source = re.sub(r"[。.!！~～]+$", "", source).strip()
+    match = _EXPLICIT_ORDER_REORDER_TO_RE.fullmatch(source)
+    if match is not None:
+        words = _split_explicit_order_words(
+            match.group("words"),
+            allow_list_sep=True,
+            allow_two_word_arrow=True,
+        )
+        return ExplicitOrderReorderCommand(words=words) if words else None
+    match = _EXPLICIT_ORDER_BY_RE.fullmatch(source)
+    if match is not None:
+        words = _split_explicit_order_words(
+            match.group("words"),
+            allow_list_sep=False,
+            allow_two_word_arrow=True,
+        )
+        return ExplicitOrderReorderCommand(words=words) if words else None
+    match = _EXPLICIT_ORDER_SHORT_TO_RE.fullmatch(source)
+    if match is not None:
+        words = _split_explicit_order_words(
+            match.group("words"),
+            allow_list_sep=False,
+            allow_two_word_arrow=False,
+        )
+        return ExplicitOrderReorderCommand(words=words) if words else None
+    words = _split_explicit_order_words(
+        source,
+        allow_list_sep=False,
+        allow_two_word_arrow=False,
+    )
+    return ExplicitOrderReorderCommand(words=words) if words else None
 
 
 _WORD_LIST_REORDER_WORD_PATTERN = r"[\u3400-\u9fff]{1,30}"
@@ -605,6 +737,7 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "batch_replace_char",
     "code_chain_reorder",
     "code_list_reorder",
+    "explicit_order_reorder",
     "word_list_reorder",
     "entry_swap",
     "entry_move_plan",
@@ -640,12 +773,13 @@ def _strip_command_message_prefixes(message_text: str) -> str:
     changes = _parse_code_word_changes(message_text)
     if changes:
         return "修改 " + " ".join(f"{code} {word}" for code, word in changes)
-    text = strip_self_mention_tokens(_strip_leading_self_mentions(message_text)).strip()
+    text = _strip_leading_self_mentions(message_text).strip()
     while text:
         stripped = _LEADING_COMMAND_PREFIX_RE.sub("", text, count=1).strip()
         if stripped == text:
             break
         text = stripped
+    text = strip_self_mention_tokens(text).strip()
     source = strip_add_command_modifier(text)
     return normalize_glued_add_code(source) or source
 
@@ -2689,6 +2823,12 @@ def _is_fresh_current_user_command_intent(
             command is not None
             and command.codes == command_intent.requested_codes
         )
+    if command_intent.intent == "explicit_order_reorder":
+        command = _parse_explicit_order_reorder_command(message_text)
+        return bool(
+            command is not None
+            and command.words == command_intent.keep_words
+        )
     if command_intent.intent == "word_list_reorder":
         command = _parse_word_list_reorder_command(message_text)
         return bool(
@@ -2745,7 +2885,7 @@ def _is_prefixed_fresh_word_query(message_text: str, normalized_message_text: st
     if not raw or not normalized or raw == normalized:
         return False
     words = _extract_pure_chinese_words(normalized)
-    if not words:
+    if not words or not all(_is_chat_word_query_target(word) for word in words):
         return False
     if (
         parse_pending_assent_phrase(normalized).recognized
@@ -2911,6 +3051,7 @@ def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent
         "batch_replace_char",
         "code_chain_reorder",
         "code_list_reorder",
+        "explicit_order_reorder",
         "word_list_reorder",
         "pending_confirm",
         "pending_cancel",
@@ -2986,6 +3127,13 @@ def _structural_draft_management_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Keep the safest common recall/clear commands independent of the LLM."""
+    explicit_order_reorder = _parse_explicit_order_reorder_command(message_text)
+    if explicit_order_reorder is not None:
+        return MessageCommandIntent(
+            intent="explicit_order_reorder",
+            confidence=1.0,
+            keep_words=explicit_order_reorder.words,
+        )
     word_list_reorder = _parse_word_list_reorder_command(message_text)
     if word_list_reorder is not None:
         return MessageCommandIntent(
@@ -3385,8 +3533,9 @@ _CHAT_SENTENCE_SHAPE_RE = re.compile(
     r"(.)[不没]\1"  # A-not-A questions: 是不是/有没有/要不要
     r"|(?:就|都|也|还|并|根本|完全|真的?)(?:不|没)"
     r"|不(?:需要|用|想|会|能|必)(?![\u3400-\u9fff]?$)"
+    r"|(?:规则|原理|意思|方法|区别|特点|作用)是"
     r"|[了吗呢吧啊呀嘛啦]$"
-    r"|(?:还好|挺好|不错|还行|就行|就好|而已)$"
+    r"|(?:是吧|对吧|对不对|是不是|还好|挺好|不错|还行|就行|就好|而已)$"
 )
 
 
@@ -3459,7 +3608,7 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
         return ()
     if (
         len(structural_words) == 1
-        and _is_bare_word_query_target(structural_words[0])
+        and _is_chat_word_query_target(structural_words[0])
         and not message_authorizes_mutation(message_text)
         and not looks_like_mutation_grammar_gap(message_text)
     ):
