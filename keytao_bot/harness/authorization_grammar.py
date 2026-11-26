@@ -369,9 +369,32 @@ _ORTHOGRAPHY_QUESTION_RE = re.compile(
     r"[哪那]一?[个种]\s*(?:(?:才)?(?:是|算)\s*(?:正字|规范(?:字形|用字|写法|字))|"
     r"写法\s*(?:才|更)?(?:正确|规范))[？?。.!！~～]*\s*$"
 )
+_HOWTO_INTERROGATIVE_RE = re.compile(
+    r"(?:(?<!给)(?:怎么|如何|怎样)(?:写|打|拆|拆分|编|编码|用|使用|读|念|查|查看|算|回事|办|"
+    r"操作|弄|搞|发|说|问|找你|让你|叫你|喊你|给你|跟你|向你|告诉你|"
+    r"加词|加(?:新词|一个|个|这|那|进|到)|加入(?!编码)|添加|新增|删词|删除|改码|改编码|改|调码|调序|"
+    r"重排|重新排序|排序|提交|撤回|清空|绑定|顺延|看草稿|把|"
+    r"(?:给|往|向|在)[\u3400-\u9fff]{1,8}(?:加|添|删|改|排|提交|查))|"
+    r"(?:有哪些|有什么)(?:功能|命令|指令|用法)|"
+    r"(?:你|喵喵)?(?:能|可以)(?:帮我)?(?:做|干)(?:什么|啥|嘛)|"
+    r"(?:你|喵喵)会(?:做)?什么)"
+)
+_USAGE_HELP_QUESTION_RE = re.compile(
+    r"(?:(?<!给)(?:怎么|如何|怎样)(?:找你|让你|叫你|喊你|给你|跟你|向你|告诉你|用你|"
+    r"加词|加(?:新词|一个|个|这|那|进|到)|加入(?!编码)|添加|新增|删词|删除|"
+    r"改码|改编码|调码|调序|重排|重新排序|排序|提交|撤回|清空|绑定|顺延|看草稿|查草稿|查看草稿|"
+    r"操作|使用|用(?:这个|这|你|喵喵|机器人)|问你|问|说|发给你|"
+    r"(?:给|往|向|在)[\u3400-\u9fff]{1,8}(?:加|添|删|改|排|提交|查)|"
+    r"把.{1,16}(?:加|删|改|换|调|排|放|移|挪|提交))|"
+    r"(?:有哪些|有什么)(?:功能|命令|指令|用法)|"
+    r"(?:你|喵喵)?(?:能|可以)(?:帮我)?(?:做|干)(?:什么|啥|嘛)|"
+    r"(?:你|喵喵)会(?:做)?什么|"
+    r"(?:使用说明|使用帮助|用法说明|功能介绍|帮助文档|怎么用喵喵|喵喵怎么用|怎么使用喵喵)|"
+    r"应该怎么(?:做|弄|办|说|发|问|用|加|删|改|排|提交|操作))"
+)
 _INTERROGATIVE_MESSAGE_RE = re.compile(
-    r"(?:[?？]|是什么(?:字|词|意思|规则)?|是啥|怎么(?:写|打|拆|拆分|编|编码|用|读|念|查|算|回事|办)|"
-    r"如何(?:写|打|拆|拆分|编|编码|用|读|念|查|算)|为什么|为啥|有啥用|有什么用|什么意思|啥意思|什么含义|"
+    rf"(?:[?？]|是什么(?:字|词|意思|规则)?|是啥|{_HOWTO_INTERROGATIVE_RE.pattern}|"
+    r"为什么|为啥|有啥用|有什么用|什么意思|啥意思|什么含义|"
     r"^(?:什么时候|何时|多久)(?:才|会|能|在|被|开始|收录|加入|入库|进入).+|"
     r"读什么|读啥|念什么|念啥|是不是.{0,24}(?:吗|嘛|么)|"
     r"(?:^|[\u3400-\u9fff])是不是[\u3400-\u9fff]{2,}|"
@@ -429,6 +452,20 @@ def is_interrogative_message(message: str) -> bool:
         source
         and _INTERROGATIVE_MESSAGE_RE.search(source)
         and not _ACTIONABLE_INSTRUCTION_CLAUSE_RE.search(source)
+    )
+
+
+def is_usage_help_question(message: str) -> bool:
+    """Recognize questions asking how to use the bot or trigger bot operations."""
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    ).strip()
+    if not source:
+        return False
+    return bool(
+        _USAGE_HELP_QUESTION_RE.search(source)
+        and not _ACTIONABLE_INSTRUCTION_CLAUSE_RE.search(source)
+        and not message_authorizes_mutation(source)
     )
 
 
@@ -3426,6 +3463,7 @@ def looks_like_mutation_grammar_gap(message: str) -> bool:
     if (
         not compact
         or re.search(r"[?？]", compact)
+        or is_interrogative_message(source)
         or re.match(r"^(?:请)?(?:解释|说明|复述|翻译|引用|转述|原话)", compact)
         or _NEGATIVE_MODAL_RE.search(compact)
         or re.match(r"^(?:先不要|暂时不|没|未|尚未|并非|无须|毋须|绝不能|甭|勿)", compact)

@@ -46,6 +46,7 @@ from keytao_bot.utils.pending_confirmation import (
     FAILED_WRITE_TEMPLATE_PREFIX,
     SYSTEM_REPLY_TEMPLATE_MARKERS,
     UnansweredChatReply,
+    UsageHelpReply,
     append_unbound_binding_notice,
     already_existing_word_copy,
     already_existing_words_copy,
@@ -55,6 +56,7 @@ from keytao_bot.utils.pending_confirmation import (
     command_suggestions_are_closed_candidate_selections,
     ensure_multi_word_candidate_copy,
     is_closed_draft_view_request,
+    is_safe_usage_help_reply,
     parse_pending_assent_phrase,
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
@@ -96,6 +98,7 @@ from .authorization_grammar import (
     is_character_composition_question,
     is_interrogative_message,
     is_orthography_question,
+    is_usage_help_question,
     looks_like_mutation_grammar_gap,
     message_authorizes_mutation,
     parse_eviction_modified_add,
@@ -130,6 +133,16 @@ READ_ONLY_TURN_GUIDANCE = (
     "不要描述内部处理方式、权限判断或实现细节，不要预测后续结果，"
     "也不要概括之前的失败。"
     "除非当前存在完整确认内容，否则不要建议确认或取消。"
+)
+
+HELP_TURN_GUIDANCE = (
+    "对方正在询问如何使用喵喵或怎么发起操作，请直接以喵喵的身份用自然、简洁的话说明真实支持的用法。"
+    "可以结合对方问的具体场景举例（例如：直接发想查/想加的词，或发「加词 词条」「加词 词条 编码」，"
+    "我会先查重审词并给出候选编码，之后按提示选码加入草稿再「提交」或「确认并提交」；"
+    "改码或调序可直接说「把 A 改到 xxx」「重新排序 ...」；删词说「删除 词条」；查草稿说「查看草稿」；"
+    "首次提交前先在个人页面生成绑定码，用 /bind 绑定码 完成绑定）。"
+    "明确把这些当作用法说明，不要伪造候选列表、不要假装已经生成待确认计划或已写入，"
+    "也不要回复「本次未写入」「没有可确认的计划」或第三人称旁白。"
 )
 
 
@@ -691,6 +704,8 @@ class AgentRequestContext:
     actor_is_bound: Optional[bool] = None
     conversation_only: bool = False
     require_docs_for_tool_free_answer: bool = False
+    help_turn: bool = False
+    lightweight_prompt: bool = False
 
     @property
     def actor_key(self) -> tuple:
@@ -736,12 +751,20 @@ class AgentOrchestrator:
         self._tool_receipt_recorder = tool_receipt_recorder
         self._deterministic_fallback_handler = deterministic_fallback_handler
         self._server_backed_query_reply: Optional[str] = None
+        self._usage_help_reply: Optional[str] = None
 
     def is_server_backed_query_reply(self, reply: object) -> bool:
         """Identify the exact read-only renderer output from the last run."""
         return bool(
             self._server_backed_query_reply
             and str(reply or "") == self._server_backed_query_reply
+        )
+
+    def is_usage_help_reply(self, reply: object) -> bool:
+        """Identify a verified read-only usage-help reply from the last run."""
+        return bool(
+            self._usage_help_reply
+            and str(reply or "") == self._usage_help_reply
         )
 
     async def run(
@@ -753,6 +776,7 @@ class AgentOrchestrator:
         """Emit every final reply through one same-turn loop breaker."""
         _binding_remediation_reply.set(None)
         self._server_backed_query_reply = None
+        self._usage_help_reply = None
         log_grammar_gap_if_needed(
             message,
             mutations_allowed=context.mutations_allowed,
@@ -791,6 +815,14 @@ class AgentOrchestrator:
             self._server_backed_query_reply = finalized
         else:
             self._server_backed_query_reply = None
+        if (
+            termination_state.get("usage_help_reply")
+            and finalized
+            and is_safe_usage_help_reply(message, finalized, help_turn=True)
+        ):
+            self._usage_help_reply = finalized
+        else:
+            self._usage_help_reply = None
         return finalized
 
     async def _run_loop(
@@ -806,12 +838,23 @@ class AgentOrchestrator:
 
         platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(context.platform, '未知')
         platform_ctx = self._build_platform_context(platform_label, context)
-        skill_instructions = self._skills_manager.get_skill_instructions()
-        system_prompt = build_system_prompt(
-            self._system_prompt_core,
-            skill_instructions,
-            platform_ctx,
+        use_lightweight_prompt = bool(
+            context.lightweight_prompt
+            and context.conversation_only
+            and not context.mutations_allowed
+            and not context.visual_context
+            and not context.require_docs_for_tool_free_answer
+            and not context.resolved_advertised_words
         )
+        if use_lightweight_prompt:
+            system_prompt = f"{_CONVERSATION_RETRY_SYSTEM_PROMPT}\n\n{platform_ctx}"
+        else:
+            skill_instructions = self._skills_manager.get_skill_instructions()
+            system_prompt = build_system_prompt(
+                self._system_prompt_core,
+                skill_instructions,
+                platform_ctx,
+            )
         record_history_messages(len(context.history or []))
 
         logger.info(f"📋 System prompt length: {len(system_prompt)} chars")
@@ -876,6 +919,12 @@ class AgentOrchestrator:
             )
 
         orthography_question = is_orthography_question(message)
+        is_help_turn = bool(
+            not context.mutations_allowed
+            and (context.help_turn or is_usage_help_question(message))
+            and not message_authorizes_mutation(message)
+            and not looks_like_mutation_grammar_gap(message)
+        )
         # Image-derived text is untrusted data. Do not expose even read/network tools:
         # a visual prompt injection could otherwise read private data and exfiltrate it.
         tools = None
@@ -948,8 +997,13 @@ class AgentOrchestrator:
             if not context.mutations_allowed:
                 messages.append({
                     "role": "system",
-                    "content": READ_ONLY_TURN_GUIDANCE,
+                    "content": HELP_TURN_GUIDANCE if is_help_turn else READ_ONLY_TURN_GUIDANCE,
                 })
+        elif is_help_turn:
+            messages.append({
+                "role": "system",
+                "content": HELP_TURN_GUIDANCE,
+            })
         tool_schemas: Dict[str, Dict[str, Any]] = {}
         for tool in tools or []:
             function = tool.get("function") if isinstance(tool, dict) else None
@@ -1025,6 +1079,19 @@ class AgentOrchestrator:
                     )
                 return replacement or "没找到要执行的操作，本次未写入。"
             if (
+                is_help_turn
+                and record is None
+                and is_safe_usage_help_reply(
+                    message,
+                    rendered,
+                    contract,
+                    help_turn=True,
+                )
+            ):
+                if termination_state is not None:
+                    termination_state["usage_help_reply"] = True
+                return rendered
+            if (
                 contract.command_suggestions
                 and contract.requires_live_state
                 and not command_suggestions_are_closed_candidate_selections(
@@ -1073,7 +1140,11 @@ class AgentOrchestrator:
             )
 
         current_max_tokens = self._initial_max_tokens(message)
-        current_reasoning_effort = "high"
+        current_reasoning_effort = (
+            "low"
+            if use_lightweight_prompt and supports_thinking_control(self._runtime.model)
+            else "high"
+        )
         tool_free_retry_started = False
         docs_retry_started = False
         turn_metrics = current_turn_metrics()
@@ -4129,9 +4200,16 @@ class AgentOrchestrator:
             return vote_reply
         if reply is None:
             return cls._receipt_completion_reply(receipts) if receipts else None
+        reply_contract = advertised_reply_contract(reply)
         if (
             is_interrogative_message(current_message)
-            and advertised_reply_contract(reply).requires_live_state
+            and reply_contract.requires_live_state
+            and not is_safe_usage_help_reply(
+                current_message,
+                reply,
+                reply_contract,
+                help_turn=bool((termination_state or {}).get("usage_help_reply")),
+            )
         ):
             logger.error(
                 "Replacing review/add affordances emitted for an interrogative turn"
@@ -4678,9 +4756,13 @@ class AgentOrchestrator:
                 # Link labels are authoritative-record surfaces.  Remove every
                 # model/failure-path URL here; the exact trusted record URL is
                 # appended below from ``links``.
-                cleaned = re.sub(r"https?://[^\s)\]]+", "", cleaned)
+                cleaned = re.sub(
+                    r"https?://[^\s<>\"'`\[\]{}（）【】「」『』《》〈〉〔〕〖〗“”‘’，。；：、！？［］｛｝)]+",
+                    "",
+                    cleaned,
+                )
             cleaned = re.sub(
-                r"https?://[^\s)\]]+",
+                r"https?://[^\s<>\"'`\[\]{}（）【】「」『』《》〈〉〔〕〖〗“”‘’，。；：、！？［］｛｝)]+",
                 lambda match: (
                     ""
                     if "/batch/" in urlsplit(match.group(0)).path

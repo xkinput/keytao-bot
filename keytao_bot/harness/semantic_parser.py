@@ -69,7 +69,7 @@ Example: 把春暖花开换成秋高气爽 -> op recode, operands ["春暖花开
 replacing its current occupant: op move, operands [X], codes [<code>], relation replace (spaces optional).
 Example: 顶替abcd为春暖花开 -> op move, operands ["春暖花开"], codes ["abcd"], relation replace.
 For all other relations set relation to an empty string.
-submit_after: boolean, true only when the user explicitly asks to also submit (并提交/加入并提交).
+submit_after: boolean, true only when the user explicitly asks to also submit (并提交/加入并提交/确认并提交).
 refers_to_pending: boolean, true only when answering the sender's OWN live pending_context ticket.
 confidence: high or low; note: short explanation only for low confidence or noteworthy cases, else empty.
 Confidence reflects only certainty about the requested operation and its literal words/codes; never lower it
@@ -80,10 +80,10 @@ Bare words/phrases listed with spaces, 、, commas or newlines, optionally with 
 parentheses, and no add/change verb are query with frame none, never add.
 词频排序：A B C and questions about how words rank by frequency are query with frame none.
 chat: greeting, thanks, banter, emoji or conversation with humans, with no dictionary task.
-help: ask how to use the bot or phrase a request (应该怎么说).
+help: ask how to use the bot, what it can do, or how to perform an operation (我怎么找你加词, 怎么删词, 怎么重排, 怎么绑定, 应该怎么说) without requesting execution on specific target words/codes.
 add: add new words, optionally with codes.
 select_candidate: answer a pending ticket by selecting an index or code, possibly with add/submit wording.
-confirm: bare assent to a pending ticket or plan, including 加入/好/确认/加入并提交 without a new selection.
+confirm: bare assent to a pending ticket or plan, including 加入/好/确认/加入并提交/确认并提交 without a new selection.
 cancel: decline or cancel the pending ticket.
 pending_recode: request a different code for the pending ticket (换码/换一个码).
 swap: swap two existing entries' codes, positions or priority.

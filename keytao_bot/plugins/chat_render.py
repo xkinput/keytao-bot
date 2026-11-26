@@ -78,6 +78,7 @@ def _escape_mv2_segment(text: str) -> str:
 
 def _to_markdownv2(text: str) -> str:
     """Convert common markdown to Telegram MarkdownV2."""
+    text = separate_url_boundaries(text)
     result: list[str] = []
     last = 0
     for m in re.finditer(r'```[\w]*\n?.*?```|`[^`\n]+`', text, re.DOTALL):
@@ -180,6 +181,59 @@ def public_base_for_platform(platform: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
+_PLAIN_URL_RE = re.compile(
+    r"https?://[^\s<>\"'`\[\]{}（）【】「」『』《》〈〉〔〕〖〗“”‘’，。；：、！？［］｛｝]+"
+)
+_URL_TRAILING_ASCII_PUNCT = ",.;:!?"
+
+
+def _trim_url_match_end(url: str) -> str:
+    """Stop at the first unmatched ASCII ')' and trim trailing ASCII punctuation."""
+    depth = 0
+    cutoff = len(url)
+    for index, ch in enumerate(url):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                cutoff = index
+                break
+            depth -= 1
+    trimmed = url[:cutoff]
+    while trimmed and trimmed[-1] in _URL_TRAILING_ASCII_PUNCT:
+        trimmed = trimmed[:-1]
+    return trimmed
+
+
+def separate_url_boundaries(text: str) -> str:
+    """Ensure no URL is immediately followed by closing brackets or punctuation.
+
+    Telegram and other clients' URL auto-linkers swallow adjacent fullwidth
+    brackets/punctuation (e.g. ``https://example.com/profile）``) into the
+    clickable href unless separated by whitespace.
+    """
+    source = str(text or "")
+    if "http://" not in source and "https://" not in source:
+        return source
+    parts: List[str] = []
+    cursor = 0
+    for match in _PLAIN_URL_RE.finditer(source):
+        start = match.start()
+        raw_url = match.group(0)
+        url = _trim_url_match_end(raw_url)
+        if not url or url in {"http://", "https://"}:
+            continue
+        end = start + len(url)
+        parts.append(source[cursor:end])
+        if end < len(source) and not source[end].isspace() and source[end] != "`":
+            parts.append(" ")
+        cursor = end
+    if cursor == 0:
+        return source
+    parts.append(source[cursor:])
+    return "".join(parts)
+
+
 def render_platform_public_links(text: str, platform: str) -> str:
     """Render KeyTao public links on the configured host for one platform."""
     public_base = urlsplit(public_base_for_platform(platform))
@@ -191,18 +245,25 @@ def render_platform_public_links(text: str, platform: str) -> str:
     }
 
     def replace_url(match: re.Match) -> str:
-        source = urlsplit(match.group(0))
+        raw_url = match.group(0)
+        url = _trim_url_match_end(raw_url)
+        suffix = raw_url[len(url):]
+        if not url or url in {"http://", "https://"}:
+            return raw_url
+        source = urlsplit(url)
         if source.hostname not in public_hosts and "/batch/" not in source.path:
-            return match.group(0)
-        return urlunsplit((
+            return raw_url
+        rewritten = urlunsplit((
             public_base.scheme,
             public_base.netloc,
             source.path,
             source.query,
             source.fragment,
         ))
+        return rewritten + suffix
 
-    return re.sub(r"https?://[^\s)\]]+", replace_url, str(text or ""))
+    rendered = _PLAIN_URL_RE.sub(replace_url, str(text or ""))
+    return separate_url_boundaries(rendered)
 
 
 _BARE_BATCH_UUID_RE = re.compile(
@@ -218,10 +279,13 @@ def strip_bare_batch_ids(text: str) -> str:
     urls: List[str] = []
 
     def stash_url(match: re.Match) -> str:
-        urls.append(match.group(0))
-        return f"\x00KEYTAO_URL_{len(urls) - 1}\x00"
+        raw_url = match.group(0)
+        url = _trim_url_match_end(raw_url)
+        suffix = raw_url[len(url):]
+        urls.append(url)
+        return f"\x00KEYTAO_URL_{len(urls) - 1}\x00{suffix}"
 
-    stashed = re.sub(r"https?://[^\s)\]]+", stash_url, str(text or ""))
+    stashed = _PLAIN_URL_RE.sub(stash_url, str(text or ""))
     lines: List[str] = []
     for line in stashed.splitlines():
         cleaned = _BARE_BATCH_UUID_RE.sub("", line)

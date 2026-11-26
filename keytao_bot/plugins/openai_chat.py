@@ -116,6 +116,7 @@ from ..utils.pending_confirmation import (
     ReviewedSelectionReply,
     ServerBackedQueryReply,
     UNBOUND_BINDING_PRECHECK_NOTICE,
+    UsageHelpReply,
     append_unbound_binding_notice as _append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_single_word_candidate_codes,
@@ -124,6 +125,7 @@ from ..utils.pending_confirmation import (
     advertised_word_set_words,
     command_suggestions_are_closed_candidate_selections,
     ensure_multi_word_candidate_copy,
+    is_safe_usage_help_reply,
     parse_pending_candidate_selection,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
@@ -1659,6 +1661,8 @@ async def get_ai_response_core(
     preserve_pending: bool = False,
     conversation_only: bool = False,
     docs_guard_allowed: bool = True,
+    help_turn: bool = False,
+    lightweight_prompt: bool = False,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
 
@@ -1783,6 +1787,21 @@ async def get_ai_response_core(
                 live_record.state,
             )
         )
+        mutations_allowed = (
+            not bool(visual_context) and not preserve_pending
+            and (
+                message_authorizes_mutation(message)
+                or live_pending_authorizes_mutation
+                or bool(resolved_advertised_words)
+            )
+        )
+        effective_help_turn = bool(
+            not mutations_allowed
+            and _structural_draft_management_intent(message) is None
+            and not message_authorizes_mutation(message)
+            and not _authorization_grammar.looks_like_mutation_grammar_gap(message)
+            and (help_turn or _authorization_grammar.is_usage_help_question(message))
+        )
         result = await orchestrator.run(
             message=message,
             context=AgentRequestContext(
@@ -1798,19 +1817,16 @@ async def get_ai_response_core(
                 memory_context=memory_block,
                 visual_context=visual_context,
                 visual_image_count=visual_image_count,
-                mutations_allowed=(
-                    not bool(visual_context) and not preserve_pending
-                    and (
-                        message_authorizes_mutation(message)
-                        or live_pending_authorizes_mutation
-                        or bool(resolved_advertised_words)
-                    )
-                ),
+                mutations_allowed=mutations_allowed,
                 progress_reporter=progress_reporter,
                 resolved_advertised_words=resolved_advertised_words,
                 advertised_snapshot_token=advertised_snapshot_token,
                 conversation_only=(conversation_only or _current_conversational_turn.get() is not None) and not require_docs,
                 require_docs_for_tool_free_answer=require_docs,
+                help_turn=effective_help_turn,
+                lightweight_prompt=bool(
+                    lightweight_prompt and not require_docs and not mutations_allowed and not visual_context
+                ),
             ),
             max_iterations=max_iterations,
         )
@@ -1822,17 +1838,20 @@ async def get_ai_response_core(
                 "branch=orchestrator_query_claim trusted=True"
             )
             result = ServerBackedQueryReply(str(result or ""))
+        elif orchestrator.is_usage_help_reply(result):
+            _current_conversational_turn.set(None)
+            result = UsageHelpReply(str(result or ""))
         if (
             result
             and advertised_reply_contract(result).requires_live_state
-            and not isinstance(result, ServerBackedQueryReply)
+            and not isinstance(result, (ServerBackedQueryReply, UsageHelpReply))
         ):
             actor_is_bound = await _user_resolver.resolve_actor_binding(
                 platform,
                 user_id,
             )
             result = _append_unbound_binding_notice(result, actor_is_bound)
-        if isinstance(result, (ServerBackedQueryReply, UnansweredChatReply)):
+        if isinstance(result, (ServerBackedQueryReply, UnansweredChatReply, UsageHelpReply)):
             return result
         conversational_turn = _current_conversational_turn.get()
         if conversational_turn is not None:
@@ -2683,6 +2702,8 @@ def _enforce_advertised_reply_contract(
     body = _without_binding_precheck_notice(response)
     if isinstance(response, ServerBackedQueryReply):
         body = ServerBackedQueryReply(body)
+    elif isinstance(response, UsageHelpReply):
+        body = UsageHelpReply(body)
     rendered = _enforce_candidate_reply_contract(body, conv_key, query_words=query_words)
     record = conversation_state_store.get_record(conv_key) if conv_key is not None else None
     question = _current_turn_message.get("")
@@ -2704,7 +2725,8 @@ def _enforce_advertised_reply_contract(
             else:
                 rendered = "候选编号无效或重复，请按原候选列表选择；本次未写入。"
     if (
-        record is not None and not record.execution_id
+        not isinstance(rendered, UsageHelpReply)
+        and record is not None and not record.execution_id
         and _user_resolver.resolved_binding_for_notice(record.owner_key.platform, record.owner_key.actor_id) is False
         and advertised_reply_contract(rendered).requires_live_state
         and _advertised_reply_matches_live_record(rendered, record)
@@ -2753,6 +2775,7 @@ def _enforce_candidate_reply_contract(
 ) -> str:
     """Single delivery guard for the advertisement-implies-live-state invariant."""
     server_backed_query = isinstance(response, ServerBackedQueryReply)
+    usage_help_reply = isinstance(response, UsageHelpReply)
     record = (
         conversation_state_store.get_record(conv_key)
         if conv_key is not None
@@ -2811,6 +2834,17 @@ def _enforce_candidate_reply_contract(
         understood = f"想把「{move.word}」调到 {move.target_code}" if move is not None else "看到了操作请求"
         return f"{understood}，但还没有可确认的计划；本次未写入。"
     contract = advertised_reply_contract(text)
+    current_message = _current_turn_message.get("")
+    if (
+        (usage_help_reply or (record is None and not query_words))
+        and is_safe_usage_help_reply(
+            current_message,
+            text,
+            contract,
+            help_turn=usage_help_reply,
+        )
+    ):
+        return UsageHelpReply(text) if usage_help_reply else text
     if contract.command_suggestions:
         replacement = _render_live_shift_record(record) or _render_live_choice_record(record) or _render_live_duplicate_record(record)
         if replacement and _advertised_reply_matches_live_record(replacement, record):
@@ -2823,7 +2857,6 @@ def _enforce_candidate_reply_contract(
     from ..utils.explicit_code import parse_explicit_entry_code_request
     from ..utils.same_code_reorder import parse_same_code_reorder
 
-    current_message = _current_turn_message.get("")
     write_flow = bool(
         not current_message
         or message_authorizes_mutation(current_message)
@@ -5839,6 +5872,21 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             # Model routing cannot release an answer already recognized for this ticket.
             ctx.operation_request = fast_request
             return False
+        targetless_op_question = bool(
+            "help" in route_ops
+            and validated.frame == "question"
+            and not validated.operands
+            and not validated.codes
+            and validated.refers_to_pending is False
+            and validated.op in {
+                "add", "delete", "recode", "reorder", "move", "swap", "batch_replace",
+                "draft_view", "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
+            }
+            and not message_authorizes_mutation(message)
+        )
+        if targetless_op_question:
+            validated = replace(validated, op="help", frame="none")
+            ctx.operation_request = validated
         if (
             validated.op in {"query", "chat", "help"} & route_ops
             and isinstance(pending_decision, dict)
@@ -8059,6 +8107,13 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
                 else replace(ctx.generic_command_intent, has_operation_intent=None)
             ),
             **({"conversation_only": True} if ctx.semantic_nonwrite_route else {}),
+            **({"help_turn": True} if (
+                ctx.semantic_nonwrite_route == "help"
+                or getattr(ctx.operation_request, "op", "") == "help"
+            ) else {}),
+            **({"lightweight_prompt": True} if (
+                ctx.semantic_nonwrite_route in {"chat", "help"} and not docs_guard_allowed
+            ) else {}),
         )
         conversational_turn = _current_conversational_turn.get()
         if conversational_turn is not None and not isinstance(ctx.response, UnansweredChatReply):
@@ -8089,7 +8144,7 @@ def _empty_response_failure(stage: str, step: str) -> str:
 
 async def _stage_normalize_response(ctx: TurnContext) -> bool:
     """Production scenario: review copy and pending guidance normalization remain ordered."""
-    if isinstance(ctx.response, ServerBackedQueryReply):
+    if isinstance(ctx.response, (ServerBackedQueryReply, UsageHelpReply)):
         return False
     ctx.response = _normalize_generated_review_copy(ctx.response)
     record = conversation_state_store.get_record(ctx.conv_key)
@@ -8109,7 +8164,7 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
     metrics = current_turn_metrics()
     if metrics is not None and metrics.tool_calls == 0 and metrics.model_calls >= 2:
         return False
-    if isinstance(ctx.response, ServerBackedQueryReply):
+    if isinstance(ctx.response, (ServerBackedQueryReply, UsageHelpReply)):
         return False
     if (
         ctx.generic_command_intent.intent == "none"
@@ -8133,7 +8188,7 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
 
 async def _stage_scope_language_only_response(ctx: TurnContext) -> bool:
     """Production scenario: reading/meaning turns cannot expose code diagnostics."""
-    if isinstance(ctx.response, (ReviewedSelectionReply, RestoredCandidateReply)):
+    if isinstance(ctx.response, (ReviewedSelectionReply, RestoredCandidateReply, UsageHelpReply)):
         return False
     if getattr(ctx, "semantic_query_candidates_prepared", False):
         return False
@@ -8154,7 +8209,7 @@ async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
     """Draft management replies cannot advertise an unrelated pending mutation."""
     if getattr(ctx, "semantic_pending_released", False):
         return False
-    if isinstance(ctx.response, ServerBackedQueryReply):
+    if isinstance(ctx.response, (ServerBackedQueryReply, UsageHelpReply)):
         return False
     if not advertised_reply_contract(ctx.response).requires_live_state:
         return False

@@ -22,7 +22,7 @@ from ..utils.image_input import (
 from ..utils.llm_policy import log_chat_usage
 from ..utils.memory_store import ChatMemoryContext
 from ..utils.pending_confirmation import render_remediation_reply
-from .chat_render import _split_telegram_text
+from .chat_render import _split_telegram_text, separate_url_boundaries
 
 
 try:
@@ -39,7 +39,7 @@ async def _send_telegram_plain_chunks(
     *,
     reply_to_message_id: Optional[int] = None,
 ) -> None:
-    chunks = _split_telegram_text(text)
+    chunks = _split_telegram_text(separate_url_boundaries(text))
     for index, chunk in enumerate(chunks):
         kwargs: Dict[str, Any] = {"event": event, "message": chunk}
         if index == 0 and reply_to_message_id:

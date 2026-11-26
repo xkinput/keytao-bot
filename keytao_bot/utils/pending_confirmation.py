@@ -25,6 +25,7 @@ from .reply_copy import (
     community_vote_receipt_matches,
     missing_word_card_word,
     no_recommended_candidate,
+    numbered_candidate_codes,
     recommended_candidate_code,
     strip_legacy_occupied_guidance,
 )
@@ -36,6 +37,10 @@ class ServerBackedQueryReply(str):
 
 class UnansweredChatReply(str):
     """A model reply reduced to empty internal narration by finalization."""
+
+
+class UsageHelpReply(str):
+    """Verified instructional help reply whose usage examples are non-stateful."""
 
 
 class ReviewedSelectionReply(ServerBackedQueryReply):
@@ -322,8 +327,8 @@ SYSTEM_REPLY_TEMPLATE_MARKERS = (
 
 
 UNBOUND_BINDING_PRECHECK_NOTICE = (
-    "提示：你还未绑定键道账号，提交前请先绑定"
-    "（请在账号页面生成实际绑定码；绑定说明：https://keytao.vercel.app/profile）。"
+    "提示：你还未绑定键道账号，提交前请先打开链接生成绑定码，并用 /bind 绑定码 完成绑定："
+    "https://keytao.vercel.app/profile"
 )
 
 
@@ -2785,6 +2790,60 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         read_only_single_word_lookup=read_only_single_word_lookup,
         command_suggestions=suggestions,
     )
+
+
+_BARE_LIVE_CONTROL_REPLY_RE = re.compile(
+    r"^(?:请)?(?:直接)?(?:回复|发送)\s*[「“『\"']?"
+    r"(?:确认|确认并提交|加入|加入并提交|都加|都加并提交|添加|添加并提交|取消|强制调序|照做)"
+    r"[」”』\"']?(?:\s*即可(?:执行)?)?[。.!！]?$"
+)
+_FAKE_WRITE_CLAIM_RE = re.compile(
+    r"(?:已(?:经)?(?:成功)?(?:加入|添加到|写入|提交|删除|修改|更新|清空|撤回)"
+    r"(?:当前)?(?:草稿|批次|词库)|批次已加入词库|操作已完成)"
+)
+
+
+def is_safe_usage_help_reply(
+    message: str,
+    text: str,
+    contract: Optional[AdvertisedReplyContract] = None,
+    *,
+    help_turn: bool = False,
+) -> bool:
+    """Allow instructional command examples on genuine bot-usage help turns.
+
+    Never permits forged candidate lists, binding pairs, word-set offers,
+    bare live-ticket prompts, or write-success claims.
+    """
+    from keytao_bot.harness.authorization_grammar import (
+        is_usage_help_question,
+        looks_like_mutation_grammar_gap,
+        message_authorizes_mutation,
+    )
+
+    body = str(text or "").strip()
+    source = str(message or "").strip()
+    if (
+        not body
+        or not source
+        or message_authorizes_mutation(source)
+        or looks_like_mutation_grammar_gap(source)
+    ):
+        return False
+    if not (help_turn or is_usage_help_question(source)):
+        return False
+    resolved = contract if contract is not None else advertised_reply_contract(body)
+    if (
+        resolved.code_choice_advertisement
+        or resolved.word_set_advertisement
+        or resolved.deictic_batch_command
+        or bool(advertised_batch_binding_pairs(body))
+        or bool(numbered_candidate_codes(body))
+        or _BARE_LIVE_CONTROL_REPLY_RE.fullmatch(body) is not None
+        or _FAKE_WRITE_CLAIM_RE.search(body) is not None
+    ):
+        return False
+    return True
 
 
 def ensure_multi_word_candidate_copy(text: str) -> str:
