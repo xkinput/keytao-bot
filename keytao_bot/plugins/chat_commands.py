@@ -6285,44 +6285,74 @@ def _ranked_shift_warning_copy(
 _RANKED_SHIFT_SIGNAL_RE = re.compile(
     r"^「(?P<word>[^」]+)」：(?:整词)?语料频次\s*"
     r"(?P<frequency>无|[\d,.]+)，词典收录\s*"
-    r"(?P<dictionary>无|[\d,.]+)$"
+    r"(?P<dictionary>无|[\d,.]+)"
+    r"(?P<bcc_miss>；现代四频道均未收录.*)?$"
+)
+_RANKED_SHIFT_BCC_SIGNAL_RE = re.compile(
+    r"^「(?P<word>[^」]+)」：BCC\s+(?P<channel>[^；，\s]+)\s+"
+    r"[\d,]+（每百万\s*(?P<per_million>[\d.,]+)）"
+    r"(?:.*词典收录\s*(?P<dictionary>无|[\d,.]+))?$"
+)
+_RANKED_SHIFT_EMPTY_SIGNAL_RE = re.compile(
+    r"^「(?P<word>[^」]+)」：当前没有可核验的语料/词典信号$"
 )
 
 
 def _compact_ranked_shift_evidence(evidence_lines: List[str]) -> str:
     """Keep one decisive visible clause while raw evidence remains in tool logs."""
     unique_lines = list(OrderedDict.fromkeys(evidence_lines))
-    signals: List[Tuple[float, float, str]] = []
+    signals: List[Tuple[int, float, float, str]] = []
     for line in unique_lines:
-        match = _RANKED_SHIFT_SIGNAL_RE.fullmatch(line)
-        if match is None:
-            continue
-        frequency_text = match.group("frequency")
-        dictionary_text = match.group("dictionary")
-        frequency = (
-            0.0
-            if frequency_text == "无"
-            else float(frequency_text.replace(",", ""))
-        )
-        dictionary = (
-            0.0
-            if dictionary_text == "无"
-            else float(dictionary_text.replace(",", ""))
-        )
-        if frequency > 0 and dictionary > 0:
-            summary = (
-                f"{match.group('word')} 语料{frequency_text}/词典{dictionary_text}"
+        bcc_match = _RANKED_SHIFT_BCC_SIGNAL_RE.fullmatch(line)
+        if bcc_match is not None:
+            per_million_text = bcc_match.group("per_million")
+            per_million = float(per_million_text.replace(",", ""))
+            dictionary_text = bcc_match.group("dictionary") or "0"
+            dictionary = (
+                0.0
+                if dictionary_text == "无"
+                else float(dictionary_text.replace(",", ""))
             )
-        elif frequency > 0:
-            summary = f"{match.group('word')} 语料{frequency_text}"
-        elif dictionary > 0:
-            summary = f"{match.group('word')} 词典{dictionary_text}"
-        else:
-            summary = f"{match.group('word')} 无记录"
-        signals.append((frequency, dictionary, summary))
+            summary = (
+                f"{bcc_match.group('word')} BCC "
+                f"{bcc_match.group('channel')} {per_million_text}/百万"
+            )
+            signals.append((2, per_million, dictionary, summary))
+            continue
+        match = _RANKED_SHIFT_SIGNAL_RE.fullmatch(line)
+        if match is not None:
+            frequency_text = match.group("frequency")
+            dictionary_text = match.group("dictionary")
+            frequency = (
+                0.0
+                if frequency_text == "无"
+                else float(frequency_text.replace(",", ""))
+            )
+            dictionary = (
+                0.0
+                if dictionary_text == "无"
+                else float(dictionary_text.replace(",", ""))
+            )
+            if frequency > 0 and dictionary > 0:
+                summary = (
+                    f"{match.group('word')} 语料{frequency_text}/词典{dictionary_text}"
+                )
+            elif frequency > 0:
+                summary = f"{match.group('word')} 语料{frequency_text}"
+            elif dictionary > 0:
+                summary = f"{match.group('word')} 词典{dictionary_text}"
+            else:
+                summary = f"{match.group('word')} 无记录"
+            if match.group("bcc_miss"):
+                summary += "（BCC未收录）"
+            signals.append((1 if frequency > 0 else 0, frequency, dictionary, summary))
+            continue
+        empty_match = _RANKED_SHIFT_EMPTY_SIGNAL_RE.fullmatch(line)
+        if empty_match is not None:
+            signals.append((0, 0.0, 0.0, f"{empty_match.group('word')} 无记录"))
     if signals:
-        signals.sort(key=lambda item: (item[0] > 0, item[0], item[1]), reverse=True)
-        return "关键证据：" + "，".join(summary for _freq, _dict, summary in signals[:3])
+        signals.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return "关键证据：" + "，".join(summary for _tier, _freq, _dict, summary in signals[:5])
     if not unique_lines:
         return ""
     decisive = re.split(r"[；。]", unique_lines[0], maxsplit=1)[0].strip()
@@ -6591,9 +6621,13 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 new_code = str(entry.get("code") or "").strip()
                 old_weight = previous.get("weight")
                 new_weight = entry.get("weight")
-                if old_code == new_code and old_weight == new_weight:
-                    continue
                 source = "草稿" if previous.get("source") == "draft" else "词库"
+                if old_code == new_code and old_weight == new_weight:
+                    lines.append(
+                        f"• {word}：{old_code} / {old_weight}（{source}，保持不变）"
+                    )
+                    displayed_words.add(word)
+                    continue
                 lines.append(
                     f"• {word}：{old_code} / {old_weight}（{source}）"
                     f"→ {new_code} / {new_weight}"

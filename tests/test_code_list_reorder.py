@@ -554,6 +554,53 @@ class CodeListReorderTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("没找到要执行的操作", guarded)
         self.assertNotIn("看到了操作请求", guarded)
 
+    async def test_ranked_plan_shows_unchanged_member_and_all_bcc_evidence(self):
+        self.rows = [
+            {"word": "超导体", "code": "jdt", "type": "Phrase", "weight": 100},
+            {"word": "基督徒", "code": "jdtv", "type": "Phrase", "weight": 100},
+            {"word": "进度条", "code": "jdtvo", "type": "Phrase", "weight": 100},
+        ]
+        self.candidates = {
+            "超导体": ["jdt", "jdtv", "jdtva", "jdtvai"],
+            "基督徒": ["jdt", "jdtv", "jdtvi", "jdtviu"],
+            "进度条": ["jdt", "jdtv", "jdtvo", "jdtvou"],
+        }
+        ranking = {
+            "status": "reorder",
+            "reason": "comparison_edges",
+            "currentOrder": list(self.rows),
+            "proposedOrder": [self.rows[1], self.rows[0], self.rows[2]],
+            "comparisons": [{"summary": "「基督徒」较「超导体」更常用"}],
+            "evidenceLines": [
+                "「超导体」：BCC 多领域 176（每百万 0.44）；新闻 795（每百万 0.86）；词典收录 3",
+                "「基督徒」：BCC 多领域 1,842（每百万 4.56）；新闻 771（每百万 0.83）；词典收录 2",
+                "「进度条」：语料频次 3，词典收录 1；现代四频道均未收录；历史补充：古代汉语 未收录；近代汉语 未收录",
+            ],
+        }
+        with patch.object(
+            self.commands.keytao_review,
+            "rank_code_chain_by_commonness",
+            AsyncMock(return_value=ranking),
+        ):
+            handled, response = await self.run_semantic_stage(
+                "喵喵 重新排序 jdt jdtv jdtvo 三个编码的词条",
+                raw_operation(op="reorder", operands=[], codes=["jdt", "jdtv", "jdtvo"]),
+            )
+        self.assertTrue(handled)
+        self.assertIn("• 基督徒：jdtv / 100（词库）→ jdt / 100", response)
+        self.assertIn("• 超导体：jdt / 100（词库）→ jdtv / 100", response)
+        self.assertIn("• 进度条：jdtvo / 100（词库，保持不变）", response)
+        self.assertIn(
+            "依据：关键证据：基督徒 BCC 多领域 4.56/百万，超导体 BCC 多领域 0.44/百万，进度条 语料3/词典1（BCC未收录）",
+            response,
+        )
+        token = self.chat._current_turn_message.set("喵喵 重新排序 jdt jdtv jdtvo 三个编码的词条")
+        try:
+            guarded = self.chat._enforce_advertised_reply_contract(response, self.author)
+        finally:
+            self.chat._current_turn_message.reset(token)
+        self.assertIn("• 进度条：jdtvo / 100（词库，保持不变）", guarded)
+
 
 if __name__ == "__main__":
     unittest.main()
