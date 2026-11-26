@@ -82,7 +82,7 @@ parentheses, and no add/change verb are query with frame none, never add.
 chat: greeting, thanks, banter, emoji or conversation with humans, with no dictionary task.
 help: ask how to use the bot, what it can do, or how to perform an operation (我怎么找你加词, 怎么删词, 怎么重排, 怎么绑定, 应该怎么说) without requesting execution on specific target words/codes.
 add: add new words, optionally with codes.
-select_candidate: answer a pending ticket by selecting an index or code, possibly with add/submit wording.
+select_candidate: answer a pending ticket by selecting an index, code, or explicit subset of words (e.g. 只加前两个, 只加显眼包, 除了松弛感其他都加), possibly with add/submit wording. For a subset on a multi-word card, list only the selected words in operands and their codes in codes (or leave codes empty to use their recommended codes).
 confirm: bare assent to a pending ticket or plan, including 加入/好/确认/加入并提交/确认并提交 without a new selection.
 cancel: decline or cancel the pending ticket.
 pending_recode: request a different code for the pending ticket (换码/换一个码).
@@ -93,7 +93,7 @@ recode: change an existing entry to a different code.
 Keep 为/是/改为/改成 out of operands; they connect each literal word to its target code.
 删除"X"编码，添加"X"为C and 删除"X"的编码C0，添加"X"的编码为C mean one same-word recode,
 not delete or add: operands [X], codes [C] or [C0, C] when the old code is explicit.
-reorder: change candidate order on a code or chain, including X 优先于 Y, 提到前面, or reordering one or more codes (e.g. 重新排序 jdt jdtv jdtvo 三个编码的词条 -> operands [], codes ["jdt", "jdtv", "jdtvo"]; never copy generic nouns like 词条/编码/顺序 into operands). For an explicit user-specified target order (e.g. 重新排序为 A > B > C, 按 A > B > C 排序, A > B > C), set relation to explicit_order and operands to [A, B, C] in that exact order. For two-word priority, operands is the word to put first, then the word it goes ahead of.
+reorder: change candidate order on a code or chain, including X 优先于 Y, 提到前面, or reordering one or more codes (e.g. 重新排序 jdt jdtv jdtvo 三个编码的词条 -> operands [], codes ["jdt", "jdtv", "jdtvo"]; never copy generic nouns like 词条/编码/顺序 into operands). For an explicit user-specified target order (e.g. 重新排序为 A > B > C, 按 A > B > C 排序, A > B > C), set relation to explicit_order and operands to [A, B, C] in that exact order. When pending_context has proposed_order and the user asks to tweak that pending plan's order (e.g. 把进度条放第一个, 超导体排最后, 进度条和基督徒换一下), set op to reorder, relation to explicit_order, refers_to_pending to true, and operands to the complete new order of those exact words. For two-word priority, operands is the word to put first, then the word it goes ahead of.
 move: move/insert an entry at a specific code position, or replace the entry at a code.
 顺延X, 把X顺延, X顺延 and 顺延X一位 mean move only when X is quoted or exactly names a word in the quoted bot reply or OWN live ticket.
 Never infer X from conversational text beside 顺延 (确认顺延, 取消顺延, 先别顺延, 顺延就行).
@@ -292,6 +292,16 @@ def _pending_values(pending_state) -> Tuple[set, set]:
                     and scope["word"] in words
                 ):
                     candidates(scope.get("candidates"))
+        pending_display = args.get("_pending_display")
+        shift_plan = pending_display.get("shiftPlan") if isinstance(pending_display, dict) else None
+        proposed_state = shift_plan.get("proposedState") if isinstance(shift_plan, dict) else None
+        if isinstance(proposed_state, list):
+            for entry in proposed_state:
+                if isinstance(entry, dict):
+                    word(entry.get("word"))
+                    code = entry.get("code")
+                    if isinstance(code, str) and re.fullmatch(r"[a-z]{1,12}", code):
+                        codes.add(code)
     return words, codes
 
 
@@ -386,10 +396,17 @@ def validate_operation(
         op, relation = "draft_submit", ""
         raw = {**raw, "operands": [], "codes": [], "submit_after": False, "refers_to_pending": False}
     refers_to_pending = raw.get("refers_to_pending") is True
+    pending_shift_reorder = bool(
+        op == "reorder"
+        and relation == "explicit_order"
+        and refers_to_pending
+        and pending_state is not None
+        and getattr(pending_state, "function_name", "") == "keytao_shift_phrase_code"
+    )
     if op in {
         "swap", "delete", "recode", "reorder", "move", "batch_replace",
         "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
-    }:
+    } and not pending_shift_reorder:
         # Write commands must stand on message literals, never ticket operands.
         refers_to_pending = False
     if refers_to_pending and pending_state is None:

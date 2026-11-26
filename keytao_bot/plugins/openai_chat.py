@@ -5766,9 +5766,11 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
                 )
                 return True
-        # Preserve complete commands before recovering a model-misclassified lexical query.
+        # Preserve complete commands and live-ticket follow-ups before recovering a bare lexical query.
         bare_words = _bare_lexical_query_words(message) if (
             fast_op == "none" and not validated.codes
+            and not validated.refers_to_pending
+            and not (validated.op == "reorder" and validated.relation == "explicit_order")
             and validated.op in {"chat", "none", "other", "recode", "move", "delete", "swap", "reorder", "batch_replace"}
         ) else ()
         # A live card owns bare replies (都要/好嘞/明白), so only look up words without one.
@@ -6021,18 +6023,6 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             and all(value.startswith("frame_backstop:") for value in violations)
         )
         if live_owned_ticket:
-            if (
-                "pending_answer" in route_ops and validated.refers_to_pending is True
-                and validated.frame == "question" and validated.op in {"query", "chat", "help"}
-                and validated.operands
-                and set(validated.operands).issubset(
-                    word for word, _code in _pending_state_binding_pairs(pending_snapshot)
-                )
-            ):
-                ctx.released_pending_turn = ctx.semantic_pending_released = True
-                ctx.current_pending_record = current_record
-                ctx.scoped_pending_state = ctx.scoped_pending_intent = ctx.scoped_pending_response = None
-                return False
             history = ctx.history if ctx.history is not None else get_history(ctx.conv_key)
             prompt = _get_latest_assistant_message(history)
             ticket_prompt = next((
@@ -6041,7 +6031,11 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 and _chat_routing._prompt_capability_digest(str(row.get("content") or "")) == current_record.origin_prompt_digest
             ), "")
             if not ticket_prompt:
-                ticket_prompt = _render_live_single_candidate_record(current_record) or _render_live_batch_record(current_record)
+                ticket_prompt = (
+                    _render_live_shift_record(current_record)
+                    or _render_live_single_candidate_record(current_record)
+                    or _render_live_batch_record(current_record)
+                )
             contract = advertised_reply_contract(ticket_prompt)
             closed_answer = message.strip() in (
                 *contract.generic_assent_forms, *contract.batch_assent_forms, "取消",
@@ -6061,11 +6055,69 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             else:
                 derived, intent, error = _resolve_multi_word_pending_candidate_selection(pending_snapshot, message)
                 closed_answer = closed_answer or bool(derived is not None and intent is not None and not error)
+            card_words = {
+                *(word for word, _code in _pending_state_binding_pairs(pending_snapshot)),
+                *_chat_commands.pending_shift_plan_words(pending_snapshot),
+            }
+            if (
+                "pending_answer" in route_ops and validated.refers_to_pending is True
+                and validated.op in {"query", "chat", "help"}
+                and (validated.frame == "question" or _authorization_grammar.is_interrogative_message(message))
+                and not closed_answer
+                and (not validated.operands or set(validated.operands).issubset(card_words))
+            ):
+                ctx.released_pending_turn = ctx.semantic_pending_released = True
+                ctx.current_pending_record = current_record
+                ctx.scoped_pending_state = ctx.scoped_pending_intent = ctx.scoped_pending_response = None
+                return False
             if "pending_release" in route_ops and validated.refers_to_pending is False and not closed_answer:
                 ctx.released_pending_turn = True
                 ctx.semantic_pending_released = True
                 ctx.current_pending_record = current_record
                 ctx.scoped_pending_state = ctx.scoped_pending_intent = ctx.scoped_pending_response = None
+            elif (
+                "pending_answer" in route_ops and validated.refers_to_pending is True
+                and validated.frame == "direct"
+                and validated.op == "reorder"
+                and validated.relation == "explicit_order"
+                and draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is None
+            ):
+                if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, current_record):
+                    ctx.released_pending_turn = True
+                    ctx.semantic_pending_released = True
+                    ctx.current_pending_record = current_record
+                    return False
+                proposed_words = _chat_commands.pending_shift_plan_words(pending_snapshot)
+                verified_shift_reply = bool(
+                    (ctx.reply_reference.is_reply and _verified_pending_reply(ctx, current_record))
+                    or (
+                        current_record.origin_prompt_digest
+                        and _chat_routing._prompt_capability_digest(prompt) == current_record.origin_prompt_digest
+                    )
+                )
+                if (
+                    verified_shift_reply
+                    and len(proposed_words) >= 2
+                    and len(validated.operands) == len(proposed_words)
+                    and set(validated.operands) == set(proposed_words)
+                ):
+                    response = await _chat_commands._try_handle_explicit_order_reorder_command(
+                        _chat_routing.ExplicitOrderReorderCommand(words=validated.operands),
+                        ctx.platform,
+                        ctx.user_id,
+                        ctx.conv_key,
+                        ctx.space_key,
+                        ctx.owner_label,
+                    )
+                    if response is not None:
+                        ctx.response = response
+                        ctx.scoped_pending_response = None
+                        remember_conversation(ctx.conv_key, ctx.memory_context, message, response)
+                        await _finish_ai_chat_response(
+                            ctx.bot, ctx.event, ctx.user_id, ctx.memory_context,
+                            response, ctx.QQMessageSegment,
+                        )
+                        return True
             elif (
                 "pending_answer" in route_ops and validated.refers_to_pending is True
                 and validated.frame == "direct"
@@ -8070,6 +8122,19 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
         reply_context = await build_reply_context(ctx.bot, ctx.event, ctx.reply_reference)
         if ctx.semantic_query_reply:
             reply_context += "\n\n词库查询结果（仅作解释依据，候选由系统展示，无需重写）：\n" + ctx.semantic_query_reply
+        if (
+            not reply_context
+            and getattr(ctx, "semantic_pending_released", False)
+            and ctx.current_pending_record is not None
+            and getattr(ctx.operation_request, "refers_to_pending", False) is True
+        ):
+            card_summary = (
+                _render_live_shift_record(ctx.current_pending_record)
+                or _render_live_single_candidate_record(ctx.current_pending_record)
+                or _render_live_batch_record(ctx.current_pending_record)
+            )
+            if card_summary:
+                reply_context = "当前待确认卡片内容（仅作答疑参考，不要重写卡片或执行写入）：\n" + card_summary
 
         async def report_progress(text: str) -> None:
             await _send_event_response(

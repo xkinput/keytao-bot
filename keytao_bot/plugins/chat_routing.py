@@ -3090,41 +3090,9 @@ def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent
 
 
 def _pending_context_for_command_intent(state: Optional[PendingState]) -> str:
-    if isinstance(state, PendingAddWord):
-        candidates = [
-            {
-                "index": index,
-                "code": code,
-                "occupied": occupied,
-                "occupied_words": state.occupied_words.get(code, []),
-            }
-            for index, (code, occupied) in enumerate(state.candidates, start=1)
-        ]
-        return json.dumps(
-            {
-                "type": "pending_add_word",
-                "word": state.word,
-                "recommended_code": state.recommended_code,
-                "candidates": candidates,
-                "pronunciation_codes": state.pronunciation_codes,
-                "pronunciation_recommended_codes": state.pronunciation_recommended_codes,
-            },
-            ensure_ascii=False,
-        )
-    if isinstance(state, PendingToolConfirm):
-        return json.dumps(
-            {
-                "type": "pending_tool_confirm",
-                "function_name": state.function_name,
-                "args": {
-                    key: value
-                    for key, value in state.args.items()
-                    if not str(key).startswith("_")
-                },
-            },
-            ensure_ascii=False,
-        )
-    return "none"
+    from .pending_card_helpers import serialize_pending_context_for_semantic_parser
+
+    return serialize_pending_context_for_semantic_parser(state)
 
 
 def _structural_draft_management_intent(
@@ -3538,6 +3506,7 @@ _CHAT_SENTENCE_SHAPE_RE = re.compile(
     r"|(?:就|都|也|还|并|根本|完全|真的?)(?:不|没)"
     r"|不(?:需要|用|想|会|能|必)(?![\u3400-\u9fff]?$)"
     r"|(?:规则|原理|意思|方法|区别|特点|作用)是"
+    r"|^(?:把|将)[\u3400-\u9fff]{1,12}(?:放|排|挪|移|调|改|换|删|提)"
     r"|[了吗呢吧啊呀嘛啦]$"
     r"|(?:是吧|对吧|对不对|是不是|还好|挺好|不错|还行|就行|就好|而已)$"
 )
