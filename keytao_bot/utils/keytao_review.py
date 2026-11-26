@@ -6882,7 +6882,11 @@ async def rank_code_chain_by_commonness(
     fail closed so a caller can render one deterministic ASK.
     """
     normalized = [dict(entry) for entry in entries if isinstance(entry, dict)]
+    codes = {str(entry.get("code") or "").strip().lower() for entry in normalized}
+    has_distinct_codes = len(codes) == len(normalized) > 1 and "" not in codes
     normalized.sort(key=lambda entry: (
+        (len(str(entry.get("code") or "").strip()), str(entry.get("code") or "").strip().lower())
+        if has_distinct_codes else (0, ""),
         offline_only and entry.get("weight") is None,
         int(entry.get("weight") or 0),
         str(entry.get("word") or ""),

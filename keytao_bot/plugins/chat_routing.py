@@ -278,6 +278,13 @@ class CodeChainReorderCommand:
 
 
 @dataclass(frozen=True)
+class CodeListReorderCommand:
+    """One direct request to reorder entries across two or more literal codes."""
+
+    codes: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WordListReorderCommand:
     """One explicit ordered list whose scope must be resolved server-side."""
 
@@ -345,12 +352,16 @@ def _parse_word_list_reorder_command(
     return WordListReorderCommand(words=words)
 
 
+_CODE_CHAIN_REORDER_SCOPE_SUFFIX = (
+    r"(?:(?:这条|这个|这)?(?:编码|码)?链|(?:这个|这)?(?:编码|码))?"
+    r"(?:(?:的)?(?:这几个|这些|这)?词条?|(?:的)?顺序)?"
+)
+
 _CODE_CHAIN_REORDER_DIRECT_RE = re.compile(
     r"(?:重新排序|重新排|重排|排序|排)(?:下|一下)?"
     r"(?P<code>[a-z]{1,6})"
-    r"(?:(?:这条)?(?:编码)?链)?"
-    r"(?:(?:这几个|这些|这)词)?"
-    r"(?:按(?:优先级|常用度)(?:排(?:序)?(?:一下)?|重新排序)?)?"
+    + _CODE_CHAIN_REORDER_SCOPE_SUFFIX
+    + r"(?:按(?:优先级|常用度)(?:排(?:序)?(?:一下)?|重新排序)?)?"
     r"(?:一下|吧)?",
     re.IGNORECASE,
 )
@@ -358,9 +369,8 @@ _CODE_CHAIN_REORDER_DIRECT_RE = re.compile(
 
 _CODE_CHAIN_REORDER_BA_RE = re.compile(
     r"(?:把|将)?(?P<code>[a-z]{1,6})"
-    r"(?:(?:这条)?(?:编码)?链)?"
-    r"(?:(?:这几个|这些|这)词)?"
-    r"(?:按(?:优先级|常用度))?"
+    + _CODE_CHAIN_REORDER_SCOPE_SUFFIX
+    + r"(?:按(?:优先级|常用度))?"
     r"(?:重新排序|重新排|重排|排(?:序)?)(?:下|一下|吧)?",
     re.IGNORECASE,
 )
@@ -370,10 +380,98 @@ _CODE_CHAIN_REORDER_CRITERION_FIRST_RE = re.compile(
     r"按(?:优先级|常用度)"
     r"(?:重新排序|重新排|重排|排(?:序)?)(?:下|一下)?"
     r"(?P<code>[a-z]{1,6})"
-    r"(?:(?:这条)?(?:编码)?链)?"
-    r"(?:(?:这几个|这些|这)词)?(?:一下|吧)?",
+    + _CODE_CHAIN_REORDER_SCOPE_SUFFIX
+    + r"(?:一下|吧)?",
     re.IGNORECASE,
 )
+
+
+_CODE_LIST_REORDER_CODE_PATTERN = r"[a-z]{2,6}"
+_CODE_LIST_REORDER_SEP_PATTERN = r"(?:\s*(?:[、,，/]+|和|与|及)\s*|\s+)"
+_CODE_LIST_REORDER_CODES_PATTERN = (
+    rf"{_CODE_LIST_REORDER_CODE_PATTERN}"
+    rf"(?:{_CODE_LIST_REORDER_SEP_PATTERN}{_CODE_LIST_REORDER_CODE_PATTERN}){{1,19}}"
+)
+_CODE_LIST_REORDER_SCOPE_PATTERN = (
+    r"(?:\s*(?:这|那)?"
+    r"(?:(?:[两二三四五六七八九十几]+|[2-9]|1[0-9]|20)\s*(?:个|条)|几个|些)?"
+    r"(?:(?:的)?(?:编码|码)(?:链)?(?:里|中|下)?(?:的)?(?:词条|词)?|"
+    r"(?:条)?(?:编码)?链(?:里|中|下)?(?:的)?(?:词条|词)?|(?:的)?(?:词条|词)))?"
+    r"(?:\s*(?:的)?顺序)?"
+)
+_CODE_LIST_REORDER_POLITE_PATTERN = (
+    r"(?:(?:请|请你|请帮我|帮我|帮忙|麻烦|麻烦你|劳驾|拜托|给我)\s*)?"
+)
+_CODE_LIST_REORDER_CRITERION_PATTERN = r"按(?:优先级|常用度)"
+_CODE_LIST_REORDER_DIRECT_RE = re.compile(
+    rf"^{_CODE_LIST_REORDER_POLITE_PATTERN}"
+    r"(?:重新排序|重新排|重排|排序|排)(?:下|一下)?\s*"
+    rf"(?P<codes>{_CODE_LIST_REORDER_CODES_PATTERN})"
+    rf"{_CODE_LIST_REORDER_SCOPE_PATTERN}"
+    rf"(?:\s*{_CODE_LIST_REORDER_CRITERION_PATTERN}(?:(?:重新)?排(?:序)?(?:下|一下)?)?)?"
+    r"(?:\s*(?:一下|吧))?$",
+    re.IGNORECASE,
+)
+_CODE_LIST_REORDER_BA_RE = re.compile(
+    rf"^{_CODE_LIST_REORDER_POLITE_PATTERN}"
+    r"(?:(?:把|将)\s*)?"
+    rf"(?P<codes>{_CODE_LIST_REORDER_CODES_PATTERN})"
+    rf"{_CODE_LIST_REORDER_SCOPE_PATTERN}"
+    rf"(?:\s*{_CODE_LIST_REORDER_CRITERION_PATTERN}\s*(?:重新排序|重新排|重排|排(?:序)?(?:下|一下)?)|"
+    r"\s*(?:重新排序|重新排|重排|排序(?:下|一下)?|排(?:下|一下)))"
+    r"(?:\s*(?:一下|吧))?$",
+    re.IGNORECASE,
+)
+_CODE_LIST_REORDER_CRITERION_FIRST_RE = re.compile(
+    rf"^{_CODE_LIST_REORDER_POLITE_PATTERN}"
+    rf"{_CODE_LIST_REORDER_CRITERION_PATTERN}\s*"
+    r"(?:重新排序|重新排|重排|排(?:序)?)(?:下|一下)?\s*"
+    rf"(?P<codes>{_CODE_LIST_REORDER_CODES_PATTERN})"
+    rf"{_CODE_LIST_REORDER_SCOPE_PATTERN}"
+    r"(?:\s*(?:一下|吧))?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_code_list_reorder_command(
+    message_text: str,
+) -> Optional[CodeListReorderCommand]:
+    """Parse a closed, positive whole-message reorder over two or more literal codes."""
+    source = unicodedata.normalize(
+        "NFKC",
+        _strip_command_message_prefixes(message_text),
+    ).strip()
+    if (
+        not source
+        or re.search(r"[?？\"'“”‘’「」『』]", source)
+        or re.search(r"^(?:不要|别|无需|不用|不必|先不要|暂不|不要再)", source)
+        or re.search(r"^(?:他说|她说|他们说|有人说|引用|转述|例如|比如)[：:]?", source)
+    ):
+        return None
+    source = re.sub(r"[。.!！~～]+$", "", source).strip()
+    match = (
+        _CODE_LIST_REORDER_DIRECT_RE.fullmatch(source)
+        or _CODE_LIST_REORDER_BA_RE.fullmatch(source)
+        or _CODE_LIST_REORDER_CRITERION_FIRST_RE.fullmatch(source)
+    )
+    if match is None:
+        return None
+    raw_codes = [
+        token.strip().lower()
+        for token in re.split(
+            _CODE_LIST_REORDER_SEP_PATTERN,
+            str(match.group("codes") or "").strip(),
+        )
+        if token.strip()
+    ]
+    if (
+        len(raw_codes) < 2
+        or len(raw_codes) > 20
+        or len(set(raw_codes)) != len(raw_codes)
+        or any(re.fullmatch(_CODE_LIST_REORDER_CODE_PATTERN, code) is None for code in raw_codes)
+    ):
+        return None
+    return CodeListReorderCommand(codes=tuple(raw_codes))
 
 
 _CODE_CHAIN_REORDER_PAIR_RE = re.compile(
@@ -390,6 +488,8 @@ def _parse_code_chain_reorder_command(
     message_text: str,
 ) -> Optional[CodeChainReorderCommand]:
     """Parse a closed, positive whole-message code-chain reorder command."""
+    if _parse_code_list_reorder_command(message_text) is not None:
+        return None
     raw = unicodedata.normalize(
         "NFKC",
         _strip_command_message_prefixes(message_text),
@@ -504,6 +604,7 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "operation_recall",
     "batch_replace_char",
     "code_chain_reorder",
+    "code_list_reorder",
     "word_list_reorder",
     "entry_swap",
     "entry_move_plan",
@@ -2582,6 +2683,12 @@ def _is_fresh_current_user_command_intent(
             command is not None
             and command.code == command_intent.requested_code
         )
+    if command_intent.intent == "code_list_reorder":
+        command = _parse_code_list_reorder_command(message_text)
+        return bool(
+            command is not None
+            and command.codes == command_intent.requested_codes
+        )
     if command_intent.intent == "word_list_reorder":
         command = _parse_word_list_reorder_command(message_text)
         return bool(
@@ -2803,6 +2910,7 @@ def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent
         "operation_recall",
         "batch_replace_char",
         "code_chain_reorder",
+        "code_list_reorder",
         "word_list_reorder",
         "pending_confirm",
         "pending_cancel",
@@ -2926,6 +3034,13 @@ def _structural_draft_management_intent(
             intent="entry_swap",
             confidence=1.0,
             keep_words=(swap.first_word, swap.second_word),
+        )
+    code_list_reorder = _parse_code_list_reorder_command(message_text)
+    if code_list_reorder is not None:
+        return MessageCommandIntent(
+            intent="code_list_reorder",
+            confidence=1.0,
+            requested_codes=code_list_reorder.codes,
         )
     chain_reorder = _parse_code_chain_reorder_command(message_text)
     if chain_reorder is not None:

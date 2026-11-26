@@ -221,6 +221,7 @@ from .chat_routing import (
     _message_authorizes_replace_char,
     _normalize_pending_candidate_selection_text,
     _parse_code_chain_reorder_command,
+    _parse_code_list_reorder_command,
     _parse_word_list_reorder_command,
     _parse_pending_choice_index,
     _pending_owner_label,
@@ -11030,6 +11031,37 @@ def _validated_code_chain_entries(data: Dict[str, Any], code: str) -> Optional[L
     return entries
 
 
+def _validated_codes_batch_lookup_entries(
+    data: Dict[str, Any],
+    codes: Tuple[str, ...],
+) -> Optional[List[Dict[str, Any]]]:
+    """Validate an exact complete batch code lookup without accepting extras."""
+    results = data.get("results")
+    if (
+        data.get("success") is not True
+        or not isinstance(results, list)
+        or len(results) != len(codes)
+    ):
+        return None
+    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            return None
+        result_code = str(result.get("code") or "").strip().lower()
+        if result_code not in codes or result_code in by_code:
+            return None
+        rows = _validated_code_chain_entries(
+            {**result, "success": result.get("success", True)},
+            result_code,
+        )
+        if rows is None:
+            return None
+        by_code[result_code] = rows
+    if set(by_code) != set(codes):
+        return None
+    return [entry for code in codes for entry in by_code[code]]
+
+
 async def _lookup_code_query_reply(code: str, platform: str, user_id: str) -> ServerBackedQueryReply:
     set_turn_flow("word-query")
     try:
@@ -11261,6 +11293,25 @@ def _shared_candidate_chain_root(
 
 
 def _format_chain_order(entries: List[Dict[str, Any]]) -> str:
+    codes = [str(entry.get("code") or "").strip().lower() for entry in entries]
+    distinct_codes = {code for code in codes if code}
+    if len(distinct_codes) > 1:
+        ordered = sorted(
+            entries,
+            key=lambda entry: (
+                len(str(entry.get("code") or "").strip()),
+                str(entry.get("code") or "").strip().lower(),
+                int(entry.get("weight") or 0),
+                str(entry.get("word") or ""),
+            ),
+        )
+        has_duplicate_code = len(distinct_codes) < len(entries)
+        return " → ".join(
+            f"{entry['word']}({entry['code']}/{entry['weight']})"
+            if has_duplicate_code
+            else f"{entry['word']}({entry['code']})"
+            for entry in ordered
+        )
     return " → ".join(
         f"{entry['word']}({entry['weight']})"
         for entry in entries
@@ -11836,6 +11887,153 @@ async def _try_handle_word_list_reorder_command(
     )
 
 
+async def _try_handle_code_list_reorder_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Resolve every literal code's live+draft entries and rank across one shared chain."""
+    command = _parse_code_list_reorder_command(message_text)
+    if (
+        command is None
+        or command_intent.intent != "code_list_reorder"
+        or command_intent.requested_codes != command.codes
+    ):
+        return None
+    set_turn_flow("draft-op")
+    codes = command.codes
+    codes_label = "、".join(codes)
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_codes_batch",
+        {"codes": list(codes)},
+        platform,
+        user_id,
+    )
+    draft_json = await call_tool_function(
+        "keytao_list_draft_items",
+        {},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+    try:
+        draft_data = json.loads(draft_json)
+    except Exception:
+        draft_data = {}
+    live_entries = _validated_codes_batch_lookup_entries(lookup_data, codes)
+    draft_snapshot = _validated_draft_reorder_snapshot(draft_data)
+    if live_entries is None or draft_snapshot is None:
+        return _chain_reorder_ask(
+            codes_label,
+            "服务端没有返回完整的词库记录或草稿版本",
+        )
+    merged = _merge_live_and_draft_reorder_entries(live_entries, draft_snapshot)
+    if merged is None:
+        return _chain_reorder_ask(
+            codes_label,
+            "当前草稿里存在无法唯一投影的词条记录",
+        )
+    code_set = set(codes)
+    entries = [entry for entry in merged if entry.get("code") in code_set]
+    entries.sort(key=lambda entry: (
+        len(str(entry.get("code") or "")),
+        str(entry.get("code") or ""),
+        int(entry.get("weight") or 0),
+        str(entry.get("word") or ""),
+    ))
+    if not entries:
+        return _chain_reorder_ask(
+            codes_label,
+            "词库和当前草稿的合并视图都没有词条",
+        )
+    present_codes = {str(entry.get("code") or "") for entry in entries}
+    empty_codes = [code for code in codes if code not in present_codes]
+    if empty_codes:
+        return _assert_plain_user_facing_reply(
+            "编码 " + "、".join(empty_codes)
+            + " 当前在词库和草稿中都没有词条；已找到："
+            + _format_word_resolution_rows(entries)
+            + "；未生成排序计划。"
+        )
+    words = tuple(str(entry.get("word") or "") for entry in entries)
+    if len(set(words)) != len(words):
+        duplicated = list(OrderedDict.fromkeys(
+            word for word in words if words.count(word) > 1
+        ))
+        return _assert_plain_user_facing_reply(
+            "「" + "、".join(duplicated)
+            + "」同时出现在多个目标编码中："
+            + _format_word_resolution_rows(entries)
+            + "；未生成排序计划。"
+        )
+    if len(entries) > MAX_REPLACE_CHAR_ITEMS:
+        return _assert_plain_user_facing_reply(
+            f"这些编码共有 {len(entries)} 条词条，超过单条确认可完整展示的 "
+            f"{MAX_REPLACE_CHAR_ITEMS} 条上限，未生成排序计划。"
+        )
+    phrase_types = {str(entry.get("type") or "") for entry in entries}
+    if len(phrase_types) != 1:
+        return _assert_plain_user_facing_reply(
+            "这些编码的词条类型不同："
+            + _format_word_resolution_rows(entries)
+            + "；不能共用一条重排计划，未生成排序计划。"
+        )
+
+    candidate_codes_by_word: Dict[str, Tuple[str, ...]] = {}
+    for entry in entries:
+        word = str(entry.get("word") or "")
+        encode_json = await call_tool_function(
+            "keytao_encode",
+            {"word": word, "requested_code": str(entry.get("code") or "")},
+            platform,
+            user_id,
+        )
+        try:
+            encode_data = json.loads(encode_json)
+        except Exception:
+            encode_data = {}
+        candidate_codes_by_word[word] = _candidate_codes_from_encode(
+            encode_data,
+            word,
+        )
+    shared_root = _shared_candidate_chain_root(entries, candidate_codes_by_word)
+    if shared_root is None:
+        return _assert_plain_user_facing_reply(
+            "这些编码的词条不在同一候选前缀链："
+            + _format_word_resolution_rows(entries)
+            + "；未生成排序计划。"
+        )
+
+    async def load_semantic_review(word: str) -> Dict[str, Any]:
+        return await _load_reorder_semantic_review(word, platform, user_id)
+
+    ranking = await keytao_review.rank_code_chain_by_commonness(
+        entries,
+        semantic_review_loader=load_semantic_review,
+    )
+    if not isinstance(ranking, dict) or ranking.get("status") == "ask":
+        return _chain_reorder_ask(
+            shared_root,
+            str((ranking or {}).get("reason") or "常用度证据不足"),
+        )
+    return await _start_generalized_reorder_plan(
+        entries=entries,
+        ranking=ranking,
+        target_code=shared_root,
+        listed_words=(),
+        platform=platform,
+        user_id=user_id,
+        space_key=space_key,
+        owner_label=owner_label,
+    )
+
+
 def _announce_replaced_submit(previous, conv_key, response):
     current = conversation_state_store.get_record(conv_key)
     if (
@@ -11985,6 +12183,17 @@ async def _try_handle_draft_management_command_core(
         return response
 
     response = await _try_handle_entry_swap_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
+
+    response = await _try_handle_code_list_reorder_command(
         message_text,
         command_intent,
         platform,
@@ -13137,6 +13346,27 @@ async def _resolve_target_recodes(request, message, original_operands, platform,
 
 async def resolve_model_replace(request, platform, user_id, *, message="", original_operands=()):
     """Resolve model old/new fields against exact dictionary rows, never prose."""
+    if request.op == "reorder" and request.codes and request.operands:
+        parsed_code_list = _parse_code_list_reorder_command(message)
+        if parsed_code_list is not None and request.codes == parsed_code_list.codes:
+            return replace(request, operands=()), (), ""
+        parsed_code_chain = _parse_code_chain_reorder_command(message)
+        if (
+            parsed_code_chain is not None
+            and not parsed_code_chain.focus_words
+            and request.codes == (parsed_code_chain.code,)
+        ):
+            return replace(request, operands=()), (), ""
+        if (
+            len(request.operands) == 2
+            and len(request.codes) == 1
+            and not (
+                parsed_code_chain is not None
+                and parsed_code_chain.focus_words == request.operands
+                and parsed_code_chain.code == request.codes[0]
+            )
+        ):
+            return replace(request, codes=(request.codes[0], request.codes[0])), (), ""
     if request.op == "recode" and not request.operands and len(request.codes) == 2 and not request.relation:
         from ..harness.authorization_grammar import parse_code_only_recode
 
@@ -13450,10 +13680,14 @@ def render_understood_command(request) -> str:
         if len(words) == 2 and len(codes) in {0, 2}:
             entries = [f"{word} {codes[index]}" if codes else word for index, word in enumerate(words)]
             command = f"{entries[0]} 优先于 {entries[1]}"
+        elif len(words) == 2 and len(codes) == 1:
+            command = f"调整 {codes[0]} {words[0]} 和 {words[1]}"
         elif len(words) > 2 and not codes:
             command = "重新排序 " + " ".join(words)
         elif not words and len(codes) == 1:
             command = "重排 " + codes[0]
+        elif not words and len(codes) >= 2 and len(set(codes)) == len(codes):
+            command = "重新排序 " + " ".join(codes)
     elif op in {"draft_submit", "draft_recall", "draft_clear"} and not words and not codes:
         command = {"draft_submit": "提交草稿", "draft_recall": "撤回提交", "draft_clear": "清空草稿"}[op]
     elif op == "draft_keep_only" and words and not codes:
@@ -13770,8 +14004,11 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
                     return "替换计划无法安全消费，本次未写入。"
                 response = await _execute_confirmed_tool(record.state, platform, user_id, conv_key, space_key, owner_label)
     else:
-        if op == "reorder" and not words:
-            intent = replace(intent, intent="code_chain_reorder")
+        if op == "reorder" and (not words or len(codes) == 1):
+            intent = replace(
+                intent,
+                intent="code_list_reorder" if not words and len(codes) >= 2 else "code_chain_reorder",
+            )
         response = await _try_handle_draft_management_command(command, platform, user_id, space_key, owner_label, intent)
     return response or "规范指令无法执行，本次未写入。"
 

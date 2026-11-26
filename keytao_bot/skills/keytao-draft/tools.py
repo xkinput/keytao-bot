@@ -5832,6 +5832,12 @@ async def _prepare_ranked_reorder_plan(
             # An in-place same-code reorder addresses that exact existing
             # location; other codes of the same word are outside its scope.
             matches = [entry for entry in matches if entry["code"] == target_code]
+        elif len(matches) > 1:
+            chain_matches = [
+                entry for entry in matches if entry["code"].startswith(target_code)
+            ]
+            if len(chain_matches) == 1:
+                matches = chain_matches
         if len(matches) != 1:
             return {
                 "success": False,
@@ -5916,20 +5922,19 @@ async def _prepare_ranked_reorder_plan(
         desired_codes = []
         for position, ordered_word in enumerate(ordered_words):
             own_chain = candidate_map[ordered_word]
-            target_index = own_chain.index(target_code) + position
-            if target_index >= len(own_chain):
+            start_index = own_chain.index(target_code)
+            desired_code = next(
+                (
+                    code
+                    for code in own_chain[start_index:]
+                    if code.startswith(target_code) and code not in desired_codes
+                ),
+                None,
+            )
+            if desired_code is None:
                 return {
                     "success": False,
                     "message": f"「{ordered_word}」自己的候选前缀链没有第 {position + 1} 个位置",
-                }
-            desired_code = own_chain[target_index]
-            if (
-                not desired_code.startswith(target_code)
-                or desired_code in desired_codes
-            ):
-                return {
-                    "success": False,
-                    "message": f"「{ordered_word}」无法锁定唯一的第 {position + 1} 个前缀链位置",
                 }
             desired_codes.append(desired_code)
 

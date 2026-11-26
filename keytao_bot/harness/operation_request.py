@@ -53,6 +53,9 @@ def understand_message(
     command = routing._parse_word_list_reorder_command(message)
     if command is not None:
         return matched("_parse_word_list_reorder_command", "reorder", command.words)
+    command = routing._parse_code_list_reorder_command(message)
+    if command is not None:
+        return matched("_parse_code_list_reorder_command", "reorder", (), command.codes)
     command = routing._parse_code_chain_reorder_command(message)
     if command is not None:
         return matched("_parse_code_chain_reorder_command", "reorder", command.focus_words, (command.code,))
