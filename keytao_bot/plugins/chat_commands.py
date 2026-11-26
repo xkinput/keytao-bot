@@ -140,6 +140,7 @@ from ..utils.pending_confirmation import (
     parse_pending_candidate_selection,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
+    pending_confirmation_copy_for_tool,
     pending_word_reminder_lines,
     prepend_pending_word_reminders,
     recall_batch_copy,
@@ -6435,7 +6436,7 @@ def render_pending_replace_at_code_plan(state: PendingToolConfirm) -> str:
             except ValueError:
                 message = "服务端风险信息无法完整展示，请查看草稿核对。"
             lines.append(f"提示：{message}")
-    lines.append(pending_confirmation_copy())
+    lines.append(pending_confirmation_copy_for_tool(state.function_name))
     batch_url = _trusted_batch_url(state.args.get("_pending_display", {}))
     if batch_url:
         lines.append(f"草稿地址：{batch_url}")
@@ -6456,7 +6457,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         batch_url = _trusted_batch_url(data)
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
-        lines.append(pending_confirmation_copy())
+        lines.append(pending_confirmation_copy_for_tool(function_name))
         return _assert_plain_user_facing_reply("\n".join(lines))
 
     if function_name == "keytao_batch_add_to_draft":
@@ -6488,7 +6489,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 f"提示：{_plain_warning_message(warning)}"
                 for warning in warnings
             )
-            lines.append(pending_confirmation_copy())
+            lines.append(pending_confirmation_copy_for_tool(function_name))
             batch_url = _trusted_batch_url(data)
             if batch_url:
                 lines.append(f"草稿地址：{batch_url}")
@@ -6560,7 +6561,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 f"提示：{_plain_warning_message(warning)}"
                 for warning in warnings
             )
-            lines.append(pending_confirmation_copy())
+            lines.append(pending_confirmation_copy_for_tool(function_name))
             batch_url = _trusted_batch_url(data)
             if batch_url:
                 lines.append(f"草稿地址：{batch_url}")
@@ -6702,7 +6703,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             lines.append(
                 f"如需手动排序，可引用本条回复「重新排序为 {' > '.join(proposed_words)}」（按你想要的顺序）。"
             )
-        lines.append(pending_confirmation_copy())
+        lines.append(pending_confirmation_copy_for_tool(function_name))
         batch_url = _trusted_batch_url(data)
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
@@ -6726,7 +6727,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     batch_url = _trusted_batch_url(data)
     link_text = f"\n草稿地址：{batch_url}" if batch_url else ""
     return _assert_plain_user_facing_reply(
-        f"{warning_text}{review_text}\n{pending_confirmation_copy()}{link_text}"
+        f"{warning_text}{review_text}\n{pending_confirmation_copy_for_tool(function_name)}{link_text}"
     )
 
 
@@ -7781,6 +7782,11 @@ async def _execute_confirmed_tool(
                     user_id,
                     compact=True,
                 )
+                if submit_after:
+                    return await continue_with_submit_preview(
+                        response,
+                        authorized_items=state.args.get("items"),
+                    )
                 return prepend_pending_word_reminders(
                     response,
                     data.get("pendingItems"),
@@ -11404,7 +11410,7 @@ def _format_code_chain_reorder_confirmation(
     warnings = preview_data.get("warnings")
     if isinstance(warnings, list) and warnings:
         lines.extend(f"提示：{_plain_warning_message(warning)}" for warning in warnings)
-    lines.append(pending_confirmation_copy())
+    lines.append(pending_confirmation_copy_for_tool("keytao_batch_add_to_draft"))
     batch_url = _trusted_batch_url(preview_data)
     if batch_url:
         lines.append(f"草稿地址：{batch_url}")
@@ -13937,7 +13943,7 @@ def render_understood_pending_answer(request, state, prompt: str, message: str =
     if request.op == "confirm":
         contract = advertised_reply_contract(prompt)
         forms = contract.generic_assent_forms + contract.batch_assent_forms
-        choices = ("加入并提交",) if request.submit_after else ("确认", "加入", "添加", "都加")
+        choices = ("确认并提交", "加入并提交") if request.submit_after else ("确认", "加入", "添加", "都加")
         for text in choices:
             if text not in forms:
                 continue

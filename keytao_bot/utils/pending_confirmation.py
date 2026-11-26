@@ -64,7 +64,14 @@ class RestoredCandidateReply(ServerBackedQueryReply):
         return reply
 
 
-PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
+PENDING_CONFIRM_ADVERTISED_FORMS = ("确认", "确认并提交")
+DRAFT_WRITE_CONFIRMATION_TOOLS = frozenset({
+    "keytao_create_phrase",
+    "keytao_batch_add_to_draft",
+    "keytao_shift_phrase_code",
+    "keytao_remove_draft_item",
+    "keytao_batch_remove_draft_items",
+})
 PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     *PENDING_CONFIRM_ADVERTISED_FORMS,
     "确认调整",
@@ -1237,6 +1244,13 @@ def parse_pending_candidate_selection(text: str) -> PendingCandidateSelection | 
 def pending_confirmation_copy() -> str:
     """Render the generic forms accepted by a single actor-owned ticket."""
     return "回复「确认」执行，或「取消」。"
+
+
+def pending_confirmation_copy_for_tool(function_name: str = "") -> str:
+    """Advertise confirm-and-submit alongside confirm on draft-writing tickets."""
+    if function_name in DRAFT_WRITE_CONFIRMATION_TOOLS:
+        return f"{pending_confirmation_copy()}也可回复「确认并提交」执行并提交。"
+    return pending_confirmation_copy()
 
 
 def recall_batch_copy(data: dict[str, Any]) -> str:

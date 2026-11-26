@@ -40,6 +40,7 @@ from ..utils.pending_confirmation import (
     candidate_commonness_guard_copy,
     completed_warning_messages,
     pending_confirmation_copy,
+    pending_confirmation_copy_for_tool,
     pending_word_reminder_lines,
     prepend_pending_word_reminders,
     plain_warning_message,
@@ -939,7 +940,7 @@ def _format_server_bound_confirmation_prompt(state: PendingToolConfirm) -> str:
         raise ValueError("Server-bound confirmation prompt requires a server ticket")
     details = _format_pending_state_details(state)
     return _assert_plain_user_facing_reply(
-        f"{details}\n{pending_confirmation_copy()}"
+        f"{details}\n{pending_confirmation_copy_for_tool(state.function_name)}"
     )
 
 
@@ -964,7 +965,7 @@ def _format_changed_server_confirmation_prompt(
         "确认内容已变化：",
         f"原：{previous_details}",
         f"现：{current_details}",
-        pending_confirmation_copy(),
+        pending_confirmation_copy_for_tool(current.function_name),
     ]
     return _assert_plain_user_facing_reply("\n".join(lines))
 

@@ -886,6 +886,113 @@ class CodeListReorderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("无需调整", noop_reply)
         self.assertIsNone(self.store.get_record(self.author))
 
+    async def test_confirm_and_submit_advertised_and_executes_reorder_then_submits(self):
+        self.rows = [
+            {"word": "超导体", "code": "jdt", "type": "Phrase", "weight": 100},
+            {"word": "超导体", "code": "wdtv", "type": "Phrase", "weight": 100},
+            {"word": "基督徒", "code": "jdtv", "type": "Phrase", "weight": 100},
+            {"word": "进度条", "code": "jdtvo", "type": "Phrase", "weight": 100},
+        ]
+        self.candidates = {
+            "超导体": ["jdt", "jdtv", "jdtva", "jdtvai", "wdt", "wdtv"],
+            "基督徒": ["jdt", "jdtv", "jdtvi", "jdtviu"],
+            "进度条": ["jdt", "jdtv", "jdtvo", "jdtvou"],
+        }
+        submit_calls = []
+
+        original_call = self.call
+
+        async def call_with_submit(name, args, platform, user_id, **kwargs):
+            if name == "keytao_submit_batch":
+                submit_calls.append(copy.deepcopy(args))
+                if args.get("confirmed"):
+                    return json.dumps({
+                        "success": True,
+                        "autoApproved": True,
+                        "batchId": "code-list-batch",
+                        "batchUrl": "https://offline.invalid/draft/code-list-batch",
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "code-list-batch",
+                    "batchUrl": "https://offline.invalid/draft/code-list-batch",
+                    "contentVersion": self.draft_version + 1,
+                    "serverSnapshotDigest": "b" * 64,
+                    "warningDigest": "c" * 64,
+                    "auditDigest": "d" * 64,
+                    "warnings": [],
+                    "snapshotItems": copy.deepcopy(self.writes[-1]),
+                }, ensure_ascii=False)
+            if name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []}, ensure_ascii=False)
+            return await original_call(name, args, platform, user_id, **kwargs)
+
+        with (
+            patch.object(self.chat, "call_tool_function", side_effect=call_with_submit),
+            patch.object(self.commands, "call_tool_function", side_effect=call_with_submit),
+        ):
+            msg = "重新排序为 进度条 > 基督徒 > 超导体"
+            intent = self.routing._structural_draft_management_intent(msg)
+            plan = await self.commands._try_handle_draft_management_command(
+                msg, "qq", self.author.actor_id, self.author.space_key, "Rea", command_intent=intent,
+            )
+            self.assertIn("回复「确认」执行，或「取消」。也可回复「确认并提交」执行并提交。", plan)
+            token = self.chat._current_turn_message.set(msg)
+            try:
+                guarded = self.chat._enforce_advertised_reply_contract(plan, self.author)
+            finally:
+                self.chat._current_turn_message.reset(token)
+            self.assertIn("也可回复「确认并提交」执行并提交。", guarded)
+
+            # Bind origin metadata just as _finish_ai_chat_response does on real delivery.
+            record = self.store.get_record(self.author)
+            self.assertIsNotNone(record)
+            self.store.bind_origin_prompt_digest(
+                self.author,
+                self.routing._prompt_capability_digest(plan),
+            )
+            record = self.store.get_record(self.author)
+            self.assertTrue(self.store.bind_origin_message_ids(record, ["100001"]))
+            canonical = self.commands.render_understood_pending_answer(
+                OperationRequest(op="confirm", submit_after=True, refers_to_pending=True, frame="direct"),
+                record.state,
+                plan,
+                "确认并提交",
+            )
+            self.assertEqual(canonical, "确认并提交")
+
+            # Bound reply 「确认并提交」 executes shift AND submits in one turn.
+            ctx = self.chat.TurnContext(
+                bot=None, event=None, platform="qq", user_id=self.author.actor_id,
+                message_text="确认并提交", normalized_message_text="确认并提交",
+                conv_key=self.author, space_key=self.author.space_key, owner_label="Rea",
+                history=[{"role": "assistant", "content": plan}],
+                reply_reference=self.chat.ReplyReferenceInfo(
+                    is_reply=True, is_to_bot=True, text=plan, message_id="100001",
+                ),
+            )
+            with patch.object(self.chat, "get_history", return_value=ctx.history):
+                handled = await self.chat._try_bound_pending_reply(ctx)
+            self.assertTrue(handled)
+            self.assertEqual(len(self.writes), 1)
+            self.assertEqual(len(submit_calls), 2)
+            self.assertTrue(submit_calls[0].get("preview_only"))
+            self.assertTrue(submit_calls[1].get("confirmed"))
+            self.assertIn("✅ 操作已完成", ctx.response)
+            self.assertIn("已加入词库", ctx.response)
+            self.assertIsNone(self.store.get_record(self.author))
+
+        # Non-draft-write confirmations (submit/recall) must NOT advertise 确认并提交.
+        submit_prompt = self.commands._format_server_warning_confirmation("keytao_submit_batch", {
+            "requiresConfirmation": True, "warnings": [],
+        })
+        recall_prompt = self.commands._format_server_warning_confirmation("keytao_recall_batch", {
+            "requiresConfirmation": True, "pullRequestCount": 2,
+        })
+        self.assertNotIn("确认并提交", submit_prompt)
+        self.assertNotIn("确认并提交", recall_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

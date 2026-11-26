@@ -62,6 +62,7 @@ from ..utils import reply_copy as _reply_copy
 from ..utils.observability import current_turn_metrics, observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     ADD_OPERATION_VERB_PATTERN,
+    DRAFT_WRITE_CONFIRMATION_TOOLS,
     PENDING_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     ReviewedSelectionReply,
@@ -948,7 +949,10 @@ def _pending_tool_assent_intent(
         "keytao_create_phrase",
         "keytao_batch_add_to_draft",
     }
-    if add_confirmation_tool and assent.submit_after:
+    draft_write_confirmation_tool = state.function_name in DRAFT_WRITE_CONFIRMATION_TOOLS
+    if draft_write_confirmation_tool and assent.submit_after and (
+        add_confirmation_tool or not assent.add_requested
+    ):
         return MessageCommandIntent(
             intent="pending_add_and_submit",
             confidence=1.0,
