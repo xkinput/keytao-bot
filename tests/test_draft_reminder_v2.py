@@ -239,6 +239,38 @@ class DraftReminderTests(DraftReminderFixture):
         self.assertEqual((rows[-1]["lastModifiedAt"], rows[-1]["batchId"]),
                          (second["modifiedAfter"], second["afterId"]))
 
+    async def test_full_malformed_web_page_advances_using_raw_tail(self):
+        history = self.group_history(chat.ConversationAddress.group("qq", GROUP, ACTOR))
+        tail = self.web_row(batchId="draft-099", creatorQqId="bad")
+        web = AsyncMock(side_effect=[
+            {"success": True, "drafts": [None] * 99 + [tail]},
+            {"success": True, "drafts": [self.web_row()]},
+        ])
+
+        self.assertEqual(1, await self.scan_with_web(web, history))
+        second = web.await_args_list[1].kwargs["params"]
+        self.assertEqual((tail["lastModifiedAt"], tail["batchId"]),
+                         (second["modifiedAfter"], second["afterId"]))
+        self.assertEqual(BATCH, self.read.await_args.args[0]["batch_id"])
+
+    async def test_full_malformed_web_page_without_cursor_restarts_next_scan(self):
+        saved = draft_reminder.DraftReminderCursor((NOW - timedelta(hours=1)).isoformat(), "saved")
+        self.store._save_web_cursor(None, saved)
+        web = AsyncMock(side_effect=[
+            {"success": True, "drafts": [None] * 100},
+            {"success": True, "drafts": []},
+        ])
+
+        with patch.object(chat.logger, "warning") as warning:
+            self.assertEqual(0, await self.scan_with_web(web, None))
+            warning.assert_called_once()
+        self.assertIsNone(self.store._web_cursor(self.rollout.timestamp()))
+        self.assertEqual(0, await self.scan_with_web(web, None))
+        first, second = [call.kwargs["params"] for call in web.await_args_list]
+        self.assertEqual(saved.batch_id, first["afterId"])
+        self.assertNotIn("afterId", second)
+        self.assertEqual(self.rollout.astimezone(timezone.utc).isoformat(), second["modifiedAfter"])
+
     async def test_web_resumes_after_five_full_pages_at_the_same_timestamp_and_resets_at_end(self):
         history = self.group_history(chat.ConversationAddress.group("qq", GROUP, ACTOR))
         rows = [self.web_row(

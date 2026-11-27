@@ -2461,6 +2461,29 @@ class GluedAddCodeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(("add", ("苕皮",), ("ezpk",)), (actual.op, actual.operands, actual.codes))
                 self.assertEqual(spaced, actual)
 
+    def test_invalid_glued_codes_do_not_have_disambiguation_operands(self):
+        from keytao_bot.utils.explicit_code import glued_add_code_operands
+
+        with patch("keytao_bot.utils.explicit_code.query_reference_readings", return_value=[]):
+            for message in ("新增功能v2", "新增功能V", "新增功能abcdefg"):
+                with self.subTest(message=message):
+                    self.assertIsNone(glued_add_code_operands(message))
+
+    async def test_version_suffix_reaches_chat_without_encoding(self):
+        chat = harness.openai_chat_module
+        message = "新增功能v2"
+        with (
+            self.runtime(),
+            patch("keytao_bot.utils.explicit_code.query_reference_readings", return_value=[]),
+            patch.object(chat, "_classify_message_command_intent", AsyncMock(return_value=chat.MessageCommandIntent())),
+            patch.object(chat, "get_ai_response_core", AsyncMock(return_value="聊聊这个功能。")) as model,
+            patch.object(chat._chat_commands, "call_tool_function", AsyncMock()) as tool,
+        ):
+            self.assertEqual("聊聊这个功能。", await self.turn(message))
+            model.assert_awaited_once()
+            self.assertEqual(message, model.await_args.args[0])
+            tool.assert_not_awaited()
+
     async def test_glued_commands_dispatch_only_the_matching_review_target(self):
         for message, full, rest, code, target in (
             ("新增长点xzcd", "新增长点", "长点", "xzcd", "新增长点"),
@@ -2477,6 +2500,36 @@ class GluedAddCodeTests(unittest.IsolatedAsyncioTestCase):
         for candidates in ({"补钙": ["bg"], "钙": ["bg"]}, {}, {"补钙": ["bg"], "钙": None}):
             with self.subTest(candidates=candidates):
                 await self.assert_glued_route("补钙bg", "补钙", "钙", "bg", candidates, None)
+
+    async def test_glued_command_asks_when_one_parallel_encode_times_out(self):
+        commands = harness.openai_chat_module._chat_commands
+        timeout = asyncio.timeout
+        waiting = asyncio.Event()
+        overlapped = asyncio.Event()
+
+        async def encode(name, args, platform, user_id):
+            if args["word"] == "新增长点":
+                waiting.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    waiting.clear()
+            if waiting.is_set():
+                overlapped.set()
+            return json.dumps({"success": True, "candidateCodes": ["xzcd"]})
+
+        with (
+            self.runtime(),
+            patch("keytao_bot.utils.explicit_code.query_reference_readings", return_value=[]),
+            patch.object(commands, "call_tool_function", AsyncMock(side_effect=encode)) as tool,
+            patch.object(asyncio, "timeout", side_effect=lambda _: timeout(0.01)) as deadline,
+        ):
+            reply = await asyncio.wait_for(self.turn("新增长点xzcd"), timeout=0.5)
+        self.assertEqual("你要加的是「新增长点」还是「长点」？", reply)
+        self.assertTrue(overlapped.is_set())
+        self.assertCountEqual(["新增长点", "长点"], [call.args[1]["word"] for call in tool.await_args_list])
+        self.assertEqual([(5.0,), (5.0,)], [call.args for call in deadline.call_args_list])
+        self.assertIsNone(self.store.get_record(self.key))
 
     async def assert_glued_route(self, message, full, rest, code, candidates, target):
         chat = harness.openai_chat_module

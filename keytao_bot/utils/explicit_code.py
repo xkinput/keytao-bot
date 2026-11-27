@@ -12,6 +12,8 @@ from .pinyin_reference import PinyinReferenceUnavailable, query_reference_readin
 
 
 _HAN_WORD = r'[\u3400-\u9fff\U00020000-\U0003134f]{1,32}'
+_CODE_LETTERS_RE = re.compile(r"[a-z]+")
+_MAX_CODE_LENGTH = 6
 _GLUED_ADD_CODE_RE = re.compile(
     rf"(?P<verb>{ADD_OPERATION_VERB_PATTERN})(?P<space>[ \t]*)"
     rf"(?!{_HAN_WORD}(?:的)?编码(?:改为|[为是])[a-zA-Z])"
@@ -55,7 +57,7 @@ def glued_add_code_operands(source: str) -> tuple[str, str, str, str] | None:
     if match is None:
         return None
     verb, space, _, word, code, submit = match.groups()
-    if space or not word:
+    if space or not word or not _CODE_LETTERS_RE.fullmatch(code) or len(code) > _MAX_CODE_LENGTH:
         return None
     full_word = verb + word
     try:
@@ -63,7 +65,7 @@ def glued_add_code_operands(source: str) -> tuple[str, str, str, str] | None:
             return None
     except PinyinReferenceUnavailable:
         pass
-    return full_word, word, code.lower(), submit or ""
+    return full_word, word, code, submit or ""
 
 
 def parse_explicit_entry_code_request(message: str):
@@ -261,10 +263,10 @@ def validate_explicit_code(state, code: str, pinyin: str = "") -> ExplicitCodeVa
     fail = lambda reason: ExplicitCodeValidation(code, reason=reason)
     if not state.server_candidates or state.server_candidates != state.candidates:
         return fail("当前没有已核验的候选记录，请先查询该词")
-    if re.fullmatch(r"[a-z]+", code) is None:
+    if _CODE_LETTERS_RE.fullmatch(code) is None:
         return fail(f"编码 {code} 只能包含小写字母 a-z")
-    if len(code) > 6:
-        return fail(f"编码 {code} 有 {len(code)} 位；单字和词组最多 6 位")
+    if len(code) > _MAX_CODE_LENGTH:
+        return fail(f"编码 {code} 有 {len(code)} 位；单字和词组最多 {_MAX_CODE_LENGTH} 位")
     if state.phrase_type not in {"Single", "Phrase"}:
         return fail("当前词条类型不支持按读音核验指定编码")
     inventory = dict(state.server_candidates)

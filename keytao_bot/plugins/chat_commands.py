@@ -15018,9 +15018,10 @@ async def resolve_glued_add_code(source: str, platform: str, user_id: str) -> tu
 
     async def matches(word: str) -> bool | None:
         try:
-            data = json.loads(await call_tool_function(
-                "keytao_encode", {"word": word, "requested_code": code}, platform, user_id,
-            ))
+            async with asyncio.timeout(5.0):
+                data = json.loads(await call_tool_function(
+                    "keytao_encode", {"word": word, "requested_code": code}, platform, user_id,
+                ))
         except Exception:
             return None
         if not isinstance(data, dict) or data.get("success") is not True:

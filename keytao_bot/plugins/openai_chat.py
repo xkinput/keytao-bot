@@ -3625,7 +3625,8 @@ async def _list_web_reminder_candidates(
         candidates = []
         invalid_rows = False
         next_cursor = None
-        for row in rows[:page_size]:
+        raw_last_cursor = None
+        for index, row in enumerate(rows[:page_size], start=1):
             if not isinstance(row, dict):
                 invalid_rows = True
                 continue
@@ -3646,6 +3647,9 @@ async def _list_web_reminder_candidates(
             # Legacy servers ignore afterId and return only newer timestamps.
             if last_write < modified_after or (boundary is not None and (modified, batch_id) <= boundary):
                 continue
+            row_cursor = DraftReminderCursor(modified_at, batch_id)
+            if index == page_size:
+                raw_last_cursor = row_cursor
             actor = str(row.get("creatorQqId") or "")
             version, count = row.get("contentVersion"), row.get("itemCount")
             if (
@@ -3655,7 +3659,7 @@ async def _list_web_reminder_candidates(
             ):
                 invalid_rows = True
                 continue
-            next_cursor = DraftReminderCursor(modified_at, batch_id)
+            next_cursor = row_cursor
             if actor not in groups:
                 groups[actor] = history_store.latest_group_for_actor("qq", actor, after=group_after, now=now)
             if groups[actor]:
@@ -3664,6 +3668,12 @@ async def _list_web_reminder_candidates(
                     "batch_id": batch_id, "content_version": version, "item_count": count,
                     "last_write": last_write, "batch_url": row.get("batchUrl") or "",
                 })
+        if len(rows) >= page_size and next_cursor is None and invalid_rows:
+            next_cursor = raw_last_cursor
+            if next_cursor is None:
+                logger.warning("[draft_reminder_error] web_list_cursor_reset")
+                yield DraftReminderPage(candidates)
+                return
         if invalid_rows:
             logger.warning("[draft_reminder_error] web_list_malformed_rows")
         if len(rows) < page_size:
