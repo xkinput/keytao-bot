@@ -75,6 +75,7 @@ from ..utils.completed_draft_undo import (
     conversation_scope,
     current_operation_capture,
     handle_completed_undo,
+    has_pending_completed_undo_action,
     note_completed_operation_reply,
     start_operation_turn,
 )
@@ -5182,11 +5183,20 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             return unbound_answer()
         prompt = latest
     if (
-        not cancel_control and isinstance(state, PendingToolConfirm)
+        isinstance(state, PendingToolConfirm)
         and state.function_name == "keytao_submit_batch"
         and state.args.get("_recent_own_write") is True
+        and (
+            not cancel_control
+            or has_pending_completed_undo_action(
+                normalize_conversation_key(ctx.conv_key, ctx.space_key),
+                ctx.normalized_message_text,
+                ctx.reply_reference,
+            )
+        )
     ):
-        # The recent-write handler seals and submits the exact receipt snapshot.
+        # The recent-write handler seals and submits the exact receipt snapshot,
+        # while bare undo/cancel yields to completed_draft_undo to revert the write.
         return False
     from ..harness.operation_request import OperationRequest
 
@@ -5266,6 +5276,17 @@ async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: 
             and not _verified_pending_reply(ctx, record)
         )
         or draft_operation_coordinator.get(ctx.conv_key) is not None
+    ):
+        return False
+    if (
+        not getattr(ctx, "semantic_pending_released", False)
+        and (record is None or isinstance(record.state, PendingTrustedWordRecord))
+        and draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is None
+        and has_pending_completed_undo_action(
+            normalize_conversation_key(ctx.conv_key, ctx.space_key),
+            ctx.normalized_message_text,
+            ctx.reply_reference,
+        )
     ):
         return False
     addressed = bool(
@@ -5585,6 +5606,17 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     if await _try_reviewed_operand_reply(ctx):
         return True
     if await _try_stale_displacement_reply(ctx):
+        return True
+    if (
+        ctx.conv_key is not None
+        and not getattr(ctx, "semantic_pending_released", False)
+        and has_pending_completed_undo_action(
+            normalize_conversation_key(ctx.conv_key, ctx.space_key),
+            ctx.normalized_message_text,
+            ctx.reply_reference,
+        )
+        and await _stage_handle_completed_draft_undo(ctx)
+    ):
         return True
     if await _try_stale_affirmative_reply(ctx):
         return True

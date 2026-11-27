@@ -3188,11 +3188,13 @@ async def keytao_recall_batch(
                             str(existing_recall_payload.get("batchId") or ""),
                             "上一次撤回结果仍无法确认；已锁定原批次，不会选择新的提交批次。",
                         )
-                    return {
+                    error_result = {
                         **data,
                         "success": False,
                         "message": data.get("message") or f"获取待撤回批次失败（HTTP {response.status_code}）",
                     }
+                    _inject_batch_url(error_result)
+                    return error_result
                 preview_batch_id = str(data.get("batchId") or "")
                 preview_version = data.get("contentVersion")
                 if (

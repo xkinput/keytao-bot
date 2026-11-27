@@ -18,6 +18,7 @@ from .draft_mutation_store import get_default_draft_mutation_claim_store
 from .draft_reminder import record_draft_write
 from . import http_client
 from .observability import observe_tool_call
+from .url_format import render_platform_public_links
 
 UNDO_WINDOW_SECONDS = 600
 _UNDO_WORDS = {"取消", "撤销", "撤回", "回滚"}
@@ -458,7 +459,60 @@ def operation_description(record: Dict) -> str:
 
 
 def _confirmation(record: Dict, reason: str) -> str:
-    return f"{reason}；最近操作：{operation_description(record)}；{record.get('batchUrl', '')}；是否整笔撤销？请引用本条回复「是」或「否」。"
+    url = str(record.get("batchUrl") or "").strip()
+    url_part = f"；{url} " if url else ""
+    return f"{reason}；最近操作：{operation_description(record)}{url_part}；是否整笔撤销？请引用本条回复「是」或「否」。"
+
+
+def _confirmation_prompt_matches(reply_reference: Any, stored_prompt: str, platform: str) -> bool:
+    if not stored_prompt or not getattr(reply_reference, "is_to_bot", False):
+        return False
+    quoted_text = str(getattr(reply_reference, "text", "") or "").strip()
+    expected = str(stored_prompt).strip()
+    if not quoted_text:
+        return False
+    if quoted_text == expected:
+        return True
+    normalized_quoted = re.sub(
+        r"\s+",
+        " ",
+        render_platform_public_links(quoted_text, platform).strip(),
+    )
+    normalized_expected = re.sub(
+        r"\s+",
+        " ",
+        render_platform_public_links(expected, platform).strip(),
+    )
+    return normalized_quoted == normalized_expected
+
+
+def has_pending_completed_undo_action(key: Any, message: str, reply_reference: Any) -> bool:
+    """Return True when a bare undo/cancel/quote reply belongs to completed_draft_undo or draft_recall."""
+    command = _clean_command(message)
+    if not command:
+        return False
+    if command in {"撤销", "撤回", "回滚"}:
+        return True
+    scope = conversation_scope(key)
+    record = get_default_draft_mutation_claim_store().completed_operation(scope)
+    if not record or record.get("status") not in {"ready", "undoing"}:
+        return False
+    if _confirmation_prompt_matches(
+        reply_reference,
+        str(record.get("confirmationPrompt") or ""),
+        str(getattr(key, "platform", "") or ""),
+    ):
+        return command in _YES_WORDS | _NO_WORDS
+    if command == "取消":
+        if record.get("status") == "undoing":
+            return True
+        completed_at = record.get("completedAt")
+        return bool(
+            record.get("latestActorWrite") == record.get("operationId")
+            and isinstance(completed_at, (int, float))
+            and 0 <= time.time() - completed_at <= UNDO_WINDOW_SECONDS
+        )
+    return False
 
 
 async def handle_completed_undo(key: Any, message: str, reply_reference: Any, get_tool: Callable) -> Optional[str]:
@@ -468,16 +522,19 @@ async def handle_completed_undo(key: Any, message: str, reply_reference: Any, ge
     store = get_default_draft_mutation_claim_store()
     record = store.completed_operation(scope)
     quoted = bool(
-        record and record.get("confirmationPrompt")
-        and getattr(reply_reference, "is_to_bot", False)
-        and str(getattr(reply_reference, "text", "")).strip() == record["confirmationPrompt"]
+        record
+        and _confirmation_prompt_matches(
+            reply_reference,
+            str(record.get("confirmationPrompt") or ""),
+            str(getattr(key, "platform", "") or ""),
+        )
     )
     if command not in _UNDO_WORDS and not (quoted and command in _YES_WORDS | _NO_WORDS):
         if re.fullmatch(r"(?:取消|撤销|撤回|回滚)[？?]+", command):
             return "这条消息是在询问撤销，尚未执行。"
         return None
     if record is None:
-        if command == "撤回":
+        if command in {"撤回", "撤销"}:
             return None
         return "当前对话没有可核验的已完成写入，未执行撤销。"
     link = str(record.get("batchUrl") or "")
@@ -588,6 +645,16 @@ async def handle_completed_undo(key: Any, message: str, reply_reference: Any, ge
         store.update_completed_operation(scope, record["operationId"], "undoing", "undoing", record)
         recalled = preview if recovered_recall else await call("keytao_recall_batch", batch_id=batch_id, expected_content_version=preview["contentVersion"])
         if recalled.get("success") is not True or recalled.get("batchId") != batch_id:
+            if (
+                recalled.get("success") is False
+                and not recalled.get("uncertain")
+                and not recalled.get("transportError")
+                and not record.get("recalled")
+            ):
+                record.pop("recallStarted", None)
+                record.pop("recallVersion", None)
+                if store.update_completed_operation(scope, record["operationId"], "undoing", "ready", record):
+                    record["status"] = "ready"
             return f"撤回提审未确认完成，尚未撤销条目：{recalled.get('message', '结果不确定')}。草稿地址：{link}"
         record["recalled"] = True
         store.update_completed_operation(scope, record["operationId"], "undoing", "undoing", record)
